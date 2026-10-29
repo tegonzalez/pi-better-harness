@@ -380,6 +380,19 @@ omitted `sandbox` also starts unconfined. Explicit `sandbox:true` enables task
 confinement without requiring another extension; `sandbox:false` cannot bypass
 an enabled human profile. Saved enabled profiles and session choices stay enabled.
 
+- **Repeat-failure guard.** When the same tool call (same tool, same arguments)
+  fails 3 times, the third result carries a `REPEATED FAILURE` notice and any
+  further identical call is blocked with `terminate`, ending the agent run. At
+  top level the turn ends and the user is notified; in a child (installed via
+  the child control extension in every mode, including `clean`) the run ends
+  and its final output escalates to the parent. A success of that call or new
+  user input clears the count.
+- **Blank optional strings mean omitted.** `agent: ""`, `model: ""`,
+  `thinking: ""` and other empty or whitespace-only optional string fields in
+  `subagent_spawn` and `subagent_spawn_batch` (shared and per job) are treated as
+  absent. Some models fill every schema field with `""`; rejecting those made
+  launches impossible. A role array with a blank entry is still rejected.
+
 - **Task sandbox (opt-in, macOS and Linux).** Pi startup, authentication,
   provider transport, and session persistence run as trusted runtime operations.
   Admitted task tools run under `sandbox-exec` or Linux Bubblewrap. Project files
