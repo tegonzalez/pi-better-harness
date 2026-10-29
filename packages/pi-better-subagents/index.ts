@@ -166,6 +166,7 @@ import {
 } from "./catalog-runtime.ts";
 import { registerSubagentsGoalProvider } from "./goal-provider.ts";
 import { defaultUserRoot, type CatalogSnapshot } from "./catalog-store.ts";
+import repeatGuard, { isSubagentChild } from "./repeat-guard.ts";
 
 const SUBAGENT_MODE_ACTIONS: readonly AutocompleteItem[] = [
     { value: "settings", label: "settings", description: "Open delegation mode and concurrency settings" },
@@ -1475,6 +1476,9 @@ function catalogRoleSchema(purpose: string) {
 }
 
 export default function (pi: ExtensionAPI) {
+    // Top level: a repeated identical failing call ends the turn and escalates to the user.
+    // Inside a child, child-steer already installed the guard (escalation to the parent).
+    if (!isSubagentChild()) repeatGuard(pi as unknown as Parameters<typeof repeatGuard>[0], { child: false });
     const agentSessionSettings = createAgentSessionSettings(pi);
     let catalogModelRegistry: ExtensionContext["modelRegistry"] | undefined;
     let delegationOverride: DelegationMode | undefined;

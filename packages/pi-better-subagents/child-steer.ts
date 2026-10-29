@@ -19,6 +19,7 @@
  * prompt there would start work instead of steering it.
  */
 import { readFileSync, renameSync, writeFileSync } from "node:fs";
+import repeatGuard from "./repeat-guard.ts";
 
 export const STEER_FILE_ENV = "PI_SUBAGENT_STEER_FILE";
 const POLL_MS = 2_000;
@@ -54,6 +55,8 @@ export function readSteerRequest(path: string): { id: string; text: string } | u
 }
 
 export default function childSteer(pi: SteerApi): void {
+    // Every child escalates a repeated identical failing call to its parent.
+    repeatGuard(pi, { child: true });
     const path = process.env[STEER_FILE_ENV];
     if (!path) return;
     const delivered = new Set<string>();
