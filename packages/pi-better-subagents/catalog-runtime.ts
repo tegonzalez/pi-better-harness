@@ -571,8 +571,29 @@ function agentIdOf(job: { agent?: unknown }): string | undefined {
 }
 
 /**
- * Error text for a selector that is present but blank (`role: "  "`,
- * `agent: ""`, or an empty or blank role array). Absent or null means no
+ * Drop optional string fields whose value is empty or whitespace-only, so they
+ * read as omitted. Some models emit every schema field and fill unused string
+ * fields with ""; rejecting those as "present but blank" made such models
+ * unable to launch any child (session 01a18443: 1482 identical rejections).
+ * `keep` names required fields (such as `prompt`) that are validated separately.
+ * Arrays are left untouched: a role array with a blank entry still fails.
+ */
+export function omitBlankOptionalStrings<T extends object>(input: T, keep?: readonly string[]): T;
+export function omitBlankOptionalStrings<T extends object>(input: T | undefined, keep?: readonly string[]): T | undefined;
+export function omitBlankOptionalStrings<T extends object>(input: T | undefined, keep: readonly string[] = []): T | undefined {
+    if (!input || typeof input !== "object" || Array.isArray(input)) return input;
+    const out: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(input)) {
+        if (!keep.includes(key) && typeof value === "string" && value.trim() === "") continue;
+        out[key] = value;
+    }
+    return out as T;
+}
+
+/**
+ * Error text for a selector that is present but blank. Callers first apply
+ * omitBlankOptionalStrings, so in practice this catches an empty role array or
+ * a role array with a blank entry (`role: ["developer", " "]`). Absent or null means no
  * selector and returns undefined. `where` names the field's owner, such as
  * `shared` or `jobs[1]`.
  */

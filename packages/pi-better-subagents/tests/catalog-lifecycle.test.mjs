@@ -1094,38 +1094,39 @@ fi
             assert.doesNotMatch(missing.content[0].text, /No role named/);
         });
 
-        it("rejects a present-but-blank role or agent and starts no child", async (t) => {
+        it("rejects a blank entry in a role array and starts no child", async (t) => {
             setConfigForTests({ defaultModel: null, maxConcurrent: 64, tierPolicy: null });
             t.after(() => setConfigForTests(undefined));
             const before = runsNow();
-            const spawnCases = [
-                [{ role: "  " }, /: role is blank\. /],
-                [{ role: "" }, /: role is blank\. /],
-                [{ role: ["developer", " "] }, /: role is blank\. /],
-                [{ agent: "   " }, /: agent is blank\. /],
-            ];
-            for (const [selector, pattern] of spawnCases) {
-                await assert.rejects(
-                    tools.subagent_spawn.execute("tc", { prompt: "x", tools: "read,bash", sandbox: false, ...selector }, null, null, ctx()),
-                    pattern,
-                    JSON.stringify(selector),
-                );
-            }
             await assert.rejects(
-                tools.subagent_spawn_batch.execute("tc", {
-                    jobs: [{ prompt: "x" }],
-                    shared: { role: " ", tools: "read,bash", sandbox: false },
-                }, null, null, ctx()),
-                /: shared\.role is blank\. /,
+                tools.subagent_spawn.execute("tc", { prompt: "x", tools: "read,bash", sandbox: false, role: ["developer", " "] }, null, null, ctx()),
+                /: role is blank\. /,
             );
             await assert.rejects(
                 tools.subagent_spawn_batch.execute("tc", {
-                    jobs: [{ prompt: "ok", role: "developer" }, { prompt: "x", agent: "" }],
+                    jobs: [{ prompt: "ok", role: "developer" }, { prompt: "x", role: [""] }],
                     shared: { tools: "read,bash", sandbox: false },
                 }, null, null, ctx()),
-                /: jobs\[1\]\.agent is blank\. /,
+                /: jobs\[1\]\.role is blank\. /,
             );
             assert.deepEqual(newRuns(before), []);
+        });
+
+        it("treats empty optional strings as omitted (models that fill every schema field)", async (t) => {
+            setConfigForTests({ defaultModel: null, maxConcurrent: 64, tierPolicy: null });
+            t.after(() => setConfigForTests(undefined));
+            // Shape seen from gpt-6.1-sol in session 01a18443: every field present, unused ones "".
+            const filled = { agent: "", alias: "", model: "", thinking: "", exclude_tools: "", sandbox_dir: "", deadline_minutes: null };
+            for (const extra of [{ role: "" }, { role: "  " }, { agent: "   " }, {}]) {
+                const err = await tools.subagent_spawn.execute("tc", { prompt: "x", tools: "read,bash", sandbox: false, ...filled, ...extra }, null, null, ctx())
+                    .then(() => undefined, (e) => e);
+                if (err) assert.doesNotMatch(String(err.message), /is blank|thinking must be one of/, JSON.stringify(extra));
+            }
+            const batchErr = await tools.subagent_spawn_batch.execute("tc", {
+                jobs: [{ prompt: "x", ...filled }],
+                shared: { tools: "read,bash", sandbox: false, ...filled, role: "" },
+            }, null, null, ctx()).then(() => undefined, (e) => e);
+            if (batchErr) assert.doesNotMatch(String(batchErr.message), /is blank|thinking must be one of/);
         });
 
         it("lists roles by short name and inspects by short name with the full id in details", async () => {
