@@ -167,6 +167,7 @@ import {
     clarifyCatalogRequest,
     createLaunchEnricher,
     blankCatalogSelector,
+    omitBlankOptionalStrings,
     hasCatalogSelector,
     loadLaunchSnapshot,
     noteCatalogHost,
@@ -2561,14 +2562,15 @@ export default function (pi: ExtensionAPI) {
             content: { type: "text"; text: string }[];
             details: Record<string, unknown>;
         }> {
-            const p = { ...params } as SpawnParams;
+            // Empty optional strings (agent: "", model: "", ...) mean omitted.
+            const p = omitBlankOptionalStrings(params as SpawnParams, ["prompt"]);
             p.session_id = requestedSessionId(p, ctx.cwd);
             if (p.prompt.trim() === "") throw new Error("prompt is empty.");
             if (p.session_id !== undefined && (typeof p.session_id !== "string" || p.session_id.trim() === "")) {
                 throw new Error("session_id must be a non-empty native session id.");
             }
             assertNoRetiredLaunchOptions(p as { retain_session?: unknown });
-            // A present-but-blank role or agent is a mistake, not a request for a catalog-free child.
+            // A blank role array entry is still a mistake, not a request for a catalog-free child.
             const blankSelector = blankCatalogSelector(p);
             if (blankSelector) throw new Error(blankSelector);
 
@@ -2753,11 +2755,17 @@ export default function (pi: ExtensionAPI) {
         }),
 
         async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-            const p = params as {
+            const raw = params as {
                 batchName?: string;
                 shared?: Partial<SpawnParams>;
                 jobs: Array<Partial<SpawnParams> & { prompt: string }>;
                 onCapacity?: "reject" | "launch-available";
+            };
+            // Empty optional strings in shared or any job mean omitted.
+            const p = {
+                ...omitBlankOptionalStrings(raw),
+                shared: omitBlankOptionalStrings(raw.shared),
+                jobs: raw.jobs.map((job) => omitBlankOptionalStrings(job, ["prompt"])),
             };
 
             const cfg = loadConfig();
@@ -2776,7 +2784,7 @@ export default function (pi: ExtensionAPI) {
             p.jobs.forEach((job, index) => assertNoRetiredLaunchOptions(job, `jobs[${index}]: `));
 
             validateBatchPlan({ shared: p.shared, jobs: p.jobs, onCapacity: p.onCapacity, config: cfg });
-            // A present-but-blank role or agent rejects the whole batch before any launch.
+            // After blank-string normalization, a blank role array entry rejects the whole batch before any launch.
             const blankSelector = blankCatalogSelector(p.shared, "shared")
                 ?? p.jobs.map((job, index) => blankCatalogSelector(job, `jobs[${index}]`)).find(Boolean);
             if (blankSelector) throw new Error(blankSelector);
