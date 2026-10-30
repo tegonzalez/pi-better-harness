@@ -13,26 +13,59 @@ const { default: extension, subagentsArgumentCompletions } = await import("../in
 const { setConfigForTests, setConfigPathForTests, loadConfig, writeSubagentSettings, normalizeConcurrencyCap } = await import("../config.ts");
 const { normalizeDelegationMode, delegationPrompt, DELEGATION_MODE_REQUEST } = await import("../delegation.ts");
 
+const SETTINGS = "pi-better-subagents-settings";
+
+// A session model that follows pi's persistence rules for the hooks this extension uses:
+// pi.sendMessage without triggerTurn appends a custom_message entry while idle, and a
+// before_agent_start `message` is stored after the run's prompt. Model requests are built
+// from the compaction-aware context entries and then passed through any `context` handler.
 function harness() {
     const handlers = new Map();
     const commands = new Map();
     const tools = new Map();
     const notifications = [];
     const entries = [];
+    const sent = [];
     const events = new EventEmitter();
     extension({
         events,
         appendEntry(customType, data) { entries.push({ type: "custom", customType, data }); },
+        sendMessage(message, options) {
+            sent.push({ message, options });
+            entries.push({ type: "custom_message", customType: message.customType, content: message.content,
+                display: message.display, details: message.details });
+        },
         registerTool(tool) { tools.set(tool.name, tool); },
         registerCommand(name, command) { commands.set(name, command); },
         on(name, handler) { handlers.set(name, handler); },
     });
-    const ctx = { ui: { notify(message, level) { notifications.push({ message, level }); } }, sessionManager: { getBranch: () => entries } };
+    const view = { contextEntries: () => entries };
+    const ctx = { ui: { notify(message, level) { notifications.push({ message, level }); } },
+        sessionManager: { getBranch: () => entries, buildContextEntries: () => view.contextEntries() } };
     const mode = () => { const request = {}; events.emit(DELEGATION_MODE_REQUEST, request); return request.mode; };
-    const context = (messages = []) => handlers.get("context")({ type: "context", messages }, ctx).messages;
-    const prompt = () => context().map(message => message.content).join("\n");
-    return { handlers, commands, tools, notifications, entries, ctx, mode, prompt, context };
+    const toMessage = (entry) => entry.type === "message" ? structuredClone(entry.message)
+        : entry.type === "custom_message" ? { role: "custom", customType: entry.customType, content: entry.content,
+            display: entry.display, details: structuredClone(entry.details) } : undefined;
+    /** One model request: context entries as messages, through the context hook if one is registered. */
+    const request = () => {
+        const messages = view.contextEntries().map(toMessage).filter(Boolean);
+        const hook = handlers.get("context");
+        return hook ? hook({ type: "context", messages: structuredClone(messages) }, ctx)?.messages ?? messages : messages;
+    };
+    /** Start a run like pi: before_agent_start, then persist the prompt and any returned message. */
+    const run = (prompt = "Next prompt") => {
+        const result = handlers.get("before_agent_start")({ type: "before_agent_start", prompt, systemPrompt: "Base prompt." }, ctx) ?? {};
+        entries.push({ type: "message", message: { role: "user", content: prompt } });
+        if (result.message) entries.push({ type: "custom_message", ...structuredClone(result.message) });
+        return result.systemPrompt;
+    };
+    const settingsMessages = (messages = request()) =>
+        messages.filter((message) => message.role === "custom" && message.customType === SETTINGS);
+    const latestSettings = () => { run(); return settingsMessages().at(-1); };
+    return { handlers, commands, tools, notifications, entries, sent, ctx, view, mode, request, run, settingsMessages, latestSettings };
 }
+
+const stable = ({ revision, delegationMode, maxConcurrent, sources }) => ({ revision, delegationMode, maxConcurrent, sources });
 
 test("effective settings replace stale context and share live reservations with spawn admission", async () => {
     setConfigForTests({ delegationMode: "adaptive", maxConcurrent: 4 });
@@ -50,9 +83,9 @@ test("effective settings replace stale context and share live reservations with 
         assert.equal(reserved.occupiedSlots, 2);
         assert.equal(reserved.availableSlots, 2);
         assert.equal(reserved.revision, original.revision, "occupancy changes do not change the settings revision");
-        const priorMessages = [{ role: "user", content: "Keep my prompt", timestamp: 1 }, ...h.context()];
-        const previousText = priorMessages.at(-1).content;
-        const historySize = h.entries.length;
+        h.run("Keep my prompt");
+        const customEntries = () => h.entries.filter((entry) => entry.type === "custom").length;
+        const historySize = customEntries();
         await h.commands.get("subagents").handler("cap 1", h.ctx);
         const current = (await inspect()).structuredContent;
         assert.equal(current.maxConcurrent, 1);
@@ -66,17 +99,16 @@ test("effective settings replace stale context and share live reservations with 
             name.endsWith("batch") ? /0\/1 subagent slots free/ : /Max concurrent subagents \(1\)/);
         }
         await h.commands.get("subagents").handler("mode coordinator", h.ctx);
-        const messages = h.context(priorMessages);
-        const again = h.context(messages);
-        assert.equal(again.length, priorMessages.length);
-        assert.equal(again[0], priorMessages[0], "unrelated context is preserved");
-        assert.equal(priorMessages.at(-1).content, previousText, "context transformation does not mutate its input");
-        const block = again.at(-1);
-        assert.match(block.content, /Concurrency limit: 1/);
-        assert.match(block.content, /Delegation mode: coordinator/);
-        assert.doesNotMatch(block.content, /Delegation mode: adaptive/);
-        assert.equal(block.details.revision, (await inspect()).structuredContent.revision);
-        assert.equal(h.entries.length, historySize + 2, "only the two settings changes are persisted, not request snapshots");
+        const messages = h.request();
+        assert.equal(messages[0].content, "Keep my prompt", "unrelated context is preserved");
+        const block = messages.at(-1);
+        assert.equal(block.customType, SETTINGS);
+        assert.match(block.content, /concurrency limit 1 \(session\)/);
+        assert.match(block.content, /delegation mode coordinator \(session\)/);
+        assert.doesNotMatch(block.content, /adaptive/);
+        assert.deepEqual(block.details, stable((await inspect()).structuredContent));
+        assert.equal(customEntries(), historySize + 2, "only the two settings changes are persisted as setting entries");
+        assert.equal(h.settingsMessages(messages).length, 3, "the first run and each change add one settings message");
         await h.commands.get("subagents").handler("cap 6", h.ctx);
         const increased = (await inspect()).structuredContent;
         assert.equal(increased.availableSlots, 4, "raising the limit makes capacity available immediately");
@@ -86,6 +118,76 @@ test("effective settings replace stale context and share live reservations with 
         setConfigForTests(undefined);
         _resetSharedCapacityGateForTests();
     }
+});
+
+test("settings context keeps earlier requests as a byte-stable prefix and adds one message per settings change", async () => {
+    setConfigForTests({ delegationMode: "adaptive", maxConcurrent: 4 });
+    _resetSharedCapacityGateForTests();
+    try {
+        const h = harness();
+        const systemPrompt = h.run("First prompt");
+        const first = h.request();
+        assert.equal(h.settingsMessages(first).length, 1, "the first run adds one settings message");
+        const [settings] = h.settingsMessages(first);
+        assert.equal(settings.display, false);
+        assert.match(settings.content, /delegation mode adaptive \(config\); concurrency limit 4 \(config\)/);
+        assert.doesNotMatch(settings.content, /running|reserved|occupied|available/i, "injected context carries no live counts");
+        assert.deepEqual(Object.keys(settings.details).sort(), ["delegationMode", "maxConcurrent", "revision", "sources"]);
+
+        // Same settings, growing history, and changed occupancy: request 1 stays an exact prefix.
+        const gate = getSharedCapacityGate(() => 0);
+        assert.equal(gate.tryReserve(2, 4), true);
+        h.entries.push({ type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "t1", name: "read", arguments: {} }] } });
+        h.entries.push({ type: "message", message: { role: "toolResult", toolCallId: "t1", content: [{ type: "text", text: "ok" }] } });
+        const second = h.request();
+        assert.ok(second.length > first.length);
+        assert.deepEqual(second.slice(0, first.length), first, "call 1 is an unchanged prefix of call 2");
+        assert.equal(h.settingsMessages(second).length, 1);
+        assert.equal(h.run("Second prompt"), systemPrompt, "the system prompt does not change with history or occupancy");
+        const third = h.request();
+        assert.deepEqual(third.slice(0, second.length), second, "an unchanged revision adds no settings message on the next run");
+        assert.equal(h.settingsMessages(third).length, 1);
+        assert.equal(h.sent.length, 0, "nothing is sent while settings are unchanged");
+
+        // A settings change adds exactly one message at the point of change, without starting a turn.
+        await h.commands.get("subagents").handler("cap 2", h.ctx);
+        const changed = h.request();
+        assert.equal(changed.length, third.length + 1);
+        assert.deepEqual(changed.slice(0, third.length), third, "a settings change does not alter earlier messages");
+        assert.equal(changed.at(-1).customType, SETTINGS);
+        assert.match(changed.at(-1).content, /concurrency limit 2 \(session\)/);
+        assert.deepEqual(h.sent.map(({ options }) => options), [{ triggerTurn: false }]);
+        assert.equal(h.run("After change"), systemPrompt, "mode and limit changes leave the system prompt unchanged");
+        assert.equal(h.settingsMessages().length, 2, "the next run does not repeat a revision the context already holds");
+        await h.commands.get("subagents").handler("mode coordinator", h.ctx);
+        assert.equal(h.run("After mode"), systemPrompt);
+        assert.equal(h.settingsMessages().length, 3);
+
+        // Compaction that summarizes the settings message away gets one fresh copy on the next run.
+        const compactedAt = h.entries.length;
+        h.view.contextEntries = () => [{ type: "message", message: { role: "user", content: "Summary" } }, ...h.entries.slice(compactedAt)];
+        h.run("After compaction");
+        const compacted = h.settingsMessages();
+        assert.equal(compacted.length, 1);
+        assert.match(compacted[0].content, /delegation mode coordinator \(session\); concurrency limit 2 \(session\)/);
+        h.run("Later");
+        assert.equal(h.settingsMessages().length, 1);
+        gate.release(2);
+    } finally {
+        setConfigForTests(undefined);
+        _resetSharedCapacityGateForTests();
+    }
+});
+
+test("the delegation system prompt is deterministic, covers every mode, and points to live capacity", () => {
+    const h = harness();
+    const prompt = h.run();
+    assert.equal(prompt, harness().run(), "independent instances produce the same prompt");
+    for (const mode of ["manual", "adaptive", "coordinator"]) assert.ok(prompt.includes(delegationPrompt(mode)));
+    assert.match(prompt, /ceiling, not a target/);
+    assert.match(prompt, /call subagent_settings for current running, reserved, and available slots/);
+    assert.doesNotMatch(prompt, /\b\d+\b/, "no counts, limits, or timestamps");
+    assert.match(h.tools.get("subagent_settings").description, /Call it for live capacity/);
 });
 
 test("same-value session overrides revise provenance and saving restores the configured revision", async () => {
@@ -102,7 +204,7 @@ test("same-value session overrides revise provenance and saving restores the con
             const result = await h.tools.get("subagent_settings").execute();
             assert.notEqual(result.isError, true);
             assert.deepEqual(h.entries, entries, "inspection does not persist a settings snapshot");
-            assert.deepEqual(h.context().at(-1).details, result.structuredContent,
+            assert.deepEqual(h.latestSettings().details, stable(result.structuredContent),
                 "the next request context and inspection agree on values, sources, and revision");
             return result.structuredContent;
         };
@@ -238,7 +340,7 @@ test("/subagents save confirms, preserves other config, and clears the session o
         assert.equal(saved.delegationMode, "coordinator");
         assert.equal(saved.maxConcurrent, 7);
         assert.equal(saved.defaultTools, "read");
-        assert.equal(h.entries.at(-1).data.mode, null);
+        assert.equal(h.entries.findLast((entry) => entry.customType === "pi-better-subagents-delegation").data.mode, null);
         assert.equal(h.mode(), "coordinator");
         await h.handlers.get("session_start")({ reason: "reload" }, { ...h.ctx, mode: "print", hasUI: false, cwd: process.cwd(), sessionManager: h.ctx.sessionManager, isIdle: () => true });
         assert.equal(h.mode(), "coordinator", "a saved default survives reload after the session override is cleared");
@@ -259,16 +361,16 @@ test("/subagents reports config, changes only this session, rejects invalid args
         assert.ok(command);
         await command.handler("", h.ctx);
         assert.match(h.notifications.at(-1).message, /^Delegation mode: manual\. Concurrent subagents: 4\./);
-        assert.match(h.prompt(), /Delegation mode: manual/);
+        assert.match(h.latestSettings().content, /delegation mode manual/);
         await command.handler("mode coordinator", h.ctx);
         assert.equal(h.mode(), "coordinator");
-        assert.match(h.prompt(), /Call agents_catalog/);
+        assert.match(h.latestSettings().content, /delegation mode coordinator/);
         await command.handler("mode adaptive extra", h.ctx);
         assert.match(h.notifications.at(-1).message, /Usage: \/subagents/);
         assert.equal(h.notifications.at(-1).level, "warning");
         assert.equal(h.mode(), "coordinator");
         await command.handler("mode adaptive", h.ctx);
-        assert.match(h.prompt(), /Delegation mode: adaptive/);
+        assert.match(h.latestSettings().content, /delegation mode adaptive/);
         await h.handlers.get("session_start")({ reason: "reload" }, { ...h.ctx, mode: "print", hasUI: false, cwd: process.cwd(), sessionManager: { ...h.ctx.sessionManager, getSessionId: () => "test" }, isIdle: () => true });
         assert.equal(h.mode(), "adaptive");
         await command.handler("mode coordinator", h.ctx);

@@ -27,10 +27,13 @@ function harness(extensions) {
   const tools = new Map();
   const commands = new Map();
   const entries = [];
+  // Custom messages that join the conversation (sendMessage or a before_agent_start message).
+  const conversation = [];
   const events = new EventEmitter();
   const pi = {
     events,
     appendEntry(customType, data) { entries.push({ type: "custom", customType, data }); },
+    sendMessage(message) { conversation.push({ role: "custom", ...message }); },
     registerTool(tool) { tools.set(tool.name, tool); },
     registerCommand(name, command) { commands.set(name, command); },
     on(name, handler) {
@@ -48,7 +51,7 @@ function harness(extensions) {
   return {
     tools, commands, entries, ctx,
     async context() {
-      let messages = [];
+      let messages = structuredClone(conversation);
       for (const handler of handlers.get("context") ?? []) {
         const result = await handler({ type: "context", messages }, ctx);
         if (result?.messages) messages = result.messages;
@@ -60,6 +63,7 @@ function harness(extensions) {
       for (const handler of handlers.get("before_agent_start") ?? []) {
         const result = await handler({ systemPrompt }, ctx);
         if (result?.systemPrompt !== undefined) systemPrompt = result.systemPrompt;
+        if (result?.message) conversation.push({ role: "custom", ...result.message });
       }
       return systemPrompt;
     },
@@ -112,8 +116,8 @@ test("manual mode keeps the same execution policy while four host milestones rem
     const coordinator = await h.prompt();
     const policyBlock = prompt => prompt.split("\n\nCurrent structured execution plan:")[0];
     assert.equal(policyBlock(manual), policyBlock(coordinator), "settings changes must not rewrite the static execution policy");
-    assert.match(manualContext, /Delegation mode: manual/);
-    assert.match(await h.context(), /Delegation mode: coordinator/);
+    assert.match(manualContext, /delegation mode manual/);
+    assert.match(await h.context(), /delegation mode coordinator/);
     await h.tools.get("update_plan").execute("start", {
       plan: steps.map((step) => hosts.includes(step.id) ? { ...step, status: "in_progress" } : step),
     }, undefined, undefined, h.ctx);

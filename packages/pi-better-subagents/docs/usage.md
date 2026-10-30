@@ -47,6 +47,28 @@ is available. Reset restores saved defaults without changing config.
 navigating a branch restores its settings. On the navigator `main` sheet, `m`
 cycles the session mode and `ctrl+s` saves only that mode default.
 
+The foreground system prompt carries fixed delegation guidance for all three
+modes, the rule that the cap is a ceiling rather than a target, and a pointer to
+`subagent_settings` for live capacity. It holds no counts or timestamps, so it
+stays identical across requests. The active mode and cap reach the model as a
+compact `Subagent settings` message (custom type `pi-better-subagents-settings`,
+hidden in the transcript) with the settings revision, mode, cap, and their
+sources. It contains no running, reserved, or available counts. The message is
+stored in the conversation once per settings revision, where the change happens:
+
+- A change through `/subagents`, the settings page, or the navigator adds it
+  immediately while idle. During a run it is added after the current turn's tool
+  results, reaches the next model request of that run, and starts no extra turn.
+- At the start of each prompt, a missing or outdated message is added once. This
+  covers the first prompt, changed saved defaults, branch navigation, and
+  compaction that summarized the previous message.
+
+Earlier messages are never moved or rewritten, so each request extends the
+previous one and the provider's prompt cache keeps the history. The latest
+settings message is authoritative and replaces earlier mode guidance, including
+guidance in a plan. Settings are not broadcast to running children. Spawn
+admission always rechecks live capacity.
+
 - **Manual:** no proactive delegation, including in plan mode. A user request or
   explicit workflow requirement may still delegate.
 - **Adaptive:** delegate useful, substantial independent work while continuing
@@ -97,7 +119,7 @@ thresholds continue to take precedence for subagent health.
 |------|---------|--------------|
 | `subagent_spawn` | never | Launch a task in a background subagent; returns a run id at once. Params: `prompt`, `name`, `model`, `tools` (allowlist), `exclude_tools`, `sandbox`, `sandbox_dir`, `callback`, `clean`, `cwd`, `git_clone_workspace`, `approve`, `allow_nested`, and the [timing](#run-timing-deadline-ceiling-stuck) overrides `deadline_minutes`, `grace_minutes`, `max_minutes`, `stuck_minutes`. |
 | `subagent_spawn_batch` | never | Launch several independent subagents at once. Each job becomes a normal run. Params: `batchName`, `shared` (options applied to every job), `jobs[]` (each needs `prompt`; same optional params as `subagent_spawn`), `onCapacity` (`reject` or `launch-available`). |
-| `subagent_settings` | never | Read-only effective settings and capacity snapshot. No parameters. Returns `delegationMode`, `maxConcurrent`, per-setting `sources` (`session` or `config`), a stable settings `revision`, `runningCount`, `pendingCount`, `occupiedSlots`, and `availableSlots`. The limit is a ceiling, not a target; spawn admission rechecks live capacity. |
+| `subagent_settings` | never | Read-only effective settings and live capacity. No parameters. Returns `delegationMode`, `maxConcurrent`, per-setting `sources` (`session` or `config`), a stable settings `revision`, `runningCount`, `pendingCount`, `occupiedSlots`, and `availableSlots`. It is the only source of live counts; settings messages in the conversation carry none. The limit is a ceiling, not a target; spawn admission rechecks live capacity. |
 | `subagent_list` | never | Compact current-session list (default 10 rows / 1 KiB page). Params: `all` (machine-global / foreign session), `limit` (default 10, max 100), `cursor`, `max_bytes` (max 4 KiB), `status` (`running`, `completed`, `failed`, `killed`, `exited`, durable `orphaned`, `lost`). Incident counts are compact; no spend/tool histories. |
 | `subagent_output` | never | Bounded current-session excerpt (default 1 KiB / 10 lines). Params: `id`, `lines` (`tail_lines` is a deprecated alias), `cursor` (a returned `nextCursor`, `statusCursor`, or `incidentCursor`), `max_bytes` (max 4 KiB; raw 16 KiB default, 64 KiB max), `mode` (`raw` pages retained log bytes), `include` (`["cost"]`, `["tools"]`, or both: opt-in spend and tool-count lines), `all` (foreign-session id). Missing/unreadable logs are gaps, not empty healthy output. |
 | `subagent_result` | never | Finished-run answer for the current session (2048-byte page). Params: `id`, `cursor` (a returned `nextCursor` continues the answer; `statusCursor` / `incidentCursor` also accepted), `max_bytes` (maximum 8192 bytes), `lines` (optional line cap per answer page), `mode` (`raw`), `include` (`["cost"]`, `["tools"]`, or both), `all` (foreign-session id). Failures and exceptional lifecycle facts come before progress; no tool-name histories. TUI folding is display-only. |

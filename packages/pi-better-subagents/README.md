@@ -47,16 +47,17 @@ session overrides. `/subagents mode manual|adaptive|coordinator` and
 both. Lowering the cap blocks new single and batch launches, including launches
 still preparing, without stopping running work. Saved configuration changes are
 picked up on subsequent reads; explicit session overrides still take precedence.
-Before every model request, including continuations after tool calls,
-the foreground receives one temporary settings block with the current mode, cap,
-setting sources, revision, and running/reserved/available slots. The latest block
-replaces older snapshots and delegation guidance; it is not saved as conversation
-history. Changes reach the model at its next request, not during an in-flight
-response, and are not broadcast to running children. The cap is a ceiling, not a
-target number of agents. `subagent_settings` inspects the same effective state
-without changing it. Its revision is a stable fingerprint of mode, cap, and
-sources; occupancy changes do not change the revision. Admission rechecks capacity
-when spawning because the snapshot can become stale.
+The system prompt carries fixed guidance for every mode. A compact settings
+message with the mode, cap, setting sources, and revision (no live counts) is
+saved in the conversation once per settings change, at the point of change, and
+is never moved, so the prompt cache keeps earlier history. The latest message
+replaces older delegation guidance. A change made during a run reaches the next
+model request of that run, not an in-flight response. Settings are not broadcast
+to running children. The cap is a ceiling, not a target number of agents.
+`subagent_settings` reports the same settings plus live running, reserved, and
+available slots without changing anything. Its revision is a stable fingerprint
+of mode, cap, and sources; occupancy changes do not change the revision.
+Admission rechecks capacity when spawning.
 
 The navigator's `main` row retains its mode-only controls:
 `m` cycles the session mode, `ctrl+s` saves that default, and `x`

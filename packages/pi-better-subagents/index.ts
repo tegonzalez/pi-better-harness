@@ -37,7 +37,8 @@ import { parseRun, readRunTranscript, resetParseRunCursor, type Usage } from "./
 import { finalizeRun as finalizeRunCore } from "./finalization.ts";
 import { loadConfig, writeDelegationMode, writeSubagentSettings, isConcurrencyCap, normalizeConcurrencyCap, normalizeTools, resolveExtensionPath, selfDir, SAFE_DEFAULT_TOOLS, SAFE_CLEAN_TOOLS } from "./config.ts";
 import { createSubagentSettingsPage } from "./settings-page.ts";
-import { effectiveSubagentSettings, formatSubagentSettings, subagentSettingsTool, SUBAGENT_SETTINGS_CONTEXT } from "./effective-settings.ts";
+import { effectiveSubagentSettings, formatSubagentSettingsMessage, stableSubagentSettings, subagentDelegationSystemPrompt,
+    subagentSettingsTool, SUBAGENT_SETTINGS_CONTEXT } from "./effective-settings.ts";
 import { STEER_FILE_ENV, readSteerReceipt } from "./child-steer.ts";
 import {
     decideTiming,
@@ -1483,23 +1484,59 @@ export default function (pi: ExtensionAPI) {
     let catalogModelRegistry: ExtensionContext["modelRegistry"] | undefined;
     let delegationOverride: DelegationMode | undefined;
     let capOverride: number | undefined;
+    // Revision of the latest settings message in (or queued for) the model context. A settings
+    // message is appended once per revision and never moved, so earlier history stays byte-stable
+    // for prompt caching. Occupancy is not part of the revision; subagent_settings reports it live.
+    let announcedSettingsRevision: string | undefined;
     const activeConcurrencyCap = (): number => capOverride ?? normalizeConcurrencyCap(loadConfig().maxConcurrent);
+    const activeDelegationMode = (): DelegationMode => delegationOverride ?? normalizeDelegationMode(loadConfig().delegationMode);
+    const settingsMessage = () => {
+        const details = stableSubagentSettings({
+            delegationMode: activeDelegationMode(), maxConcurrent: activeConcurrencyCap(),
+            sources: { delegationMode: delegationOverride ? "session" : "config",
+                maxConcurrent: capOverride !== undefined ? "session" : "config" },
+        });
+        return { customType: SUBAGENT_SETTINGS_CONTEXT, content: formatSubagentSettingsMessage(details), display: false, details };
+    };
+    /** Revision of the latest settings message in the compaction-aware context of the current branch. */
+    const contextSettingsRevision = (ctx: ExtensionContext): string | undefined => {
+        const entries = ctx.sessionManager?.buildContextEntries?.();
+        if (!Array.isArray(entries)) return undefined;
+        for (let index = entries.length - 1; index >= 0; index--) {
+            const entry = entries[index]!;
+            if (entry.type !== "custom_message" || entry.customType !== SUBAGENT_SETTINGS_CONTEXT) continue;
+            const revision = (entry.details as { revision?: unknown } | undefined)?.revision;
+            return typeof revision === "string" ? revision : undefined;
+        }
+        return undefined;
+    };
+    // Persist one settings message at the point of change. Without triggerTurn, pi appends it
+    // immediately when idle, or after the current turn's tool results while streaming; it
+    // starts no turn and reaches the next model request of the same run.
+    const announceSettingsChange = (): void => {
+        const message = settingsMessage();
+        if (message.details.revision === announcedSettingsRevision) return;
+        announcedSettingsRevision = message.details.revision;
+        pi.sendMessage(message, { triggerTurn: false });
+    };
     const changeCap = (cap: number): void => {
         if (!isConcurrencyCap(cap)) throw new Error("Concurrent subagents must be a positive whole number.");
         capOverride = cap;
         pi.appendEntry("pi-better-subagents-cap", { version: 1, maxConcurrent: cap });
+        announceSettingsChange();
     };
     const changeMode = (mode: DelegationMode): void => {
         delegationOverride = mode;
         pi.appendEntry("pi-better-subagents-delegation", { version: 1, mode });
+        announceSettingsChange();
     };
     const resetSettings = (): void => {
         capOverride = undefined;
         delegationOverride = undefined;
         pi.appendEntry("pi-better-subagents-cap", { version: 1, maxConcurrent: null });
         pi.appendEntry("pi-better-subagents-delegation", { version: 1, mode: null });
+        announceSettingsChange();
     };
-    const activeDelegationMode = (): DelegationMode => delegationOverride ?? normalizeDelegationMode(loadConfig().delegationMode);
     const countRunning = () =>
         listActiveMetasForParent(process.pid).filter((meta) => effectiveStatus(meta) === "running").length;
     const effectiveSettings = () => effectiveSubagentSettings({
@@ -1533,11 +1570,14 @@ export default function (pi: ExtensionAPI) {
         }
         delegationOverride = undefined;
         pi.appendEntry("pi-better-subagents-delegation", { version: 1, mode: null });
+        announceSettingsChange();
         return { ok: true, message: `Delegation default saved: ${mode}.` };
     };
     const restoreDelegationMode = (ctx: ExtensionContext): void => {
         delegationOverride = undefined;
         capOverride = undefined;
+        // A reloaded session or another branch holds its own settings history.
+        announcedSettingsRevision = contextSettingsRevision(ctx);
         const branch = ctx.sessionManager?.getBranch?.();
         if (!Array.isArray(branch)) return;
         for (const entry of branch) {
@@ -2354,17 +2394,16 @@ export default function (pi: ExtensionAPI) {
     const discoveryTool = agentOperations.createDiscoveryTool(Type as never);
     pi.registerTool(discoveryTool as Parameters<ExtensionAPI["registerTool"]>[0]);
 
-    pi.on("before_agent_start", (event) => ({
-        systemPrompt: `${appendExecutionPolicy(event.systemPrompt)}\n\nUse the latest Subagent settings context block as the authoritative delegation mode and capacity snapshot. Its delegation guidance replaces earlier mode-specific guidance, including guidance in a plan. Inspect subagent_settings when needed; never treat the concurrency limit as a target number of agents.`,
-    }));
-
-    pi.on("context", (event) => {
-        const settings = effectiveSettings();
-        return { messages: [
-            ...event.messages.filter(message => message.role !== "custom" || message.customType !== SUBAGENT_SETTINGS_CONTEXT),
-            { role: "custom" as const, customType: SUBAGENT_SETTINGS_CONTEXT,
-                content: formatSubagentSettings(settings), display: false, details: settings, timestamp: Date.now() },
-        ] };
+    // No per-request context rewrite: the system prompt guidance is deterministic, and a settings
+    // message joins the persisted history only when the revision differs from the one the model
+    // context already holds (first run, config edits, branch navigation, or compaction).
+    pi.on("before_agent_start", (event, ctx) => {
+        const systemPrompt = `${appendExecutionPolicy(event.systemPrompt)}\n\n${subagentDelegationSystemPrompt()}`;
+        const message = settingsMessage();
+        announcedSettingsRevision = contextSettingsRevision(ctx);
+        if (message.details.revision === announcedSettingsRevision) return { systemPrompt };
+        announcedSettingsRevision = message.details.revision;
+        return { systemPrompt, message };
     });
 
     // ---- live-status lifecycle -----------------------------------------

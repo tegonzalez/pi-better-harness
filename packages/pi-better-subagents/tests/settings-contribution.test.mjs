@@ -26,13 +26,15 @@ test("subagents contributes the standalone settings opener with shared session a
     const commands = new Map();
     const handlers = new Map();
     const entries = [];
+    const sent = [];
     extension({
         events,
         registerTool() {},
         registerCommand(name, command) { commands.set(name, command); },
         on(name, handler) { handlers.set(name, handler); },
         appendEntry(customType, data) { entries.push({ type: "custom", customType, data }); },
-        sendMessage() { assert.fail("settings must not send messages"); },
+        // Each settings change persists one hidden settings message without starting a turn.
+        sendMessage(message, options) { sent.push({ message, options }); },
         sendUserMessage() { assert.fail("settings must not send user messages"); },
     });
     assert.equal(registrations.length, 2);
@@ -89,6 +91,12 @@ test("subagents contributes the standalone settings opener with shared session a
     await commands.get("subagents").handler("mode coordinator", ctx);
     await contribution.open(ctx);
     assert.match(pages.at(-1), /Delegation mode\s+coordinator/);
+    assert.deepEqual(sent.map(({ message, options }) => [message.customType, message.display, message.details.delegationMode,
+        message.details.sources.delegationMode, options]), [
+        ["pi-better-subagents-settings", false, "adaptive", "session", { triggerTurn: false }],
+        ["pi-better-subagents-settings", false, "adaptive", "config", { triggerTurn: false }],
+        ["pi-better-subagents-settings", false, "coordinator", "session", { triggerTurn: false }],
+    ], "page edit, save, and command each announce one settings revision; opening pages sends nothing");
 
     const beforeCatalog = entries.length;
     await agents.open(ctx);
