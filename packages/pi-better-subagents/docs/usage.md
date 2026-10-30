@@ -380,13 +380,32 @@ omitted `sandbox` also starts unconfined. Explicit `sandbox:true` enables task
 confinement without requiring another extension; `sandbox:false` cannot bypass
 an enabled human profile. Saved enabled profiles and session choices stay enabled.
 
-- **Repeat-failure guard.** When the same tool call (same tool, same arguments)
-  fails 3 times, the third result carries a `REPEATED FAILURE` notice and any
-  further identical call is blocked with `terminate`, ending the agent run. At
-  top level the turn ends and the user is notified; in a child (installed via
-  the child control extension in every mode, including `clean`) the run ends
-  and its final output escalates to the parent. A success of that call or new
-  user input clears the count.
+- **Repeat-failure guard.** The agent escalates instead of looping when:
+  - the identical call (same tool, same arguments) fails 3 times;
+  - one tool fails 5 times with the same error, whatever the arguments. Errors
+    match after quoted values, ids, paths and numbers are normalized, so
+    rephrasing a rejected `subagent_spawn` still counts. This rule skips the
+    exploration tools `bash`, `read`, `grep`, `find` and `ls`, where different
+    searches with no match or guessed missing paths are normal;
+  - the same call (same tool, same arguments) returns the identical successful
+    result 5 times in a row (no-progress polling). A successful call that
+    returns something new counts as progress and restarts every streak.
+
+  The triggering result carries a `REPEATED FAILURE` or `NO PROGRESS` notice
+  with the exact error, telling the model to stop and report the error, what it
+  tried and what it needs. From then on **every** tool call, of any tool, is
+  blocked with `terminate`. Pi ends a tool batch early only when every result in
+  it terminates, so blocking only the repeated call would not stop a model that
+  pairs it with another call. At top level the turn ends and the user gets a
+  warning notification; in a child (installed via the child control extension
+  in every mode, including `clean`) the run ends and its output escalates to the
+  parent. If blocking cannot end the loop (a call that never reaches the guard,
+  such as an unknown tool or invalid arguments, or a new turn after a fully
+  blocked batch), the guard aborts the run. A success of a tool clears its
+  same-error counts, and a success of a call clears that call's count. New
+  input (the user, or the parent's steer in a child) clears everything. Thresholds are `REPEAT_LIMIT` (3), `SIGNATURE_LIMIT` (5),
+  `POLL_LIMIT` (5) and the exempt set `SIGNATURE_EXEMPT_TOOLS` in
+  `repeat-guard.ts`.
 - **Blank optional strings mean omitted.** `agent: ""`, `model: ""`,
   `thinking: ""` and other empty or whitespace-only optional string fields in
   `subagent_spawn` and `subagent_spawn_batch` (shared and per job) are treated as

@@ -1893,7 +1893,7 @@ function catalogRoleSchema(purpose: string) {
 
 export default function (pi: ExtensionAPI) {
     initializeNavigatorPanels(pi);
-    // Top level: a repeated identical failing call ends the turn and escalates to the user.
+    // Top level: repeated failures or no-progress polling end the turn and escalate to the user.
     // Inside a child, child-steer already installed the guard (escalation to the parent).
     if (!isSubagentChild()) repeatGuard(pi as unknown as Parameters<typeof repeatGuard>[0], { child: false });
     const agentSessionSettings = createAgentSessionSettings(pi);

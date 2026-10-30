@@ -55,7 +55,7 @@ export function readSteerRequest(path: string): { id: string; text: string } | u
 }
 
 export default function childSteer(pi: SteerApi): void {
-    // Every child escalates a repeated identical failing call to its parent.
+    // Every child escalates repeated failures or no-progress polling to its parent.
     repeatGuard(pi, { child: true });
     const path = process.env[STEER_FILE_ENV];
     if (!path) return;
