@@ -54,7 +54,8 @@ if (base) {
     mkdirSync(join(projectRoot, ".git", "hooks"), { recursive: true });
     mkdirSync(join(projectRoot, ".git", "info"), { recursive: true });
     mkdirSync(join(projectRoot, ".git", "objects", "info"), { recursive: true });
-    for (const name of ["config", "config.worktree", "info/attributes", "objects/info/alternates", "objects/info/http-alternates"]) writeFileSync(join(projectRoot, ".git", name), "");
+    for (const name of ["config", "config.worktree", "info/attributes", "objects/info/alternates", "objects/info/http-alternates", "gitdir"]) writeFileSync(join(projectRoot, ".git", name), "");
+    writeFileSync(join(projectRoot, ".git", "commondir"), ".\n");
     for (const name of [".env", ".env.local", ".pi"]) writeFileSync(join(projectRoot, name), "");
     writeFileSync(join(otherProject, "secret.txt"), "other project\n");
     writeFileSync(join(shared, "doc.txt"), "shared doc\n");
