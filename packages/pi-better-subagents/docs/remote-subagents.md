@@ -73,7 +73,8 @@ With pi-better-sandbox active, a `subagent_spawn` / `subagent_spawn_batch` that 
 `resume`, or an agent mapped in `remoteAgents`) opens an SSH connection from the unconfined extension and runs
 the child with network on the target. It is therefore **refused while the parent's Network access is Off**, with
 the message "Sandbox: Network access is Off. A remote, resumed or remoteAgents-mapped subagent ...". Turn Network
-access on in `/sandbox` or spawn a local subagent. If the `subagents` settings cannot be read, a spawn that names
+access on in `/sandbox` or spawn a local subagent. The guard resolves `remoteAgents` with the same resolver as the spawn
+path (bundled `config.json`, then the saved `subagents` setting, or the un-migrated legacy config file). If the `subagents` settings cannot be read, a spawn that names
 an agent is refused (it cannot be proved local).
 
 ## Workspace: working folder, agent dir, policy

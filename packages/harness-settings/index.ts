@@ -111,3 +111,47 @@ export function updateHarnessSetting<T>(
     return next;
   });
 }
+
+/** Where a package's pre-settings configuration file lives (`<agent dir>/extensions/<name>-config.json`). */
+export function legacyExtensionConfigPath(name: string, seams: HarnessSettingsSeams = {}): string {
+  return join((seams.agentDir ?? getAgentDir)(), "extensions", `${name}-config.json`);
+}
+
+/**
+ * One resolver for a settings section: package-bundled defaults (every readable, valid file in
+ * `bundledPaths`, later ones winning), overlaid by the saved section, or by the legacy file when the
+ * section is absent. Unreadable saved or legacy data throws; a missing or invalid bundled file
+ * contributes nothing. The spawn path and policy guards both call this, so they cannot disagree.
+ * `migrate` copies a legacy file into the settings section (as `readHarnessSetting` does); guards leave it off.
+ */
+export function resolveHarnessSection<T extends object>(
+  key: string,
+  options: {
+    seams?: HarnessSettingsSeams;
+    legacy?: { path: string; parse: (value: unknown) => T };
+    bundledPaths?: readonly string[];
+    migrate?: boolean;
+  } = {},
+): T {
+  const { seams = {}, legacy, bundledPaths = [], migrate = false } = options;
+  let bundled: Record<string, unknown> = {};
+  for (const path of bundledPaths) {
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+      const value = legacy ? legacy.parse(parsed) : parsed;
+      if (value && typeof value === "object" && !Array.isArray(value)) bundled = { ...bundled, ...value as Record<string, unknown> };
+    } catch { /* absent or invalid: no defaults from this file */ }
+  }
+  let user: unknown;
+  if (migrate) user = readHarnessSetting<unknown>(key, seams, legacy);
+  else {
+    const values = section(lockedRead(harnessSettingsPath(seams)));
+    if (Object.hasOwn(values, key)) user = values[key];
+    else if (legacy) {
+      try { user = legacy.parse(JSON.parse(readFileSync(legacy.path, "utf8"))); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    }
+  }
+  if (user !== undefined) object(user, `Setting ${key}`);
+  return { ...bundled, ...(user as Record<string, unknown> | undefined) } as T;
+}
