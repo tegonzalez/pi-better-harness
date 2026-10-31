@@ -9,8 +9,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { accessSync, constants, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
@@ -28,8 +28,24 @@ const broad: SandboxPermissions = {
  * A fixture home outside every temp root: a home under temp would make every
  * path in it removable and prove nothing about the home rules.
  */
+/**
+ * An explicit fixture base that is writable and outside every temp root (override with
+ * PI_SANDBOX_TEST_NON_TEMP_BASE); the checkout's own location is only one candidate, so the
+ * suite passes wherever the checkout lives.
+ */
+function nonTempFixtureBase(): string {
+    const scratch = ["/tmp", "/var/tmp", "/dev/shm", tmpdir()].map((path) => { try { return realpathSync(path); } catch { return path; } });
+    const candidates = [process.env.PI_SANDBOX_TEST_NON_TEMP_BASE, import.meta.dirname, homedir()].filter((entry): entry is string => !!entry);
+    for (const dir of candidates) {
+        let real: string;
+        try { real = realpathSync(dir); accessSync(real, constants.W_OK); } catch { continue; }
+        if (!scratch.some((root) => real === root || real.startsWith(root + "/"))) return real;
+    }
+    throw new Error("no writable fixture base outside the temp directories; set PI_SANDBOX_TEST_NON_TEMP_BASE");
+}
+
 function fixture(run: (paths: { base: string; home: string; project: string; sibling: string }) => void): void {
-    const base = realpathSync(mkdtempSync(join(import.meta.dirname, ".broad-fixture-")));
+    const base = realpathSync(mkdtempSync(join(nonTempFixtureBase(), ".broad-fixture-")));
     const home = join(base, "home");
     const project = join(home, "projects", "task");
     const sibling = join(home, "projects", "other-repo");
