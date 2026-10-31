@@ -217,7 +217,7 @@ export function createRepeatGuard(limit = REPEAT_LIMIT, pollLimit = POLL_LIMIT, 
 }
 
 export function isSubagentChild(env: NodeJS.ProcessEnv = process.env): boolean {
-    return Boolean(env.PI_SUBAGENT_STEER_FILE);
+    return Boolean(env.PI_SUBAGENT_STEER_DIR || env.PI_SUBAGENT_STEER_FILE);
 }
 
 function abort(ctx: any): void {

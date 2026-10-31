@@ -124,6 +124,35 @@ thresholds continue to take precedence for subagent health.
 | `subagent_output` | never | Bounded current-session excerpt (default 1 KiB / 10 lines). Params: `id`, `lines` (`tail_lines` is a deprecated alias), `cursor` (a returned `nextCursor`, `statusCursor`, or `incidentCursor`), `max_bytes` (max 4 KiB; raw 16 KiB default, 64 KiB max), `mode` (`raw` pages retained log bytes), `include` (`["cost"]`, `["tools"]`, or both: opt-in spend and tool-count lines), `all` (foreign-session id). Missing/unreadable logs are gaps, not empty healthy output. |
 | `subagent_result` | never | Finished-run answer for the current session (2048-byte page). Params: `id`, `cursor` (a returned `nextCursor` continues the answer; `statusCursor` / `incidentCursor` also accepted), `max_bytes` (maximum 8192 bytes), `lines` (optional line cap per answer page), `mode` (`raw`), `include` (`["cost"]`, `["tools"]`, or both), `all` (foreign-session id). Failures and exceptional lifecycle facts come before progress; no tool-name histories. TUI folding is display-only. |
 | `subagent_stop` | never | SIGTERM a running run's process group. |
+| `subagent_steer` | never | Amend a running child's instructions. Params: `id`, `message`. See [Steering a running subagent](#steering-a-running-subagent). |
+
+## Steering a running subagent
+
+`subagent_steer` sends a running child one more instruction, for example "MTP
+is now a hard requirement", without stopping or respawning it.
+
+- **Delivery.** The child receives it as an ordinary user message, prefixed
+  `Instruction amendment from your parent:`, at its next turn boundary: after
+  its current tool call finishes. It never interrupts a running tool call. It
+  works for any provider or model, because it is just a user message.
+- **Scope.** Only your own running runs (current session). Unknown ids,
+  foreign-session runs, and runs that have finished (or whose child process is
+  gone) are refused with the reason.
+- **Acknowledgement.** The tool returns at once with `queued` and a steer id;
+  that is not delivery. `subagent_list` rows show `steer: N delivered, M pending`;
+  `subagent_output` and `subagent_result` show the counts, the pending ids, and
+  the last delivery time. If a steer is still undelivered when the run ends,
+  `subagent_result` says `NOT delivered` with its id; it is never dropped silently.
+- **Idle child.** A child runs one prompt and exits when its agent loop
+  settles. If that has already happened, the tool says the steer may not be
+  delivered.
+- **Mechanics.** Each request is its own file in the run's `steer/` queue
+  directory. The harness extension in the child picks pending requests up
+  (polled every 2 s and at each turn end), hands them to Pi's steering queue in
+  order, once each, and writes a per-request receipt when the message enters
+  the conversation. The soft-deadline wrap-up uses the same queue. The receipt
+  matches the message's exact text, so if another extension rewrites user
+  input, the steer keeps showing as pending even after it arrived.
 
 ## Codemode batch launches
 
@@ -249,10 +278,11 @@ example it crashed or a user stopped it), `stopped: ceiling`, or `stuck`. The sp
 requested, deadline wake, stuck wake, stop reason) are stored in the run's
 metadata at launch, so `/reload` keeps the deadline and never repeats a wake.
 The parent checks timing on its 15-second supervision tick. The steer travels
-through a request file in the run directory, read by a small harness extension
-loaded into every child (it registers no tools and runs no commands). When the
-message enters the child's conversation, the extension writes a receipt file
-next to the request; grace starts at that time. The extension runs in the
+through the run's steer queue (the same one [`subagent_steer`](#steering-a-running-subagent)
+uses), read by a small harness extension loaded into every child (it registers
+no tools and runs no commands). When the message enters the child's
+conversation, the extension writes a receipt next to the request; grace starts
+at that time. The extension runs in the
 trusted Pi process, and the child's confined tools cannot write the run
 directory, so a child cannot forge a receipt. Without a receipt and with no
 tool call running (for example, a child started without the extension), grace

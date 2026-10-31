@@ -84,10 +84,11 @@ export function formatSubagentListRow(meta, p) {
     const failure = p.failure ? ` · ${bounded(p.failure, 60)}` : "";
     const timingNote = describeTiming({ ...meta, status: meta.status });
     const timing = timingNote ? ` · ${timingNote.short}` : "";
+    const steer = p.steer ? ` · ${p.steer}` : "";
     const batch = meta.batchId
         ? `  [batch: ${meta.batchName ? `${bounded(meta.batchName, 40)} ` : ""}${bounded(meta.batchId, 60)}]`
         : "";
-    return `• ${name}${meta.id}  [${status}]  ${bounded(meta.model ?? "?", 60)}  ${elapsed}${health}${timing}${batch}${failure}\n    ${promptPreview(meta)}`;
+    return `• ${name}${meta.id}  [${status}]  ${bounded(meta.model ?? "?", 60)}  ${elapsed}${health}${timing}${steer}${batch}${failure}\n    ${promptPreview(meta)}`;
 }
 
 export function collectSubagentList(p) {

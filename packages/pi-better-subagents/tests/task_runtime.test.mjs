@@ -91,7 +91,7 @@ test('the harness steer extension loads in a confined child without changing its
         '--no-skills', '--no-prompt-templates', '--no-themes', '--no-approve', '--no-builtin-tools'], {
         cwd: f.project, encoding: 'utf8', timeout: 30000,
         input: '{"type":"get_state","id":"startup"}\n',
-        env: { ...process.env, PI_CODING_AGENT_DIR: f.agent, PI_SUBAGENT_STEER_FILE: join(f.control, 'steer.json') },
+        env: { ...process.env, PI_CODING_AGENT_DIR: f.agent, PI_SUBAGENT_STEER_DIR: join(f.control, 'steer') },
     });
     assert.equal(result.status, 0, result.stderr + result.stdout);
     const rows = (result.stderr + '\n' + result.stdout).split('\n').flatMap((line) => { try { return [JSON.parse(line)]; } catch { return []; } });

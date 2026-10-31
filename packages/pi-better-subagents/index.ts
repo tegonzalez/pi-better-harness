@@ -12,7 +12,7 @@
  */
 
 import { execSync } from "node:child_process";
-import { writeFileSync, mkdirSync, renameSync, statSync } from "node:fs";
+import { writeFileSync, mkdirSync, statSync } from "node:fs";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import * as PiCodingAgent from "@earendil-works/pi-coding-agent";
 import * as PiTui from "@earendil-works/pi-tui";
@@ -39,7 +39,7 @@ import { loadConfig, writeDelegationMode, writeSubagentSettings, isConcurrencyCa
 import { createSubagentSettingsPage } from "./settings-page.ts";
 import { effectiveSubagentSettings, formatSubagentSettingsMessage, stableSubagentSettings, subagentDelegationSystemPrompt,
     subagentSettingsTool, SUBAGENT_SETTINGS_CONTEXT } from "./effective-settings.ts";
-import { STEER_FILE_ENV, readSteerReceipt } from "./child-steer.ts";
+import { STEER_DIR_ENV, enqueueSteer, receiptForId } from "./steer-queue.ts";
 import {
     decideTiming,
     describeTiming,
@@ -74,6 +74,7 @@ import {
     discardFailedLaunch,
     logPathFor,
     promptPathFor,
+    steerDirFor,
     nextRunId,
     writeMeta,
     readMeta,
@@ -129,6 +130,7 @@ import {
     subagentOutputTool,
     subagentResultTool,
     subagentStopTool,
+    subagentSteerTool,
 } from "./tools.ts";
 import { stopRun } from "./stop.ts";
 import {
@@ -194,6 +196,7 @@ const SUBAGENT_TOOLS = [
     "subagent_settings",
     "subagent_output",
     "subagent_stop",
+    "subagent_steer",
     "subagent_result",
     "agents_catalog",
 ];
@@ -653,10 +656,6 @@ function deliverHealthCallback(pi: ExtensionAPI | undefined, meta: RunMeta, stat
 /** Incremental progress read per run (rebuilt from the log after /reload). */
 const progressCache = new Map<string, { cursor?: LogCursor; state: ProgressState }>();
 
-function steerPathFor(id: string): string {
-    return join(runDir(id), "steer.json");
-}
-
 function childSteerExtensionPath(): string {
     return join(selfDir(), "child-steer.ts");
 }
@@ -688,11 +687,9 @@ function patchTiming(id: string, patch: Partial<NonNullable<RunMeta["timing"]>>)
     return current;
 }
 
+/** Queue the deadline wrap-up through the run's steer queue (the same path as subagent_steer). */
 function requestSteer(meta: RunMeta, now: number): void {
-    const path = steerPathFor(meta.id);
-    const tmp = `${path}.${process.pid}.tmp`;
-    writeFileSync(tmp, JSON.stringify({ id: `deadline:${meta.id}`, text: steerText(meta.timing!, meta.startedAt), at: now }));
-    renameSync(tmp, path);
+    enqueueSteer(steerDirFor(meta.id), { id: `deadline:${meta.id}`, text: steerText(meta.timing!, meta.startedAt), kind: "deadline", at: now });
 }
 
 function timingLabel(meta: RunMeta): string {
@@ -782,8 +779,8 @@ function enforceTiming(pi: ExtensionAPI | undefined, meta: RunMeta, now: number)
     if (progress?.lastProgressAt !== undefined && progress.lastProgressAt > (timing.lastProgressAt ?? 0)) patch.lastProgressAt = progress.lastProgressAt;
     if (timing.steerRequestedAt !== undefined && timing.steerDeliveredAt === undefined) {
         // The child's receipt for this run's steer; clamped so a skewed clock cannot move grace earlier than the request.
-        const receipt = readSteerReceipt(steerPathFor(meta.id));
-        if (receipt?.id === `deadline:${meta.id}`) patch.steerDeliveredAt = Math.min(now, Math.max(receipt.at, timing.steerRequestedAt));
+        const receipt = receiptForId(steerDirFor(meta.id), `deadline:${meta.id}`);
+        if (receipt) patch.steerDeliveredAt = Math.min(now, Math.max(receipt.at, timing.steerRequestedAt));
     }
     if (Object.keys(patch).length) meta = patchTiming(meta.id, patch) ?? meta;
     const actions = decideTiming(meta.timing, progress, now);
@@ -1807,7 +1804,8 @@ export default function (pi: ExtensionAPI) {
         const trustedExtArgs = [...new Set(taskTools?.trusted.map((tool) => tool.loadPath) ?? [])]
             .filter((path) => !resolvedExtArgs.includes(path)).flatMap((path) => ["--extension", path]);
         // The harness's own child control extension (no tools, no command I/O) rides along in every
-        // mode, including clean: it is how a soft-deadline steer reaches the child session.
+        // mode, including clean: it is how parent steers (subagent_steer, the soft-deadline wrap-up)
+        // reach the child session.
         const extArgs = [...resolvedExtArgs, ...trustedExtArgs, "--extension", childSteerExtensionPath()]
             .map((value, index, all) => sandboxEnabled && all[index - 1] === "--extension" ? canonicalizePath(value) : value);
         if (sandboxEnabled && resolution.mode === "inherit") {
@@ -1881,7 +1879,7 @@ export default function (pi: ExtensionAPI) {
                 throw new Error(`Max concurrent subagents (${maxConcurrent}) reached. Stop or let some finish first.`);
             }
             spawned = spawnDetached({ file: cmd.file, fileArgs: cmd.fileArgs, cwd, logPath: logPathFor(id),
-                env: { [STEER_FILE_ENV]: steerPathFor(id) } });
+                env: { [STEER_DIR_ENV]: steerDirFor(id) } });
         } catch (error) {
             // Nothing references the run yet (no metadata): drop its directory (prompt, control/), its
             // provenance record, its session directory, its clone workspace, and the task scratch, so a
@@ -2290,6 +2288,7 @@ export default function (pi: ExtensionAPI) {
     const acceptanceResultTool = subagentResultTool(Type, toolSession);
     pi.registerTool(acceptanceResultTool);
     publishAcceptanceHooks(acceptanceResultTool);
+    pi.registerTool(subagentSteerTool(Type, toolSession));
     const acceptanceStopTool = subagentStopTool(Type, { onStopped: renderWidget });
     acceptanceStopToolRef = acceptanceStopTool;
     pi.registerTool(acceptanceStopTool);
