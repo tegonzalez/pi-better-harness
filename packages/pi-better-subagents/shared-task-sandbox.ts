@@ -11,7 +11,7 @@ import { unlink } from "node:fs/promises";
 import { accessSync, constants, lstatSync, mkdirSync, mkdtempSync, readlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, parse, resolve, sep } from "node:path";
-import { canonicalizePath, compileWritePolicy, isRemovableUnderWrite, maybeBuildSandboxCommand, type SandboxPermissions } from "./shared-sandbox-core.ts";
+import { canonicalizePath, compileWritePolicy, confinedEnvironment, isRemovableUnderWrite, maybeBuildSandboxCommand, type SandboxPermissions } from "./shared-sandbox-core.ts";
 import { createTaskFileOperations, type TaskFileController } from "./shared-task-files.ts";
 import { APPLY_PATCH_TOOL, createApplyPatchToolDefinition } from "./shared-task-apply-patch.ts";
 import { createProcessListToolDefinition, PROCESS_LIST_TOOL } from "./shared-task-process-list.ts";
@@ -132,7 +132,13 @@ export function createTaskBashOperations(
             if (shell.commandTransport === "stdin") throw new Error("Sandbox: this shell cannot be confined by the available backend.");
             const scratch = plan.policy.runtimeWrite?.[0];
             // Git inventory otherwise creates optional locks in an outside gitdir it cannot unlink (#419).
-            const taskEnv = { GIT_OPTIONAL_LOCKS: "0", ...process.env, ...options.env,
+            // Read confinement (Linux, Outside project = Off) clears the environment: only the
+            // policy allowlist reaches the child, so keys and tokens are never inherited. Compiling
+            // also applies the process-wide plan published at launch, or refuses the launch.
+            const confinement = compileWritePolicy(plan.policy).readConfinement;
+            const inherited = confinement ? confinedEnvironment(confinement, { ...process.env, ...options.env })
+                : { ...process.env, ...options.env };
+            const taskEnv = { GIT_OPTIONAL_LOCKS: "0", ...inherited,
                 ...(scratch ? { TMPDIR: scratch, TMP: scratch, TEMP: scratch } : {}) };
             if (options.signal?.aborted) throw new Error("aborted");
             if (options.timeout !== undefined && (!Number.isFinite(options.timeout) || options.timeout <= 0 || options.timeout * 1000 > 2147483647)) {

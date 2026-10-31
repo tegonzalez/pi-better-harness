@@ -234,3 +234,45 @@ test("confined Git inventory avoids optional locks in linked-worktree metadata (
     assert.equal(mutation.exitCode, 0, mutation.output);
     assert.equal(mutation.output.trim(), "added.txt", "the default must not disable required Git index writes");
 });
+
+// Read confinement through the task runtime's bash: the child sees only the policy's environment.
+import { describeSandboxSupport, publishProcessReadConfinement } from "../sandbox-core/index.ts";
+import { hashPolicy, parseReadConfinementPolicy, planReadConfinement } from "../sandbox-core/read-confinement.ts";
+
+const bwrapSupport = describeSandboxSupport();
+const bwrapUsable = process.platform === "linux" && bwrapSupport.supported && bwrapSupport.backend === "linux-bubblewrap" &&
+    childProcess.spawnSync(bwrapSupport.executable, ["--ro-bind", "/", "/", "--unshare-net", "true"]).status === 0;
+
+test("task bash under a published read-confinement plan clears key/token variables and forces the synthetic PATH",
+    { skip: !bwrapUsable && "usable bubblewrap is not available" }, async (t) => {
+    const base = realpathSync(mkdtempSync(join("/var/tmp", "task-bash-rc-")));
+    const root = join(base, "project"), home = join(base, "home"), control = join(base, "control");
+    for (const path of [root, home, control]) mkdirSync(path);
+    const raw = { version: 1 as const, env: { allow: ["ALLOWED_BY_POLICY"] } };
+    const mounts = planReadConfinement({ policy: parseReadConfinementPolicy(raw), source: "test", sha256: hashPolicy(raw) }, root,
+        { home, env: { PATH: "/usr/bin:/bin" }, passwdHomes: () => [] });
+    const saved = { ...process.env };
+    Object.assign(process.env, { OPENAI_API_KEY: "sk-leak", GITHUB_TOKEN: "ghp-leak", ALLOWED_BY_POLICY: "yes" });
+    publishProcessReadConfinement({ state: "active", mounts });
+    t.after(() => {
+        publishProcessReadConfinement(undefined);
+        for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
+        Object.assign(process.env, saved);
+        rmSync(base, { recursive: true, force: true });
+    });
+    const plan = { confined: true as const, profilePath: join(control, "task.sb"), policy: {
+        writableRoot: root, home, denyWrite: [control],
+        permissions: { projectFiles: "read-write" as const, outsideProject: "off" as const,
+            storedCredentials: "off" as const, commands: true, network: false },
+    } };
+    const ops = createTaskBashOperations({ requireLaunchPlan: () => plan });
+    let out = "";
+    const result = await ops.exec("/usr/bin/env", root, { onData: (chunk: Buffer) => { out += chunk.toString(); }, env: { ANOTHER_TOKEN: "tok-leak" } });
+    assert.equal(result.exitCode, 0, out);
+    assert.doesNotMatch(out, /leak|OPENAI|GITHUB|ANOTHER_TOKEN/);
+    assert.match(out, /ALLOWED_BY_POLICY=yes/);
+    assert.match(out, /^PATH=\/nonexistent-pi-confined$/m);
+    // A failed plan refuses the launch instead of running with the host environment.
+    publishProcessReadConfinement({ state: "failed", reason: "cap exceeded" });
+    await assert.rejects(ops.exec("/usr/bin/env", root, { onData: () => {} }), /failed closed: cap exceeded/);
+});
