@@ -1076,6 +1076,7 @@ export function parseRunForLifecycle(id: string): ParsedRun {
 const PARSE_EVENT_TYPES: ReadonlySet<string> = new Set([
     "agent_end",
     "agent_settled",
+    "remote_session_stats",
     "message_end",
     "turn_end",
     "message_update",
@@ -1234,6 +1235,19 @@ function foldParseEvent(state: ParseState, e: Record<string, unknown>): void {
         state.sawEnd = true;
     }
     if (type === "agent_settled") state.sawEnd = true;
+
+    // Remote runs: the remote pi's own get_session_stats is the authoritative spend for the session
+    // (it includes tool-reported and compaction usage that per-message sums miss).
+    if (type === "remote_session_stats") {
+        const data = e.data as { tokens?: { input?: number; output?: number; cacheRead?: number }; cost?: number } | undefined;
+        const tokens = data?.tokens;
+        if (tokens) {
+            state.usage.input = tokens.input ?? 0;
+            state.usage.output = tokens.output ?? 0;
+            state.usage.cacheRead = tokens.cacheRead ?? 0;
+            if (typeof data?.cost === "number") state.usage.costUSD = data.cost;
+        }
+    }
 
     // Progress signal + fallback final: finalized assistant turns.
     // Accumulate spend from `message_end` only (fires once per turn), so

@@ -93,6 +93,7 @@ export function mergeJobOptions(shared, job) {
         // spawnSubagentRun so batch jobs can request disposable clone workspaces.
         git_clone_workspace: job.git_clone_workspace ?? shared?.git_clone_workspace,
         approve: job.approve ?? shared?.approve,
+        remote: job.remote ?? shared?.remote,
         allow_nested: job.allow_nested ?? shared?.allow_nested,
         // Native session id selected for this JOB only. A shared value would make
         // every job contend for the same conversation writer, so it is not inherited.

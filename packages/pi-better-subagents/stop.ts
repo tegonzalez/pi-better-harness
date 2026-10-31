@@ -37,7 +37,11 @@ import {
     writeMeta,
     type RunMeta,
 } from "./registry.ts";
-import { killProcessTree } from "./spawn.ts";
+import { killProcessTree, processExists } from "./spawn.ts";
+import { existsSync, rmSync } from "node:fs";
+import { stopRemoteProcess, type RemoteStopResult, type RemoteRunMeta } from "./remote.ts";
+import { failurePath } from "./failures.ts";
+import { observeFailures } from "./shared-failure-observations.ts";
 
 export type StopOutcome =
     | { action: "stopped"; id: string }
@@ -55,6 +59,10 @@ export interface StopDeps {
     probe?: ProcessProbe;
     /** Clock seam for durable timestamps. */
     now?: () => number;
+    /** Remote termination seam (ssh); defaults to `stopRemoteProcess`. */
+    remoteStop?: (remote: RemoteRunMeta) => RemoteStopResult;
+    /** Bridge signal seam for the RPC abort request; defaults to SIGUSR2 on the bridge pid. */
+    signalBridge?: (pid: number) => void;
 }
 
 /** Recorded process group for related-work signals (ADR 0002). */
@@ -163,6 +171,39 @@ function cleanupOrphanedRun(meta: RunMeta, probe: ProcessProbe, now: number): St
     return finalizeOrphanedWithoutProcess(meta, now);
 }
 
+function sleepSync(ms: number): void {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Remote stop sequence: (1) ask the local bridge to send RPC abort and wait for its marker,
+ * (2) terminate the remote process group and verify it is gone, (3) only then finalize locally.
+ * An unverifiable remote stop fails closed: the run keeps its status and an incident explains why.
+ */
+function stopRemoteRun(meta: RunMeta, status: string, probe: ProcessProbe, now: number, deps: StopDeps): StopOutcome {
+    const remote = meta.remote!;
+    if ((status === "running" || status === "orphaned") && processExists(meta.pid)) {
+        try { rmSync(remote.abortDonePath, { force: true }); } catch { /* ignore */ }
+        try { (deps.signalBridge ?? ((pid) => process.kill(pid, "SIGUSR2")))(meta.pid); } catch { /* bridge already gone */ }
+        const deadline = Date.now() + remote.abortWaitMs;
+        while (!existsSync(remote.abortDonePath) && Date.now() < deadline && processExists(meta.pid)) sleepSync(50);
+    }
+    const result = (deps.remoteStop ?? stopRemoteProcess)(meta.remote!);
+    if (!result.verified) {
+        observeFailures(failurePath(meta.id), [{
+            id: `remote-stop:${now}`, operation: "remote-stop", kind: "failure", category: "remote",
+            summary: `Remote stop on ${remote.host} was not verified: ${result.reason}. The run was left ${status}; retry subagent_stop.`,
+        }], now);
+        throw new Error(`Remote stop not verified for ${meta.id}: ${result.reason}. The run was left ${status}; retry subagent_stop.`);
+    }
+    if (status === "running" || status === "orphaned") {
+        terminateRelatedWork(meta);
+        return recordKilled(meta, now);
+    }
+    if (status === "lost") return { action: "finalized", id: meta.id, status: "lost" };
+    return finalizeOrphanedWithoutProcess(meta, now);
+}
+
 /**
  * Stop or resolve a run by id.
  *
@@ -197,6 +238,12 @@ export function stopRun(id: string, deps: StopDeps = {}): StopOutcome {
     const probe = deps.probe ?? realProcessProbe;
     const now = typeof deps.now === "function" ? deps.now() : Date.now();
     const status = effectiveStatus(meta);
+
+    // A remote run is stopped through its remote process first; a lost/exited bridge does not
+    // mean the remote pi is gone (SSH channel drop), so those statuses are cleaned up too.
+    if (meta.remote && (status === "running" || status === "orphaned" || status === "exited" || status === "lost")) {
+        return stopRemoteRun(meta, status, probe, now, deps);
+    }
 
     if (status === "running") {
         // Supervised path: same process-group kill + killed write as before.
