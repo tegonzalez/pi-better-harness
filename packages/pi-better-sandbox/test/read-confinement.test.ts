@@ -215,13 +215,14 @@ test("the foreground launch passes the whole plan: env allowlist, PATH and proje
     const raw = { version: 1 as const, env: { allow: ["FIXTURE_POLICY_ALLOWED"] } };
     const dir = join(fixtures, "env-project");
     mkdirSync(dir, { recursive: true });
-    const controller = new ForegroundSandboxController(seams({
-        lookupExecutable: undefined,
+    const real = seams({
         readConfinement: {
             loadPolicy: () => ({ policy: parseReadConfinementPolicy(raw), source: "fixture-policy", sha256: hashPolicy(raw) }),
             plan: { passwdHomes: () => [], env: { PATH: "/usr/bin" } },
         },
-    }));
+    });
+    delete real.lookupExecutable; // resolve the real bubblewrap
+    const controller = new ForegroundSandboxController(real);
     controller.beginSession(dir);
     const settings = defaultSandboxPermissions();
     settings.main = { ...settings.main, enabled: true, outsideProject: "off", storedCredentials: "off" };
