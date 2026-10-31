@@ -21,7 +21,7 @@ esac
 if [ -n "$FAKE_SSH_FAIL" ] || [ -f "$DIR/fail" ]; then echo "ssh: Could not resolve hostname $target" >&2; exit 255; fi
 if [ "$master" = 1 ]; then touch "$DIR/master"; exit 0; fi
 export HOME="${FAKE_REMOTE_HOME:?}"
-sh -c "$cmd" <&0 &
+${FAKE_REMOTE_PATH:+env "PATH=$FAKE_REMOTE_PATH"} sh -c "$cmd" <&0 &
 rp=$!
 while kill -0 "$rp" 2>/dev/null; do
   if [ -f "$DIR/drop" ]; then exit 255; fi

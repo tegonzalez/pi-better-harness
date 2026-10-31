@@ -3,9 +3,16 @@
  *
  *   PI_REMOTE_TEST_HOST             ssh Host alias (required; enables the test)
  *   PI_REMOTE_TEST_SANDBOX_PROFILE  remote sandbox profile name (required)
- *   PI_REMOTE_TEST_SANDBOX_ARGS     JSON array of remote pi args, "{profile}" substituted (optional)
- *   PI_REMOTE_TEST_SANDBOX_ENV      JSON object of remote env, "{profile}" substituted (optional)
+ *   PI_REMOTE_TEST_SANDBOX_ARGS     JSON array of remote pi args, "{profile}" substituted
+ *   PI_REMOTE_TEST_SANDBOX_ENV      JSON object of remote env, "{profile}" substituted
+ *                                   (at least one of ARGS / ENV must reference {profile}: the profile must reach the remote pi)
  *   PI_REMOTE_TEST_SANDBOX_VERIFY   remote shell command that must exit 0 (optional)
+ *   PI_REMOTE_TEST_SANDBOX_ENTRY    customType of the remote sandbox launch audit entry (optional; default of the
+ *                                   pi-better-sandbox read-confinement audit entry)
+ *
+ * The test requires the remote sandbox launch entry (active: true, the expected profile, policyHash,
+ * planHash) to have been verified by the bridge before the prompt, and checks it in the run metadata.
+ * Remote host needs setsid.
  *   PI_REMOTE_TEST_PI               remote pi command (default "pi")
  *   PI_REMOTE_TEST_PI_LOGIN         "1" to start through the remote login shell
  *   PI_REMOTE_TEST_MODEL            model pattern for the remote pi (optional)
@@ -22,7 +29,7 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync, existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { parseRemoteTarget, remoteRunDir } from "../remote.ts";
-import { handleRemoteExit, launchRemoteRun } from "../remote-run.ts";
+import { launchRemoteRun, reconcileRemoteExit } from "../remote-run.ts";
 import { finalizeRun } from "../finalization.ts";
 import { parseRun } from "../parse.ts";
 import { logPathFor, readMeta, runDir, writeMeta } from "../registry.ts";
@@ -43,6 +50,7 @@ const targetConfig = () => ({
         ...(env.PI_REMOTE_TEST_SANDBOX_ARGS ? { args: JSON.parse(env.PI_REMOTE_TEST_SANDBOX_ARGS) } : {}),
         ...(env.PI_REMOTE_TEST_SANDBOX_ENV ? { env: JSON.parse(env.PI_REMOTE_TEST_SANDBOX_ENV) } : {}),
         ...(env.PI_REMOTE_TEST_SANDBOX_VERIFY ? { verifyCommand: env.PI_REMOTE_TEST_SANDBOX_VERIFY } : {}),
+        ...(env.PI_REMOTE_TEST_SANDBOX_ENTRY ? { entryType: env.PI_REMOTE_TEST_SANDBOX_ENTRY } : {}),
     },
     termGraceSeconds: 10,
 });
@@ -100,7 +108,12 @@ describe("remote subagent on a real host", { skip }, () => {
         await until(() => parseRun(id).toolCalls.length > 0 || parseRun(id).lastActivity, "child active");
         writeFileSync(join(runDir(id), "steer.json"), JSON.stringify({ id: "live-steer", text: "Also include the word steered in your final reply.", at: Date.now() }));
         const code = await exit;
-        assert.equal(handleRemoteExit(id).finalize, true, JSON.stringify(handleRemoteExit(id)));
+        const handled = await reconcileRemoteExit(id, code);
+        assert.equal(handled.finalize, true, JSON.stringify(handled));
+        const sandbox = readMeta(id).remote.sandbox;
+        assert.ok(sandbox, "bridge verified the remote sandbox launch entry before the prompt");
+        assert.equal(sandbox.profile, profile);
+        assert.ok(sandbox.policyHash && sandbox.planHash, "policyHash and planHash recorded");
         finalizeRun(id, code);
         assert.equal(readMeta(id).status, "completed");
         assert.ok(existsSync(join(runDir(id), "steer.json.delivered")), "steer receipt");
