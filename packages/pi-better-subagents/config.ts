@@ -15,7 +15,7 @@ import { homedir } from "node:os";
 import { SELF_SPEC } from "./extensions.ts";
 import { isDelegationMode, type DelegationMode } from "./delegation.ts";
 import type { TimingSettings } from "./timing.ts";
-import { harnessSettingsPath, readHarnessSetting, updateHarnessSetting } from "./shared-harness-settings.ts";
+import { harnessSettingsPath, legacyExtensionConfigPath, readHarnessSetting, resolveHarnessSection, updateHarnessSetting } from "./shared-harness-settings.ts";
 
 export interface SubagentConfig extends TimingSettings {
     /** Foreground delegation policy; /subagents mode overrides this for the current session. */
@@ -169,9 +169,13 @@ export function loadConfig(): SubagentConfig {
     if (configOverrideForTests) return cached!;
     const identity = configIdentity();
     if (cached && cachedIdentity === identity) return cached;
-    let user: SubagentConfig = {};
-    try { user = savedConfig(); } catch { /* retain package fallback */ }
-    cached = { ...bundledConfig(), ...user };
+    // The shared resolver (also used by the sandbox's remote-spawn guard); unreadable saved data retains the package fallback.
+    try {
+        cached = resolveHarnessSection<SubagentConfig>("subagents", {
+            seams: configSeams(), migrate: true, bundledPaths: [bundledConfigPath()].filter((path): path is string => path !== undefined),
+            ...(configPathForTests ? {} : { legacy: { path: legacyExtensionConfigPath("pi-better-subagents", configSeams()), parse: parseConfig } }),
+        });
+    } catch { cached = bundledConfig(); }
     // Keep the pre-read identity: migration or a concurrent replacement must
     // trigger another read rather than label an older value with a newer stat.
     cachedIdentity = identity;

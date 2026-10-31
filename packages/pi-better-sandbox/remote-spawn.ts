@@ -4,7 +4,21 @@
  * the target. While the parent's Network access is Off that is network use, so
  * the guard refuses it like any other network-capable tool.
  */
-import { readHarnessSetting, type HarnessSettingsSeams } from "./shared-harness-settings.ts";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+
+import { legacyExtensionConfigPath, resolveHarnessSection, type HarnessSettingsSeams } from "./shared-harness-settings.ts";
+
+const SUBAGENTS_PACKAGE = "pi-better-subagents";
+
+/** Where the subagents package's bundled config.json can be: a sibling checkout, or the agent dir's npm install. */
+function bundledSubagentsConfigs(seams: HarnessSettingsSeams): string[] {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const agentDir = (seams.agentDir ?? getAgentDir)();
+    return [join(here, "..", SUBAGENTS_PACKAGE, "config.json"), join(agentDir, "npm", "node_modules", SUBAGENTS_PACKAGE, "config.json")];
+}
 
 export const REMOTE_SPAWN_TOOLS: readonly string[] = ["subagent_spawn", "subagent_spawn_batch"];
 
@@ -14,11 +28,26 @@ function present(value: unknown): boolean {
     return typeof value === "string" && value !== "";
 }
 
-/** Agent id -> remote target name, from the harness `subagents` setting. Unreadable settings fail closed (undefined). */
-export function readRemoteAgents(seams: HarnessSettingsSeams = {}): Record<string, string> | undefined | "unreadable" {
+/**
+ * Agent id -> remote target name, resolved exactly as the spawn path resolves its settings (the shared
+ * resolver: bundled config.json, saved `subagents` section or legacy file). Unreadable settings fail closed.
+ */
+export function readRemoteAgents(
+    seams: HarnessSettingsSeams & { bundledPaths?: readonly string[] } = {},
+): Record<string, string> | undefined | "unreadable" {
     try {
-        const section = readHarnessSetting<{ remoteAgents?: unknown } | undefined>("subagents", seams);
-        const map = section?.remoteAgents;
+        const section = resolveHarnessSection<{ remoteAgents?: unknown }>("subagents", {
+            seams,
+            bundledPaths: seams.bundledPaths ?? bundledSubagentsConfigs(seams),
+            legacy: {
+                path: legacyExtensionConfigPath(`${SUBAGENTS_PACKAGE}`, seams),
+                parse: (value) => {
+                    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Config must be a JSON object.");
+                    return value as { remoteAgents?: unknown };
+                },
+            },
+        });
+        const map = section.remoteAgents;
         return map && typeof map === "object" && !Array.isArray(map) ? map as Record<string, string> : undefined;
     } catch {
         return "unreadable";

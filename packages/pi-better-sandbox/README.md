@@ -53,7 +53,7 @@ Process access                    -                -                 -
   Network access is Off: `web_fetch`, `web_search`, `firecrawl_scrape`, `firecrawl_extract`, `mcp`, `mcpScript`, `remote_bash`,
   `ssh_profile`, `ssh_mux`, and any `mcp__*` name. That is a name list, not a network sandbox.
   A `subagent_spawn` / `subagent_spawn_batch` that runs the child **remotely** (`remote`, `resume`, or an agent mapped
-  in the `subagents` setting `remoteAgents`) is network use too: it opens an SSH connection from the unconfined
+  in `remoteAgents` of the subagents config: bundled `config.json`, the `subagents` setting or the legacy file) is network use too: it opens an SSH connection from the unconfined
   extension and runs the child with network on the target, so it is refused while Network access is Off.
 
 Trusted tools use two levels: a package/provider group, then its individual tools.
@@ -386,10 +386,28 @@ dirs, recursively) and every *other* `worktrees/*` entry. Refs, objects, index, 
 agent's own worktree stay writable. The same set is mounted read-only in bubblewrap and enforced by the in-process
 `write`/`edit` tools (`readConfinement.denyWrite`). Absent entries are blocked too: the sandbox mounts an empty
 read-only node, which **creates that empty file on the host** (`config.worktree`, `info/attributes`, the alternates
-files; an absent `hooks` becomes an empty file). `commondir`/`gitdir` are only protected when they exist, since an
-empty node would change the repository layout; the in-process tools still refuse them. At launch an existing
+files, `gitdir`; an absent `hooks` becomes an empty file, so a host `git init .` in such a repository then fails with
+"cannot stat hooks/*.sample: Not a directory"). An absent `commondir` is written at planning time with the content `.`
+(an empty one breaks git; `.` is what git accepts for a main repository or submodule git dir) and then mounted read-only,
+so it can neither be created nor redirected. At launch an existing
 `objects/info/alternates` is validated: each entry must be a git object directory and pass the deny rules, otherwise the
 plan **fails closed** (the refusal is recorded in `denied` and in the status entry's `reason`).
+
+**Mount anchors.** A read-only overlay under a writable directory is not enough: the directory could be renamed away and
+rebuilt without the overlay. Every directory between a writable region's root and a write-denied entry (or a nested
+writable git dir) is therefore bound onto itself, which makes it a mount point: `mv`, `rmdir` and `rm -rf` of it fail
+with EBUSY (e.g. the in-project `.git`, `worktrees`, `modules`, `modules/*`, `info`, `objects`, `objects/info`). The set
+is computed from the deny list (`plan.denyRemove`), not from a fixed list. The in-process tools refuse to remove or move
+those directories, or any directory containing one, the same way. Files a region legitimately keeps writable (HEAD,
+index, refs) can still be deleted by `rm -rf`; the overlays and anchors stay.
+
+**Not guarded.** Nested repositories and new submodules that the agent creates inside the writable project are not
+covered: their `config`, `hooks` and `.git` are ordinary writable files, and a host git run there can execute them. The
+`.git` file of a linked worktree or submodule folder is itself an ordinary project file.
+
+**Recommendation for hosts.** Never run git inside a folder an agent can write. Integrate with
+`git fetch <worktree> <branch>` from a trusted repository, and inspect with
+`git -c core.hooksPath=/dev/null -c core.fsmonitor=false …` (add `-c protocol.ext.allow=never` as needed).
 
 The sandbox also gets `--clearenv` (only `env.allow` names, taken from the launching process when each
 command is built, reach the child; the task runtime's own env passthrough is filtered the same way),
