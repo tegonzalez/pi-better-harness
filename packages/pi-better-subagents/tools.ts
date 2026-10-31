@@ -569,7 +569,7 @@ export function subagentSteerTool(Type: TypeModule, baseSession: SubagentToolSes
         ],
         parameters: Type.Object({
             id: Type.String({ description: "Run id from subagent_spawn." }),
-            message: Type.String({ description: "The amendment, e.g. \"MTP is now a hard requirement.\"" }),
+            message: Type.String({ description: "The amendment, e.g. \"Treat the format requirement as mandatory; drop candidates that fail it.\"" }),
         }),
         async execute(_toolCallId: string, params: unknown, _signal?: unknown, _onUpdate?: unknown, ctx?: unknown) {
             const session = forCall(baseSession, ctx);

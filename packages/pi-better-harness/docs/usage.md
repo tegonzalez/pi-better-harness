@@ -50,7 +50,7 @@ After installation, Pi can use these model-callable tools:
 | Extension | Tools |
 | --------- | ----- |
 | `pi-better-sandbox` | none — it replaces the built-in `bash`, `write`, and `edit` tools rather than adding any |
-| `pi-better-subagents` | `subagent_spawn`, `subagent_spawn_batch`, `subagent_list`, `subagent_output`, `subagent_result`, `subagent_stop` |
+| `pi-better-subagents` | `subagent_spawn`, `subagent_spawn_batch`, `subagent_list`, `subagent_output`, `subagent_result`, `subagent_stop`, `subagent_steer` |
 | `pi-better-background-tasks` | `bg_task_spawn`, `bg_task_watch`, `bg_task_list`, `bg_task_status`, `bg_task_log`, `bg_task_stop`, `bg_task`, `bg_status` |
 | `pi-better-ssh` | `remote_bash`, `ssh_profile`, `ssh_mux` |
 | `pi-better-goal` | `get_goal`, `update_goal`, `get_background_activity` |
