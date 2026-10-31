@@ -118,6 +118,7 @@ function confinementMounts(plan: ReadConfinementPlan): ReadConfinementMounts {
         ...(plan.envAllow && { envAllow: plan.envAllow }),
         ...(plan.pathValue !== undefined && { pathValue: plan.pathValue }),
         ...(plan.denyWrite && { denyWrite: plan.denyWrite }),
+        ...(plan.denyRemove && { denyRemove: plan.denyRemove }),
         ...(plan.overlayArgs && { overlayArgs: plan.overlayArgs }),
     };
 }

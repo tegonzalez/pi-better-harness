@@ -25,6 +25,7 @@ import {
     realpathSync,
     statSync,
     symlinkSync,
+    writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
@@ -428,16 +429,18 @@ function loaderListLibraries(executable: string): string[] {
 type Bound = { path: string; mode: "ro" | "rw" | "tmpfs"; dir: boolean; reason: string; source?: string; late?: boolean };
 
 /** Per git dir: write-denied entries. `create` = an empty node is harmless, so absence is blocked too. */
-const GIT_GUARDED: readonly { rel: string; dir: boolean; create: boolean }[] = [
+const GIT_GUARDED: readonly { rel: string; dir: boolean; create: boolean; content?: string }[] = [
     { rel: "hooks", dir: true, create: true },
     { rel: "config", dir: false, create: true },
     { rel: "config.worktree", dir: false, create: true },
     { rel: join("info", "attributes"), dir: false, create: true },
     { rel: join("objects", "info", "alternates"), dir: false, create: true },
     { rel: join("objects", "info", "http-alternates"), dir: false, create: true },
-    // An empty node here would change the repository layout, so only an existing one is protected.
-    { rel: "commondir", dir: false, create: false },
-    { rel: "gitdir", dir: false, create: false },
+    // Absent in a main repo or submodule git dir. A creatable path would let the agent redirect git, so a
+    // placeholder is written at planning time and then mounted read-only. `commondir` must hold `.` (an empty
+    // one breaks git: "failed to read commondir"); an empty `gitdir` is ignored by git outside a linked worktree.
+    { rel: "commondir", dir: false, create: true, content: ".\n" },
+    { rel: "gitdir", dir: false, create: true, content: "" },
 ];
 type ToolSpec = { name: string; lexical: string; implicit: boolean; spec: ReadConfinementTool };
 
@@ -527,16 +530,24 @@ export function planReadConfinement(
 
     /** A read-only mount laid over part of a writable bind (hooks, config): never skipped as "already covered". */
     const denyWriteSet = new Set<string>();
-    const addRoOverlay = (path: string, reason: string, absent?: { dir: boolean }): void => {
+    const addRoOverlay = (path: string, reason: string, absent?: { dir: boolean; content?: string }): void => {
         denyWriteSet.add(path);
         let info;
         try { info = statSync(path); } catch {
             if (!absent) { skip(path, "absent: write denied in-process, creation not blocked in the sandbox", reason); return; }
             if (denyMatch(path, absent.dir)) return;
-            // Mounting over an absent path makes the sandbox unable to create it. An absent directory
-            // becomes an empty read-only file node (what the packaged deny templates already do).
-            bound.set(path, { path, mode: "ro", dir: false, reason: `${reason}; creation blocked`, source: "/dev/null", late: contains(project, path) });
-            return;
+            // The sandbox would create missing parents of the node as plain directories; make them now so they can be anchored.
+            try { mkdirSync(dirname(path), { recursive: true }); } catch { /* the node is mounted regardless */ }
+            if (absent.content !== undefined) {
+                // A host-side placeholder whose content keeps git working, then overlaid read-only like any existing file.
+                try { writeFileSync(path, absent.content, { flag: "wx", mode: 0o644 }); info = statSync(path); } catch { /* fall through */ }
+            }
+            if (!info) {
+                // Mounting over an absent path makes the sandbox unable to create it. An absent directory
+                // becomes an empty read-only file node (what the packaged deny templates already do).
+                bound.set(path, { path, mode: "ro", dir: false, reason: `${reason}; creation blocked`, source: "/dev/null", late: contains(project, path) });
+                return;
+            }
         }
         if (denyMatch(path, info.isDirectory())) return;
         bound.set(path, { path, mode: "ro", dir: info.isDirectory(), reason, late: contains(project, path) });
@@ -663,7 +674,7 @@ export function planReadConfinement(
      */
     const guardGitDir = (real: string, label: string, own: string | undefined, depth = 0): void => {
         for (const g of GIT_GUARDED) {
-            addRoOverlay(join(real, g.rel), `${g.rel} of ${label}, read-only`, g.create ? { dir: g.dir } : undefined);
+            addRoOverlay(join(real, g.rel), `${g.rel} of ${label}, read-only`, g.create ? { dir: g.dir, ...(g.content !== undefined && { content: g.content }) } : undefined);
         }
         checkAlternates(join(real, "objects"));
         // Other worktrees' admin dirs (HEAD, gitdir, commondir, config, hooks ...) belong to them.
@@ -987,12 +998,30 @@ export function planReadConfinement(
         for (const tool of syntheticTools) symlinkSync(tool.real, join(syntheticDir, tool.name));
     }
 
+    // ---- mount anchors ---------------------------------------------------
+    // A read-only overlay under a writable directory is not enough: the directory itself could be renamed
+    // away and rebuilt without the overlay. Every directory between a writable region's root and a
+    // write-denied entry or a nested writable git dir becomes a mount point (self-bind): rename and
+    // rmdir of it fail with EBUSY. Computed from the deny list, not a fixed list of git paths.
+    const anchors = new Set<string>();
+    const regionRoots = [...writeRoots].sort((a, b) => b.length - a.length);
+    for (const path of [...denyWriteSet, ...[...writeRoots].filter((root) => root !== project)]) {
+        const region = regionRoots.find((root) => root !== path && contains(root, path));
+        if (region === undefined) continue;
+        for (let dir = dirname(path); dir !== region && contains(region, dir); dir = dirname(dir)) anchors.add(dir);
+    }
+    for (const dir of anchors) {
+        if (bound.has(dir) || !isDir(dir) || denyMatch(dir, true)) continue;
+        bound.set(dir, { path: dir, mode: "rw", dir: true, reason: "mount anchor: protected overlays below cannot be renamed away", late: contains(project, dir) });
+    }
+    const denyRemove = [...new Set([...anchors, ...[...writeRoots].filter((root) => root !== project && !cacheSources.has(root))])].sort();
+
     // ---- render ----------------------------------------------------------
     const entries = [...bound.values()].sort((a, b) => a.path.length - b.path.length);
     const args: string[] = [];
     // Overlays inside the project must come after the project's own writable bind (added by the launcher).
     const overlayArgs: string[] = [];
-    for (const b of entries.filter((e) => e.late)) overlayArgs.push("--ro-bind", b.source ?? b.path, b.path);
+    for (const b of entries.filter((e) => e.late)) overlayArgs.push(b.mode === "rw" ? "--bind" : "--ro-bind", b.source ?? b.path, b.path);
     for (const b of entries.filter((e) => !e.late)) {
         if (b.mode === "tmpfs") args.push("--tmpfs", b.path);
         else if (b.mode === "rw") args.push("--bind", b.source ?? b.path, b.path);
@@ -1030,6 +1059,7 @@ export function planReadConfinement(
         writeRoots: [...writeRoots].sort(),
         denyWrite: audit.denyWrite,
         overlayArgs,
+        denyRemove,
         audit,
         project,
         envAllow,

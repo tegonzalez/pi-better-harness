@@ -94,6 +94,11 @@ export type ReadConfinementMounts = {
      * alternates, other worktrees ...): the same set the sandbox mounts read-only.
      */
     denyWrite?: readonly string[];
+    /**
+     * Directories that hold or contain such a read-only overlay inside a writable region. The sandbox makes each a
+     * mount point (rename/rmdir fails); the in-process tools refuse to remove or move them (or anything containing them).
+     */
+    denyRemove?: readonly string[];
     /** Read-only overlays inside the project; mounted after the project's own writable bind. */
     overlayArgs?: readonly string[];
 };
@@ -581,6 +586,7 @@ function compile(
                 ...(readConfinement.envAllow && { envAllow: [...readConfinement.envAllow] }),
                 ...(readConfinement.pathValue !== undefined && { pathValue: readConfinement.pathValue }),
                 ...(readConfinement.denyWrite && { denyWrite: [...new Set(readConfinement.denyWrite.map((path) => canonicalizePath(path, seams)))].sort() }),
+                ...(readConfinement.denyRemove && { denyRemove: [...new Set(readConfinement.denyRemove.map((path) => canonicalizePath(path, seams)))].sort() }),
                 ...(readConfinement.overlayArgs && { overlayArgs: [...readConfinement.overlayArgs] }),
             },
         }),
@@ -917,6 +923,9 @@ export function evaluateDeleteAccess(
     const broad = policy.broad;
     if (!write.allowed) return write;
     const path = write.path;
+    // A mount anchor (or a directory containing one) cannot be removed or moved: in the sandbox that fails with EBUSY.
+    const anchor = policy.readConfinement?.denyRemove?.find((entry) => contains(path, entry));
+    if (anchor !== undefined) return { allowed: false, path, reason: "delete-denied", deniedBy: anchor };
     if (!broad) {
         // Project files = Write outside the broad profile: nothing in the
         // project is removable except worktree folders' contents.
