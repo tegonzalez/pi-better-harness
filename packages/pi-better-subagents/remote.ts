@@ -57,6 +57,19 @@ export interface RemoteTarget {
     port?: number;
     /** Remote working directory; `~/` is expanded on the remote. Default: the remote login directory. */
     cwd?: string;
+    /**
+     * Allowed working-folder roots (absolute or `~/`). When set, a spawn may pass its own `cwd`; the
+     * remote launch script resolves it (and these roots) with `pwd -P` and refuses to start pi unless it
+     * lies inside one of them. The check also applies to `cwd` / the login directory. Without roots a
+     * spawn `cwd` is rejected and `cwd` is fixed.
+     */
+    cwdRoots?: string[];
+    /**
+     * Agent dir for the remote pi (`PI_CODING_AGENT_DIR`; absolute or `~/`). With `sandboxReadConfinement` in
+     * that dir's settings the policy location travels with the workspace, as for a plain
+     * `PI_CODING_AGENT_DIR=<dir> pi` run by the owner in the same working folder.
+     */
+    agentDir?: string;
     /** Remote run directories live under this root (relative = under the remote $HOME). */
     root?: string;
     pi: {
@@ -84,6 +97,7 @@ export const DEFAULT_SANDBOX_ENTRY_TYPE = "pi-better-sandbox-read-confinement";
 export const DEFAULT_SANDBOX_VERIFY_TIMEOUT_MS = 30_000;
 export const DEFAULT_TERM_GRACE_SECONDS = 5;
 
+export const AGENT_DIR_ENV = "PI_CODING_AGENT_DIR";
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const SAFE_ROOT = /^[A-Za-z0-9._/@+-]+$/;
 const TARGET_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
@@ -108,6 +122,11 @@ function strList(value: unknown, where: string): string[] {
     if (!Array.isArray(value)) fail(where, "must be an array of strings");
     return value.map((item, index) => str(item, `${where}[${index}]`, { allowSpace: true }));
 }
+/** Remote directory word: absolute or `~/…` (expanded remotely); roots must not be `/` or `~`. */
+function remoteDirectory(value: string, where: string, options: { root?: boolean } = {}): void {
+    if (!(value.startsWith("/") || value.startsWith("~/") || value === "~")) fail(where, "must be absolute or start with ~/");
+    if (options.root && (/^\/+$/.test(value) || value === "~" || value === "~/")) fail(where, "must not be the filesystem root or the whole home directory");
+}
 function envMap(value: unknown, where: string): Record<string, string> {
     const obj = plainObject(value, where);
     const out: Record<string, string> = {};
@@ -124,7 +143,7 @@ export function parseRemoteTarget(value: unknown, name: string): RemoteTarget {
     const where = `"${name}"`;
     if (!TARGET_NAME.test(name)) fail(where, "target names use letters, digits, '.', '_' and '-'");
     const obj = plainObject(value, where);
-    noUnknown(obj, ["host", "user", "port", "cwd", "root", "pi", "env", "sandbox", "abortWaitMs", "termGraceSeconds"], where);
+    noUnknown(obj, ["host", "user", "port", "cwd", "cwdRoots", "agentDir", "root", "pi", "env", "sandbox", "abortWaitMs", "termGraceSeconds"], where);
     const target: RemoteTarget = {
         host: str(obj.host, `${where}.host`),
         pi: undefined as never,
@@ -140,6 +159,16 @@ export function parseRemoteTarget(value: unknown, name: string): RemoteTarget {
         target.port = obj.port as number;
     }
     if (obj.cwd !== undefined) target.cwd = str(obj.cwd, `${where}.cwd`, { allowSpace: true });
+    if (obj.cwdRoots !== undefined) {
+        const roots = strList(obj.cwdRoots, `${where}.cwdRoots`);
+        if (roots.length === 0) fail(`${where}.cwdRoots`, "must list at least one root");
+        roots.forEach((root, i) => remoteDirectory(root, `${where}.cwdRoots[${i}]`, { root: true }));
+        target.cwdRoots = roots;
+    }
+    if (obj.agentDir !== undefined) {
+        target.agentDir = str(obj.agentDir, `${where}.agentDir`, { allowSpace: true });
+        remoteDirectory(target.agentDir, `${where}.agentDir`);
+    }
     if (obj.root !== undefined) {
         const root = str(obj.root, `${where}.root`);
         if (!SAFE_ROOT.test(root) || root.split("/").includes("..")) fail(`${where}.root`, "may contain letters, digits and . _ / @ + - only, without '..'");
@@ -154,12 +183,14 @@ export function parseRemoteTarget(value: unknown, name: string): RemoteTarget {
         target.pi.login = pi.login;
     }
     if (obj.env !== undefined) target.env = envMap(obj.env, `${where}.env`);
+    if (target.agentDir !== undefined && (AGENT_DIR_ENV in (target.env ?? {}))) fail(`${where}.env`, `${AGENT_DIR_ENV} is set by agentDir; remove it from env`);
     if (obj.sandbox === undefined) fail(`${where}.sandbox`, "a remote sandbox profile is required");
     const sandbox = plainObject(obj.sandbox, `${where}.sandbox`);
     noUnknown(sandbox, ["profile", "args", "env", "verifyCommand", "entryType", "entryProfile", "verifyTimeoutMs", "policyHash"], `${where}.sandbox`);
     target.sandbox = { profile: str(sandbox.profile, `${where}.sandbox.profile`) };
     if (sandbox.args !== undefined) target.sandbox.args = strList(sandbox.args, `${where}.sandbox.args`);
     if (sandbox.env !== undefined) target.sandbox.env = envMap(sandbox.env, `${where}.sandbox.env`);
+    if (target.agentDir !== undefined && (AGENT_DIR_ENV in (target.sandbox.env ?? {}))) fail(`${where}.sandbox.env`, `${AGENT_DIR_ENV} is set by agentDir; remove it from sandbox.env`);
     if (sandbox.verifyCommand !== undefined) target.sandbox.verifyCommand = str(sandbox.verifyCommand, `${where}.sandbox.verifyCommand`, { allowSpace: true });
     if (sandbox.entryType !== undefined) target.sandbox.entryType = str(sandbox.entryType, `${where}.sandbox.entryType`);
     if (sandbox.entryProfile !== undefined) target.sandbox.entryProfile = str(sandbox.entryProfile, `${where}.sandbox.entryProfile`);
@@ -242,6 +273,8 @@ export interface RemotePiOptions {
     tools?: string;
     excludeTools?: string;
     approve?: boolean;
+    /** Working folder for this spawn (needs the target's `cwdRoots`); replaces the target's `cwd`. */
+    cwd?: string;
     /**
      * Resume: re-attach to the kept session of this earlier run id (a new pi process continues it).
      * The pid file and stop identity stay run-scoped to the NEW run.
@@ -269,7 +302,7 @@ export function remotePiWords(target: RemoteTarget, runId: string, options: Remo
     return words;
 }
 
-export const REMOTE_EXIT = { sessionMissing: 94, setsidMissing: 95, sandboxVerify: 96, cwdMissing: 97, dirFailed: 98, piMissing: 127, sshFailed: 255 } as const;
+export const REMOTE_EXIT = { sessionMissing: 94, setsidMissing: 95, sandboxVerify: 96, cwdMissing: 97, dirFailed: 98, cwdDenied: 99, piMissing: 127, sshFailed: 255 } as const;
 
 /** Line that ends the environment section the bridge writes to the launch script's stdin. */
 export function envSentinel(runId: string): string {
@@ -292,6 +325,7 @@ export function buildEnvPayload(target: RemoteTarget, runId: string): string {
         if (value.split("\n").includes(sentinel)) throw new Error(`remote environment variable ${name} contains a reserved line`);
         lines.push(`export ${name}=${shellQuote(value)}`);
     }
+    if (target.agentDir !== undefined) lines.push(`export ${AGENT_DIR_ENV}=${cwdWord(target.agentDir)}`);
     lines.push(sentinel);
     return `${lines.join("\n")}\n`;
 }
@@ -303,6 +337,7 @@ export function buildEnvPayload(target: RemoteTarget, runId: string): string {
  * removed once sourced; it never appears on a command line.
  */
 export function buildLaunchScript(target: RemoteTarget, runId: string, options: RemotePiOptions): string {
+    const cwd = effectiveRemoteCwd(target, options.cwd);
     const pi = shellQuote(target.pi.command);
     const sessionRun = options.resumeSessionOf ?? runId;
     const lines = [
@@ -318,7 +353,15 @@ export function buildLaunchScript(target: RemoteTarget, runId: string, options: 
     if (target.sandbox.verifyCommand) {
         lines.push(`( ${target.sandbox.verifyCommand} ) >&2 || { echo ${shellQuote(`pi-remote: sandbox profile ${target.sandbox.profile} cannot be enabled (verification failed)`)} >&2; exit ${REMOTE_EXIT.sandboxVerify}; }`);
     }
-    if (target.cwd) lines.push(`cd ${cwdWord(target.cwd)} 2>/dev/null || { echo "pi-remote: remote cwd not found" >&2; exit ${REMOTE_EXIT.cwdMissing}; }`);
+    if (cwd) lines.push(`cd ${cwdWord(cwd)} 2>/dev/null || { echo "pi-remote: remote cwd not found" >&2; exit ${REMOTE_EXIT.cwdMissing}; }`);
+    if (target.cwdRoots) {
+        // Fail closed: the physical working folder must lie inside an allowed root (both sides realpath'd remotely).
+        lines.push(`CWD_REAL=$(pwd -P) || { echo "pi-remote: cannot resolve the working folder" >&2; exit ${REMOTE_EXIT.cwdMissing}; }`, `cwd_ok=0`);
+        for (const root of target.cwdRoots) {
+            lines.push(`ROOT_REAL=$(cd ${cwdWord(root)} 2>/dev/null && pwd -P) && case "$CWD_REAL" in "$ROOT_REAL"|"$ROOT_REAL"/*) cwd_ok=1;; esac`);
+        }
+        lines.push(`[ "$cwd_ok" = 1 ] || { echo "pi-remote: the working folder is outside the target's allowed cwdRoots" >&2; exit ${REMOTE_EXIT.cwdDenied}; }`);
+    }
     const sentinel = shellQuote(envSentinel(runId));
     const piWords = [pi, ...remotePiWords(target, runId, options)].join(" ");
     lines.push(
@@ -332,6 +375,18 @@ export function buildLaunchScript(target: RemoteTarget, runId: string, options: 
         `exec setsid -w sh -c 'echo $$ > "$0/pid"; exec "$@"' "$RD" ${piWords}`,
     );
     return lines.join("\n");
+}
+
+/**
+ * The working folder a launch uses: the spawn's `cwd` (only when the target declares `cwdRoots`), else
+ * the target's fixed `cwd`. A spawn `cwd` for a target without roots is refused, never ignored.
+ */
+export function effectiveRemoteCwd(target: RemoteTarget, spawnCwd: string | undefined): string | undefined {
+    if (spawnCwd === undefined) return target.cwd;
+    if (!target.cwdRoots) throw new Error("cwd is not accepted by this remote target: it declares no cwdRoots (the working folder is fixed by the target's cwd).");
+    str(spawnCwd, "cwd", { allowSpace: true });
+    remoteDirectory(spawnCwd, "cwd");
+    return spawnCwd;
 }
 
 /** Wrap a script as one remote command: `sh -c` directly, or through the remote login shell. */
@@ -391,6 +446,10 @@ export interface RemoteRunMeta {
     abortWaitMs: number;
     termGraceSeconds: number;
     stopScript: string;
+    /** Working folder this run used (as configured or spawned; `~/` expands remotely). */
+    cwd?: string;
+    /** Agent dir the remote pi ran with (`PI_CODING_AGENT_DIR`), when the target sets one. */
+    agentDir?: string;
     /** Run this one resumed (same remote session, new pi process). */
     resumedFrom?: string;
     /** Set by the parent after the bridge verified the remote sandbox launch audit entry. */
@@ -472,6 +531,8 @@ export function buildRemotePlan(input: {
             abortWaitMs: target.abortWaitMs ?? DEFAULT_ABORT_WAIT_MS,
             termGraceSeconds: target.termGraceSeconds ?? DEFAULT_TERM_GRACE_SECONDS,
             stopScript,
+            ...(effectiveRemoteCwd(target, input.options.cwd) ? { cwd: effectiveRemoteCwd(target, input.options.cwd)! } : {}),
+            ...(target.agentDir ? { agentDir: target.agentDir } : {}),
             ...(input.options.resumeSessionOf ? { resumedFrom: input.options.resumeSessionOf } : {}),
         },
         bridge: {
@@ -610,11 +671,11 @@ export async function stopRemoteProcessAsync(remote: RemoteRunMeta, deps: Remote
 }
 
 /** Options a remote run cannot honour. A remote target never silently drops them. */
-export function assertRemoteOptionsSupported(p: { sandbox?: unknown; sandbox_dir?: unknown; cwd?: unknown; git_clone_workspace?: unknown; allow_nested?: unknown; clean?: unknown }): void {
+export function assertRemoteOptionsSupported(p: { sandbox?: unknown; sandbox_dir?: unknown; cwd?: unknown; git_clone_workspace?: unknown; allow_nested?: unknown; clean?: unknown }, target?: RemoteTarget): void {
     const unsupported: string[] = [];
     if (p.sandbox !== undefined) unsupported.push("sandbox (the remote target's own sandbox profile applies)");
     if (p.sandbox_dir !== undefined) unsupported.push("sandbox_dir");
-    if (p.cwd !== undefined) unsupported.push("cwd (set the target's cwd)");
+    if (p.cwd !== undefined && !(target?.cwdRoots)) unsupported.push("cwd (this target declares no cwdRoots; set the target's cwd)");
     if (p.git_clone_workspace !== undefined) unsupported.push("git_clone_workspace");
     if (p.allow_nested !== undefined) unsupported.push("allow_nested");
     if (p.clean !== undefined) unsupported.push("clean");

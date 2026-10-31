@@ -48,6 +48,7 @@ import { readRunFailures } from "./failures.ts";
 import { actionablePermissionBlockers } from "./shared-failure-observations.ts";
 import type { PermissionBlocker } from "./shared-permission-blocker.ts";
 import { describeTiming } from "./timing.ts";
+import { remoteWorkspaceLine } from "./remote-run.ts";
 import {
     extractChildEventFactsFromLog,
     loadHealthThresholdsFromConfig,
@@ -182,6 +183,12 @@ export function buildSubagentResultDisplayDetails(body: string) {
         compactLines,
         foldedLineCount: Math.max(0, rest.length - compactLines.length),
     };
+}
+
+/** Insert `line` after the first (head) line, which the display parser keys on. */
+function withSecondLine(body: string, line: string): string {
+    const at = body.indexOf("\n");
+    return at < 0 ? `${body}\n${line}` : `${body.slice(0, at)}\n${line}${body.slice(at)}`;
 }
 
 function subagentResultText(body: string) {
@@ -486,7 +493,9 @@ export function subagentResultTool(Type: TypeModule, baseSession: SubagentToolSe
             if (access.kind === "denied") return subagentResultText(access.payload);
             const meta = access.meta;
             const resultText = (body: string) => {
-                const result = subagentResultText(body);
+                // Remote runs name their workspace and verified hashes on the first page (owner comparison).
+                const workspace = p.cursor === undefined ? remoteWorkspaceLine(p.id, meta.remote) : undefined;
+                const result = subagentResultText(workspace ? withSecondLine(body, workspace) : body);
                 return { ...result, details: { ...result.details, ...permissionDetails(p.id, budgetFor("answer", p.maxBytes)) } };
             };
             const scopeKey = requestScopeKey(p, session);

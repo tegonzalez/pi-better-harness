@@ -1784,7 +1784,12 @@ export default function (pi: ExtensionAPI) {
         const remoteSel = selectRemoteTarget(cfg, { remote: p.remote ?? resumeSource?.remote?.target, agent: p.agent });
         if (p.resume !== undefined && !remoteSel) throw new Error("resume is only supported for remote runs.");
         if (remoteSel) {
-            assertRemoteOptionsSupported(p);
+            assertRemoteOptionsSupported(p, remoteSel.target);
+            // Resume continues the earlier run's working folder; another one is refused, not silently ignored.
+            if (resumeSource?.remote?.cwd !== undefined && p.cwd !== undefined && p.cwd !== resumeSource.remote.cwd) {
+                throw new Error(`resume: run ${p.resume} used working folder "${resumeSource.remote.cwd}", not "${p.cwd}". A resumed run keeps its session's working folder.`);
+            }
+            const remoteCwd = p.cwd ?? resumeSource?.remote?.cwd;
             if (resumeSource?.remote) {
                 // The earlier remote process must be verifiably gone before a new one continues its session.
                 const gone = await stopRemoteProcessAsync(resumeSource.remote);
@@ -1804,6 +1809,7 @@ export default function (pi: ExtensionAPI) {
                     id, targetName: remoteSel.name, target: remoteSel.target, prompt: p.prompt,
                     options: {
                         model, thinking, tools: allow || undefined, excludeTools: p.exclude_tools || undefined, approve: p.approve === true,
+                        ...(remoteCwd !== undefined && remoteSel.target.cwdRoots ? { cwd: remoteCwd } : {}),
                         ...(resumeSource ? { resumeSessionOf: resumeSource.remote?.resumedFrom ?? resumeSource.id } : {}),
                     },
                 });
@@ -1816,7 +1822,7 @@ export default function (pi: ExtensionAPI) {
             const meta: RunMeta = {
                 id, name: p.name, status: "running",
                 pid: spawned.pid, spawnPid: process.pid, spawnPidStartTime: parentStartToken(), model,
-                effort: thinking, cwd: remoteSel.target.cwd ?? "~",
+                effort: thinking, cwd: remote.cwd ?? remoteSel.target.cwd ?? "~",
                 ...captureProcessIdentity(spawned.pid, spawnIdentityProbe),
                 promptPreview: p.prompt.slice(0, 200),
                 startedAt, logPath: logPathFor(id), sessionId: id,
@@ -2084,7 +2090,7 @@ export default function (pi: ExtensionAPI) {
             sandbox: Type.Optional(Type.Boolean({ description: "Use the human Subagents profile from /sandbox. Defaults to off without published settings. True requests kernel confinement; false cannot bypass an enabled human profile." })),
             sandbox_dir: Type.Optional(Type.String({ description: "Confine writes to (and run the child in) this directory instead of the working dir. Created if missing." })),
             callback: Type.Optional(Type.Boolean({ description: "Default TRUE: on completion, trigger a turn that calls subagent_result and presents the result. Set false to finish quietly — the result is then read on demand via subagent_result." })),
-            cwd: Type.Optional(Type.String({ description: "Working directory (default: current)." })),
+            cwd: Type.Optional(Type.String({ description: "Working directory (default: current). For a remote target this must be inside the target's configured cwdRoots; it is resolved and checked on the remote host." })),
             git_clone_workspace: Type.Optional(Type.Boolean({ description: "Prepare a disposable Git clone workspace for sandboxed Git-mutating subagents. The clone has a real .git/ directory inside the sandbox writable root and is self-contained after setup." })),
             approve: Type.Optional(Type.Boolean({ description: "Trust project-local files in the child (default: false; headless runs cannot prompt for trust)." })),
             allow_nested: Type.Optional(Type.Boolean({ description: "Allow the child to spawn its own subagents (default: false). Loads this extension in the child and allowlists its tools." })),
@@ -2196,7 +2202,7 @@ export default function (pi: ExtensionAPI) {
                 sandbox_dir: Type.Optional(Type.String({ description: "Writable root for every job." })),
                 callback: Type.Optional(Type.Boolean({ description: "Default TRUE: post result back on completion." })),
                 clean: Type.Optional(Type.Boolean({ description: "Hermetic builtins-only child; no extensions load." })),
-                cwd: Type.Optional(Type.String({ description: "Working directory (default: current)." })),
+                cwd: Type.Optional(Type.String({ description: "Working directory (default: current). For a remote target this must be inside the target's configured cwdRoots; it is resolved and checked on the remote host." })),
                 git_clone_workspace: Type.Optional(Type.Boolean({ description: "Prepare a disposable Git clone workspace for each job (same semantics as subagent_spawn)." })),
                 approve: Type.Optional(Type.Boolean({ description: "Trust project-local files in children." })),
                 allow_nested: Type.Optional(Type.Boolean({ description: "Allow children to spawn their own subagents." })),
