@@ -44,11 +44,16 @@ import { openPermissionsPage } from "./permissions-page.ts";
 import { appendSessionPermissions, readSessionPermissions } from "./session-permissions.ts";
 import { createSubagentExecutionAdmission, requestsSubagentSandbox } from "./subagent-admission.ts";
 
+import { READ_CONFINEMENT_ENTRY } from "./read-confinement-settings.ts";
 import { ForegroundSandboxController, type ForegroundSandboxStatus } from "./state.ts";
 import { SandboxDiagnostics, diagnosticPackageVersion } from "./shared-sandbox-diagnostics.ts";
 
 export default function piBetterSandbox(pi: ExtensionAPI): void {
     const controller = new ForegroundSandboxController();
+    // Audit trail: every distinct read-confinement mount plan is recorded in the session.
+    controller.onReadConfinementPlan((plan) => {
+        pi.appendEntry(READ_CONFINEMENT_ENTRY, { version: 1, hash: plan.hash, audit: plan.audit });
+    });
     let diagnosticsWarning: ((error: unknown) => void) | undefined;
     const diagnostics = new SandboxDiagnostics({ context: "foreground",
         version: diagnosticPackageVersion(new URL("./package.json", import.meta.url)),

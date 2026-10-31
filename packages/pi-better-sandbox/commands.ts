@@ -42,7 +42,7 @@ const USAGE = [
     "  /sandbox deny remove <path>",
     "  /sandbox deny reset",
     "  /sandbox rules",
-    "  /sandbox diagnostics [status|on|off|summary|export]",
+    "  /sandbox diagnostics [status|on|off|summary|export|confinement]",
 ].join("\n");
 
 const DENY_USAGE = [
@@ -108,7 +108,7 @@ export function createSandboxCommandHandler({
         const rest = trimmed.slice(verb.length).trim();
 
         if (subcommand === "diagnostics") {
-            await handleDiagnosticsCommand(rest, ctx);
+            await handleDiagnosticsCommand(rest, ctx, () => controller.readConfinementReport());
             return;
         }
 
