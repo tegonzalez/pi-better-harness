@@ -13,7 +13,9 @@ import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { handleDiagnosticsCommand } from "../diagnostics-command.ts";
 import { defaultSandboxPermissions } from "../permissions.ts";
 import { configuredReadConfinementPolicyFile, loadConfiguredReadConfinementPolicy } from "../read-confinement-settings.ts";
-import { compileWritePolicy, evaluateReadAccess, processReadConfinement, READ_CONFINEMENT_POLICY_ENV } from "../shared-sandbox-core.ts";
+import { buildSandboxCommand, compileWritePolicy, evaluateReadAccess, processReadConfinement, publishProcessReadConfinement, READ_CONFINEMENT_POLICY_ENV } from "../shared-sandbox-core.ts";
+import { spawnSync } from "node:child_process";
+import { realBackendSkip } from "./support/resolvable-backend.ts";
 import { hashPolicy, parseReadConfinementPolicy } from "../shared-read-confinement.ts";
 import { ForegroundSandboxController, type ForegroundSandboxSeams } from "../state.ts";
 
@@ -80,6 +82,7 @@ test("other modes, other platforms and an unconfigured policy keep the original 
 test("an invalid or capped policy fails closed with a clear error", () => {
     const bad = enabled("off", { readConfinement: { loadPolicy: () => { throw new Error("Invalid read-confinement policy at $.x: nope"); } } });
     assert.throws(() => bad.requireLaunchPlan(), /Read confinement failed closed: Invalid read-confinement policy/);
+    bad.dispose();
     const raw = { version: 1 as const, limits: { maxSymlinks: 1 }, walkSkipDirNames: [] };
     mkdirSync(join(project, "d2"), { recursive: true });
     symlinkSync(target, join(project, "link2"));
@@ -88,6 +91,7 @@ test("an invalid or capped policy fails closed with a clear error", () => {
         plan: { passwdHomes: () => [] },
     } });
     assert.throws(() => capped.requireLaunchPlan(), /failed closed.*maxSymlinks/);
+    capped.dispose();
 });
 
 test("the policy location is configuration: env wins, then the harness setting, and it must be absolute", () => {
@@ -112,6 +116,7 @@ test("/sandbox diagnostics confinement shows the audited plan", async () => {
 });
 
 test("the plan is computed once at session start and frozen: later symlinks have no effect, a new session sees them", () => {
+    publishProcessReadConfinement(undefined); // other tests' controllers may still own slots
     const late = join(fixtures, "late-target");
     mkdirSync(late, { recursive: true });
     const proj = join(fixtures, "frozen-project");
@@ -172,4 +177,75 @@ test("the status record carries {active, profile, policyHash, planHash} only whi
     controller.recordReadConfinement();
     assert.equal(seen.length, 2);
     controller.dispose();
+});
+
+test("overlapping controllers own their own slot: disposing one never clears the other's plan", () => {
+    publishProcessReadConfinement(undefined);
+    const settings = defaultSandboxPermissions();
+    settings.main = { ...settings.main, enabled: true, outsideProject: "off", storedCredentials: "off" };
+    const make = (name: string) => {
+        const dir = join(fixtures, name);
+        mkdirSync(dir, { recursive: true });
+        const controller = new ForegroundSandboxController(seams());
+        controller.beginSession(dir);
+        controller.setPermissionSettings(settings);
+        return { controller, dir };
+    };
+    const a = make("overlap-a");
+    const b = make("overlap-b");
+    const current = () => (processReadConfinement() as { mounts: { project: string } } | undefined)?.mounts.project;
+    assert.equal(current(), b.dir, "the latest controller's plan is in force");
+    a.controller.dispose();
+    assert.equal(current(), b.dir, "disposing A leaves B's plan published");
+    assert.ok(b.controller.requireLaunchPlan().confined);
+    b.controller.dispose();
+    assert.equal(processReadConfinement(), undefined, "the last dispose clears the slot");
+    const c = make("overlap-c");
+    const d = make("overlap-d");
+    d.controller.dispose();
+    assert.equal(current(), c.dir, "when the newest goes, the older live plan is in force again");
+    c.controller.dispose();
+    assert.equal(processReadConfinement(), undefined);
+});
+
+test("the foreground launch passes the whole plan: env allowlist, PATH and project (real bubblewrap)", (t) => {
+    const skip = realBackendSkip();
+    if (skip) { t.skip(skip); return; }
+    publishProcessReadConfinement(undefined);
+    const raw = { version: 1 as const, env: { allow: ["FIXTURE_POLICY_ALLOWED"] } };
+    const dir = join(fixtures, "env-project");
+    mkdirSync(dir, { recursive: true });
+    const controller = new ForegroundSandboxController(seams({
+        lookupExecutable: undefined,
+        readConfinement: {
+            loadPolicy: () => ({ policy: parseReadConfinementPolicy(raw), source: "fixture-policy", sha256: hashPolicy(raw) }),
+            plan: { passwdHomes: () => [], env: { PATH: "/usr/bin" } },
+        },
+    }));
+    controller.beginSession(dir);
+    const settings = defaultSandboxPermissions();
+    settings.main = { ...settings.main, enabled: true, outsideProject: "off", storedCredentials: "off" };
+    controller.setPermissionSettings(settings);
+    try {
+        const launch = controller.requireLaunchPlan();
+        assert.ok(launch.confined && launch.policy.readConfinement);
+        const mounts = launch.policy.readConfinement;
+        assert.ok(mounts.envAllow?.includes("FIXTURE_POLICY_ALLOWED") && mounts.pathValue !== undefined && mounts.project === dir);
+        const launching = {
+            HOME: home, TERM: "xterm-test", LANG: "C.UTF-8", TZ: "UTC", TMPDIR: "/tmp",
+            FIXTURE_POLICY_ALLOWED: "yes", FIXTURE_SECRET_API_KEY: "sk-leak", GITHUB_TOKEN: "ghp-leak", PATH: "/usr/bin",
+        };
+        const command = buildSandboxCommand({ profilePath: join(profiles, "unused.sb"), execPath: "/usr/bin/env", execArgs: [], policy: launch.policy }, { env: launching });
+        const out = spawnSync(command.file, command.fileArgs, { encoding: "utf8", cwd: dir, env: launching });
+        assert.equal(out.status, 0, out.stderr);
+        const seen = Object.fromEntries(out.stdout.split("\n").filter(Boolean).map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
+        for (const [name, value] of [["HOME", home], ["TERM", "xterm-test"], ["LANG", "C.UTF-8"], ["TZ", "UTC"], ["TMPDIR", "/tmp"], ["FIXTURE_POLICY_ALLOWED", "yes"]]) {
+            assert.equal(seen[name!], value, `${name} reaches the confined child`);
+        }
+        assert.equal(seen.PATH, mounts.pathValue);
+        assert.equal(seen.FIXTURE_SECRET_API_KEY, undefined);
+        assert.equal(seen.GITHUB_TOKEN, undefined);
+    } finally {
+        controller.dispose();
+    }
 });

@@ -54,6 +54,9 @@ Process access                    -                -                 -
   only from the package you ticked. Known network tool names are refused while
   Network access is Off: `web_fetch`, `web_search`, `firecrawl_scrape`, `firecrawl_extract`, `mcp`, `mcpScript`, `remote_bash`,
   `ssh_profile`, `ssh_mux`, and any `mcp__*` name. That is a name list, not a network sandbox.
+  A `subagent_spawn` / `subagent_spawn_batch` that runs the child **remotely** (`remote`, `resume`, or an agent mapped
+  in the `subagents` setting `remoteAgents`) is network use too: it opens an SSH connection from the unconfined
+  extension and runs the child with network on the target, so it is refused while Network access is Off.
 
 Trusted tools use two levels: a package/provider group, then its individual tools.
 Non-MCP tools are grouped by exact owning package; `mcp__<provider>__...` tools
@@ -325,7 +328,7 @@ system runtime roots. *Read confinement* is an opt-in refinement of that mode: w
 policy file is configured, the agent can additionally read only
 
 - its project/worktree (writable) and the git dir a worktree `.git` file points to (writable, only when it
-  proves it belongs to this worktree; `hooks/` and `config` stay read-only; alternates are read-only),
+  proves it belongs to this worktree; the git-dir write-deny set below applies; alternates are read-only),
 - whatever the project reaches through symlinks (read-only, followed transitively),
 - the tools the policy approves, with their libraries and interpreters (read-only),
 - those tools' approved config paths (read-only) and cache paths (private tmpfs, or a persistent per-agent directory).
@@ -387,8 +390,22 @@ tasks, subagent launches) applies the same frozen mounts, cleared environment an
 namespace, or **fails closed**: a failed plan, a plan for another project, a missing plan while a
 policy is configured, or a non-Linux backend refuses the launch. A subagent child therefore starts
 with only the allowlisted environment; add the variables it needs to `env.allow` knowingly.
-The policy file must not lie inside the project, a writable root (including git dirs and the
-persistent cache directory) or a temp directory; such a policy is refused.
+The policy file must not lie inside the project, a writable root of **any active profile** (git dirs, the
+persistent cache directory, the harness runtime directories, home when a profile has Outside project = Write) or a temp
+directory; such a policy is refused. Each controller owns its own published plan: disposing one never clears the plan
+another live controller still owns (the most recently published live plan is in force).
+
+**Git dir write-deny set.** For every writable git dir (the in-project `.git`, and a linked worktree's git dir and
+common dir) the planner computes one deny set: `hooks/`, `config`, `config.worktree`, `info/attributes`,
+`commondir`, `gitdir`, `objects/info/alternates` and `http-alternates`, `modules/*/{hooks,config,…}` (submodule git
+dirs, recursively) and every *other* `worktrees/*` entry. Refs, objects, index, logs, packed-refs and `HEAD` of the
+agent's own worktree stay writable. The same set is mounted read-only in bubblewrap and enforced by the in-process
+`write`/`edit` tools (`readConfinement.denyWrite`). Absent entries are blocked too: the sandbox mounts an empty
+read-only node, which **creates that empty file on the host** (`config.worktree`, `info/attributes`, the alternates
+files; an absent `hooks` becomes an empty file). `commondir`/`gitdir` are only protected when they exist, since an
+empty node would change the repository layout; the in-process tools still refuse them. At launch an existing
+`objects/info/alternates` is validated: each entry must be a git object directory and pass the deny rules, otherwise the
+plan **fails closed** (the refusal is recorded in `denied` and in the status entry's `reason`).
 
 The sandbox also gets `--clearenv` (only `env.allow` names, taken from the launching process when each
 command is built, reach the child; the task runtime's own env passthrough is filtered the same way),
@@ -442,7 +459,8 @@ writes no entry. `/sandbox diagnostics confinement` prints the latest plan. Secr
 - A confined shell can still run any executable it can read by absolute path, for example one under `/usr`.
 - Libraries a tool loads with `dlopen` are not visible to the loader listing; add them with `bind`.
 - A symlink created after the plan was computed is not mounted until a new session starts (see "frozen at launch"). A project symlink present at launch to a non-denied path is still followed: use `deny.paths` and `walkSkipDirNames` for what must never be reachable.
-- Git dirs outside the project are writable except `hooks/` and `config`; common-dir `objects` stay writable because commits need them.
+- Git dirs are writable except the deny set above; common-dir `objects` stay writable because commits need them.
+  A `hooks` directory created on the host after the plan was computed makes the next launch fail (the frozen plan expects a file there); start a new session.
 - Planning is synchronous and bounded (`maxWalkEntries`, `maxWalkMs`); it runs at session start.
 - Secret detection is pattern-based; it reduces, not eliminates, the chance that a bound config holds a secret.
 - The synthetic `PATH` only constrains lookups by name; this mode is a read boundary, not a command allowlist.
