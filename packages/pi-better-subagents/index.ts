@@ -132,9 +132,9 @@ import {
     subagentStopTool,
     subagentSteerTool,
 } from "./tools.ts";
-import { stopRun } from "./stop.ts";
-import { selectRemoteTarget } from "./remote.ts";
-import { handleRemoteExit, launchRemoteRun } from "./remote-run.ts";
+import { stopRun, stopRunAsync } from "./stop.ts";
+import { assertRemoteOptionsSupported, selectRemoteTarget, stopRemoteProcessAsync } from "./remote.ts";
+import { launchRemoteRun, reconcileRemoteExit } from "./remote-run.ts";
 import {
     WIDGET_CLEAR,
     fmtElapsed,
@@ -329,8 +329,9 @@ function hasSelfProcessIdentity(meta: RunMeta): boolean {
     return meta.pid === process.pid || meta.pgid === process.pid;
 }
 
-function stopCurrentSessionSubagents(ctx: ExtensionContext): void {
+async function stopCurrentSessionSubagents(ctx: ExtensionContext): Promise<void> {
     const origin = callbackOriginFromContext(ctx);
+    const remoteStops: Promise<unknown>[] = [];
     for (const summary of listMetasForParent(process.pid)) {
         if (!ownedByThisParent(summary)) continue;
         if (summary.status !== "running" && summary.status !== "orphaned") continue;
@@ -338,11 +339,14 @@ function stopCurrentSessionSubagents(ctx: ExtensionContext): void {
         // Automatic shutdown cleanup must not let corrupt or synthetic metadata
         // signal the foreground Pi process itself.
         if (hasSelfProcessIdentity(summary)) continue;
-        try { stopRun(summary.id); } catch { /* best-effort shutdown cleanup */ }
+        // Remote stops (ssh) run concurrently and never block the event loop.
+        if (summary.remote) remoteStops.push(stopRunAsync(summary.id).catch(() => { /* best-effort shutdown cleanup */ }));
+        else try { stopRun(summary.id); } catch { /* best-effort shutdown cleanup */ }
         spendCache.delete(summary.id);
         healthLogCache.delete(summary.id);
         resetChildEventLogCursor(summary.id);
     }
+    await Promise.all(remoteStops);
 }
 
 function markCompletionCallbackSuppressed(id: string, reason: string, now: number = Date.now()): void {
@@ -739,7 +743,17 @@ function deliverTimingWake(pi: ExtensionAPI | undefined, meta: RunMeta, kind: "d
 /** Stop a run for a timing reason and report it through the ordinary completion callback. */
 function stopForTiming(pi: ExtensionAPI | undefined, id: string, reason: TimingStopReason, now: number): boolean {
     if (!patchTiming(id, { stopReason: reason, stoppedAt: now })) return false;
-    const outcome = stopRun(id, { now: () => now });
+    if (readMeta(id)?.remote) {
+        // A remote stop needs ssh: run it off the event loop and finish the same bookkeeping when it ends.
+        void stopRunAsync(id, { now: () => now })
+            .then((outcome) => afterTimingStop(pi, id, reason, now, outcome))
+            .catch(() => { patchTiming(id, { stopReason: undefined, stoppedAt: undefined }); });
+        return true;
+    }
+    return afterTimingStop(pi, id, reason, now, stopRun(id, { now: () => now }));
+}
+
+function afterTimingStop(pi: ExtensionAPI | undefined, id: string, reason: TimingStopReason, now: number, outcome: ReturnType<typeof stopRun>): boolean {
     if (outcome.action !== "stopped") {
         // The child finished on its own first (or an orphaned run's group was already gone and
         // it was finalized from its log): its own exit is the outcome, not a harness stop.
@@ -1088,6 +1102,17 @@ function navigatorDetail(id: string, now: number = Date.now()) {
 
 /** Shared #44 stop+dismiss path used by navigator Close (#47). */
 function navigatorCloseRun(id: string) {
+    const current = readMeta(id);
+    if (current?.remote && (effectiveStatus(current) === "running" || effectiveStatus(current) === "orphaned")) {
+        // The remote stop (abort + ssh) must not block the TUI: run it in the background, dismiss the
+        // row when it is verified, and report "not closed" for now (the row updates when it ends).
+        void stopRunAsync(id).then(() => {
+            dismissRun(id);
+            spendCache.delete(id); healthLogCache.delete(id); resetChildEventLogCursor(id);
+            try { renderWidget(); } catch { /* ignore */ }
+        }).catch(() => { /* incident recorded by the stop; the row stays for a retry */ });
+        return { action: "not-closed", id, status: "stopping" };
+    }
     const outcome = executeNavigatorClose(id, {
         readMeta,
         effectiveStatus,
@@ -1686,6 +1711,8 @@ export default function (pi: ExtensionAPI) {
         git_clone_workspace?: boolean; approve?: boolean; allow_nested?: boolean;
         /** Named remote target (config `remoteTargets`); runs the child on that host. */
         remote?: string;
+        /** Run id of an earlier remote run whose kept session a new remote pi process continues. */
+        resume?: string;
         agent?: string; role?: string | readonly string[]; alias?: string;
         catalog?: CatalogRunRecord; catalogResolved?: boolean;
     } & TimingParams;
@@ -1745,8 +1772,24 @@ export default function (pi: ExtensionAPI) {
         // is otherwise an ordinary run (log, navigator, incidents, timing, callback, stop). The remote
         // pi applies its own sandbox profile (required by the target); local extensions and the local
         // task runtime do not apply there.
-        const remoteSel = selectRemoteTarget(cfg, { remote: p.remote, agent: p.agent });
+        let resumeSource: RunMeta | undefined;
+        if (p.resume !== undefined) {
+            resumeSource = readMeta(p.resume);
+            if (!resumeSource?.remote) throw new Error(`resume: run ${p.resume} is not a known remote run. Resume re-attaches to the kept session of an earlier remote run.`);
+            if (p.remote !== undefined && p.remote !== resumeSource.remote.target) {
+                throw new Error(`resume: run ${p.resume} used remote target "${resumeSource.remote.target}", not "${p.remote}".`);
+            }
+            if (effectiveStatus(resumeSource) === "running") throw new Error(`resume: run ${p.resume} is still running. Stop it first (subagent_stop), then resume.`);
+        }
+        const remoteSel = selectRemoteTarget(cfg, { remote: p.remote ?? resumeSource?.remote?.target, agent: p.agent });
+        if (p.resume !== undefined && !remoteSel) throw new Error("resume is only supported for remote runs.");
         if (remoteSel) {
+            assertRemoteOptionsSupported(p);
+            if (resumeSource?.remote) {
+                // The earlier remote process must be verifiably gone before a new one continues its session.
+                const gone = await stopRemoteProcessAsync(resumeSource.remote);
+                if (!gone.verified) throw new Error(`resume: the earlier remote process for ${resumeSource.id} could not be verified stopped: ${gone.reason}`);
+            }
             const maxConcurrent = activeConcurrencyCap();
             if (countRunning() >= maxConcurrent) {
                 throw new Error(`Max concurrent subagents (${maxConcurrent}) reached. Stop or let some finish first.`);
@@ -1759,7 +1802,10 @@ export default function (pi: ExtensionAPI) {
             try {
                 launched = await launchRemoteRun({
                     id, targetName: remoteSel.name, target: remoteSel.target, prompt: p.prompt,
-                    options: { model, thinking, tools: allow || undefined, excludeTools: p.exclude_tools || undefined, approve: p.approve === true },
+                    options: {
+                        model, thinking, tools: allow || undefined, excludeTools: p.exclude_tools || undefined, approve: p.approve === true,
+                        ...(resumeSource ? { resumeSessionOf: resumeSource.remote?.resumedFrom ?? resumeSource.id } : {}),
+                    },
                 });
             } catch (error) {
                 discardFailedLaunch(id);
@@ -1781,8 +1827,9 @@ export default function (pi: ExtensionAPI) {
                 remote,
             };
             writeMeta(meta);
-            void spawned.exit.then((code) => {
-                if (!handleRemoteExit(id).finalize) return;
+            void spawned.exit.then(async (code) => {
+                // A bridge that died without a marker may leave the remote running: stop it (verified) or stay unfinalized.
+                if (!(await reconcileRemoteExit(id, code)).finalize) return;
                 finalizeRun(pi, ctx, id, code);
             });
             uiCtx = ctx;
@@ -1975,7 +2022,6 @@ export default function (pi: ExtensionAPI) {
         void spawned.exit.then((code) => {
             // A dropped SSH channel leaves the remote process possibly alive: do not finalize; health
             // reconciliation marks the run orphaned/lost and subagent_stop still reaches the remote.
-            if (meta.remote && !handleRemoteExit(id).finalize) return;
             finalizeRun(pi, ctx, id, code);
         });
 
@@ -2043,6 +2089,7 @@ export default function (pi: ExtensionAPI) {
             approve: Type.Optional(Type.Boolean({ description: "Trust project-local files in the child (default: false; headless runs cannot prompt for trust)." })),
             allow_nested: Type.Optional(Type.Boolean({ description: "Allow the child to spawn its own subagents (default: false). Loads this extension in the child and allowlists its tools." })),
             remote: Type.Optional(Type.String({ description: "Name of a configured remote target (settings remoteTargets). The child runs on that host over SSH as a normal monitored run, under the target's required remote sandbox profile. Omit for a local child (or the target mapped to the agent in remoteAgents)." })),
+            resume: Type.Optional(Type.String({ description: "Run id of an earlier REMOTE run. A new remote pi process continues that run's kept session on the same host (the prompt is the follow-up message); the remote sandbox is verified again. The earlier remote process must be stopped (it is verified). Remote runs only." })),
             ...timingSchemaFields(),
         }),
 
@@ -2587,7 +2634,7 @@ export default function (pi: ExtensionAPI) {
         // The foreground Pi session owns this work. Stop current-session
         // running/orphaned children before dropping the session origin, so they
         // cannot become live process groups with no coordinator.
-        stopCurrentSessionSubagents(ctx);
+        const remoteStops = stopCurrentSessionSubagents(ctx);
         // The stopped children exit after this handler returns; their finalizers
         // must not reach for a ctx that Pi invalidates once the session is replaced.
         uiCtx = undefined;
@@ -2618,5 +2665,7 @@ export default function (pi: ExtensionAPI) {
             try { ctx.ui.setStatus(NAVIGATOR_STATUS_KEY, undefined); } catch { /* ignore */ }
             try { ctx.ui.setStatus(CLOSE_CONFIRM_STATUS_KEY, undefined); } catch { /* ignore */ }
         }
+        // Remote stops (ssh) were started above and ran concurrently with this teardown.
+        await remoteStops;
     });
 }

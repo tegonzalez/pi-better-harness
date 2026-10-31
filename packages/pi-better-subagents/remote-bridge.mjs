@@ -8,12 +8,18 @@
  *   - SIGUSR2                      -> RPC `abort`, then an abort-done marker (stop sequence step 1)
  *   - agent_settled                -> RPC `get_session_stats` (logged as `remote_session_stats`), stdin close
  *
- * Remote process-group termination is NOT done here: `stopRun` does it (and verifies it) after the
- * abort marker, so it also works when this bridge is gone. Configuration comes from a JSON file
- * (argv[2]) written by the parent; this file names no host, path, or model.
+ * Start sequence: the environment payload goes to the launch script's stdin (never a command
+ * line); the bridge then reads the remote session's entries (RPC get_entries) and requires the
+ * sandbox launch audit entry (custom entry, `active: true`, the expected `profile`, `policyHash`,
+ * `planHash`) written by THIS pi process. Only then is the prompt sent. Anything else fails closed:
+ * an incident is written and the remote session is stopped (verified) before this bridge exits.
+ *
+ * Remote session termination on a normal stop is NOT done here: `stopRun` does it (and verifies it)
+ * after the abort marker, so it also works when this bridge is gone. Configuration comes from a JSON
+ * file (argv[2]) written by the parent; this file names no host, path, or model.
  */
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 
 const config = JSON.parse(readFileSync(process.argv[2], "utf8"));
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -26,6 +32,10 @@ let stopping = false;
 let finished = false;
 let stderrTail = "";
 const delivered = new Set();
+let startedMs;
+let failedClosed = false;
+const STARTED_RE = /^pi-remote-started (\d+)$/;
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function log(line) {
     process.stdout.write(`${line}\n`);
@@ -39,6 +49,15 @@ function writeJson(path, value) {
 }
 
 const child = spawn(config.argv[0], config.argv.slice(1), { stdio: ["pipe", "pipe", "pipe"] });
+// A remote that exits before reading stdin (pi missing, ...) must not crash the bridge with EPIPE.
+child.stdin.on("error", () => {});
+
+// Environment payload: stdin only, from a 0600 local file that is removed as soon as it is read.
+try {
+    const payload = readFileSync(config.envPath, "utf8");
+    try { unlinkSync(config.envPath); } catch { /* ignore */ }
+    child.stdin.write(payload);
+} catch { /* no payload: the launch script then fails closed */ }
 
 function send(command, timeoutMs = REQUEST_TIMEOUT_MS) {
     return new Promise((resolve) => {
@@ -56,7 +75,12 @@ function send(command, timeoutMs = REQUEST_TIMEOUT_MS) {
 
 function handleRecord(line) {
     let record;
-    try { record = JSON.parse(line); } catch { log(`[remote stdout] ${line}`); return; }
+    try { record = JSON.parse(line); } catch {
+        const started = STARTED_RE.exec(line);
+        if (started) { startedMs = Number(started[1]); return; }
+        log(`[remote stdout] ${line}`);
+        return;
+    }
     if (record?.type === "response") {
         const resolve = record.id !== undefined ? pending.get(record.id) : undefined;
         if (resolve) { pending.delete(record.id); resolve(record); }
@@ -97,6 +121,7 @@ child.stderr.on("data", (chunk) => {
 async function finishSettled() {
     const stats = await send({ type: "get_session_stats" });
     if (stats.success && stats.data) log(JSON.stringify({ type: "remote_session_stats", data: stats.data }));
+    writeJson(config.settledPath, { at: Date.now() });
     try { child.stdin.end(); } catch { /* ignore */ }
     setTimeout(() => { if (!finished) child.kill("SIGTERM"); }, 15_000).unref();
 }
@@ -107,6 +132,8 @@ function classify(code) {
         ? { kind: "channel-lost", summary: "SSH channel to the remote host was lost while the run was active; the remote process may still be running. Use subagent_stop to terminate it.", code }
         : { kind: "ssh-failed", summary: `SSH connection failed: ${tail || "no detail"}`, code };
     if (code === 127) return { kind: "pi-missing", summary: tail || "remote pi was not found", code };
+    if (code === 95) return { kind: "setsid-missing", summary: tail || "setsid is required on the remote host", code };
+    if (code === 94) return { kind: "session-missing", summary: tail || "the session to resume was not found on the remote host", code };
     if (code === 96) return { kind: "sandbox-unavailable", summary: tail || "required remote sandbox could not be enabled", code };
     if (code === 97) return { kind: "cwd-missing", summary: tail || "remote working directory not found", code };
     if (code === 98) return { kind: "remote-dir", summary: tail || "remote run directory could not be created", code };
@@ -127,6 +154,7 @@ function onClosed(code, signal) {
     if (closed) return;
     closed = true;
     finished = true;
+    if (failedClosed) return;
     if (!settled && !stopping) {
         const exitCode = code ?? 1;
         if ((exitCode !== 0 || !sawEvent) && !existsSync(config.failurePath)) writeJson(config.failurePath, classify(exitCode));
@@ -157,7 +185,60 @@ setInterval(async () => {
     else log(`[bridge] ${request.mode === "follow_up" ? "follow_up" : "steer"} ${request.id} rejected: ${response.error ?? "unknown"}`);
 }, 500).unref();
 
-// Start: send the prompt only after the remote answers, so a missing pi / sandbox fails before any work.
+/** Run the remote stop script over ssh and say whether it verified the session gone. */
+function runRemoteStop() {
+    return new Promise((resolve) => {
+        let out = "";
+        const stop = spawn(config.stopArgv[0], config.stopArgv.slice(1), { stdio: ["ignore", "pipe", "ignore"] });
+        const timer = setTimeout(() => { stop.kill("SIGKILL"); resolve(false); }, 90_000);
+        stop.stdout.on("data", (c) => { out += c; });
+        stop.on("error", () => { clearTimeout(timer); resolve(false); });
+        stop.on("close", () => { clearTimeout(timer); resolve(out.trim().split("\n").pop() === "gone"); });
+    });
+}
+
+/** Fail closed: incident, verified remote stop, exit. If the stop cannot be verified the run is NOT finalized. */
+async function failClosed(kind, summary) {
+    if (failedClosed) return;
+    failedClosed = true;
+    writeJson(config.failurePath, { kind, summary, code: 96 });
+    log(`[bridge] ${summary}`);
+    try { child.stdin.end(); } catch { /* ignore */ }
+    const stopped = await runRemoteStop();
+    if (!stopped) writeJson(config.failurePath, { kind: "remote-unstopped", summary: `${summary}; the remote process could not be verified stopped. Use subagent_stop.`, code: 96 });
+    try { child.kill("SIGTERM"); } catch { /* ignore */ }
+    process.exit(96);
+}
+
+/**
+ * Require the sandbox launch audit entry of THIS pi process: entries older than the remote's own
+ * start stamp (a resumed session carries earlier processes' entries) never count.
+ */
+async function verifySandbox() {
+    const want = config.sandbox;
+    const deadline = Date.now() + want.timeoutMs;
+    let reason = "the remote did not report a sandbox launch entry";
+    while (Date.now() < deadline && !finished) {
+        if (startedMs === undefined) { reason = "the remote did not report its start time"; await sleep(200); continue; }
+        const response = await send({ type: "get_entries" }, 10_000);
+        if (response.success) {
+            const entries = (response.data?.entries ?? []).filter((e) => e?.type === "custom" && e.customType === want.entryType && Date.parse(e.timestamp) >= startedMs);
+            const entry = entries[entries.length - 1];
+            reason = "the remote did not report a sandbox launch entry";
+            if (entry) {
+                const d = entry.data ?? {};
+                if (d.active !== true) return { ok: false, reason: `the remote sandbox reports it is not active (profile ${JSON.stringify(d.profile)})` };
+                if (d.profile !== want.entryProfile) return { ok: false, reason: `the remote sandbox profile is ${JSON.stringify(d.profile)}, expected ${JSON.stringify(want.entryProfile)}` };
+                if (typeof d.policyHash !== "string" || !d.policyHash || typeof d.planHash !== "string" || !d.planHash) return { ok: false, reason: "the remote sandbox entry carries no policyHash/planHash" };
+                return { ok: true, value: { profile: d.profile, requested: want.profile, policyHash: d.policyHash, planHash: d.planHash, ...(typeof entry.id === "string" ? { entryId: entry.id } : {}), at: Date.now() } };
+            }
+        } else reason = `get_entries failed: ${response.error ?? "no response"}`;
+        await sleep(300);
+    }
+    return { ok: false, reason: `${reason} (waited ${want.timeoutMs}ms)` };
+}
+
+// Start: verify the remote sandbox, then send the prompt, so a missing pi / inactive sandbox fails before any work.
 void (async () => {
     let prompt;
     try { prompt = readFileSync(config.promptPath, "utf8"); } catch (error) {
@@ -165,6 +246,14 @@ void (async () => {
         child.kill("SIGTERM");
         return;
     }
+    const verdict = await verifySandbox();
+    if (finished) return;
+    if (!verdict.ok) {
+        await failClosed("sandbox-unverified", `Remote sandbox profile ${config.sandbox.profile} could not be verified: ${verdict.reason}. The prompt was not sent.`);
+        return;
+    }
+    writeJson(config.sandbox.verifiedPath, verdict.value);
+    log(JSON.stringify({ type: "remote_sandbox_verified", data: verdict.value }));
     const response = await send({ type: "prompt", message: prompt }, config.startTimeoutMs ?? 120_000);
     if (!response.success && !finished) {
         writeJson(config.failurePath, { kind: "remote-exit", summary: `remote pi rejected the prompt: ${response.error ?? "no response"}`, code: 1 });

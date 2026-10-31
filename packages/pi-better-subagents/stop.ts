@@ -32,7 +32,8 @@ import {
 } from "./registry.ts";
 import { killProcessTree, processExists } from "./spawn.ts";
 import { existsSync, rmSync } from "node:fs";
-import { stopRemoteProcess, type RemoteStopResult, type RemoteRunMeta } from "./remote.ts";
+import { stopRemoteProcess, stopRemoteProcessAsync, type RemoteStopResult, type RemoteRunMeta } from "./remote.ts";
+import { remoteSurelyGone } from "./remote-run.ts";
 import { failurePath } from "./failures.ts";
 import { observeFailures } from "./shared-failure-observations.ts";
 
@@ -48,6 +49,8 @@ export interface StopDeps {
     now?: () => number;
     /** Remote termination seam (ssh); defaults to `stopRemoteProcess`. */
     remoteStop?: (remote: RemoteRunMeta) => RemoteStopResult;
+    /** Non-blocking remote termination seam used by `stopRunAsync`; defaults to `stopRemoteProcessAsync`. */
+    remoteStopAsync?: (remote: RemoteRunMeta) => Promise<RemoteStopResult>;
     /** Bridge signal seam for the RPC abort request; defaults to SIGUSR2 on the bridge pid. */
     signalBridge?: (pid: number) => void;
 }
@@ -135,20 +138,24 @@ function sleepSync(ms: number): void {
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-/**
- * Remote stop sequence: (1) ask the local bridge to send RPC abort and wait for its marker,
- * (2) terminate the remote process group and verify it is gone, (3) only then finalize locally.
- * An unverifiable remote stop fails closed: the run keeps its status and an incident explains why.
- */
-function stopRemoteRun(meta: RunMeta, status: string, probe: ProcessProbe, now: number, deps: StopDeps): StopOutcome {
+/** Step 1 of a remote stop: ask the local bridge to send RPC abort (the caller then waits for the marker). */
+function requestRemoteAbort(meta: RunMeta, status: string, deps: StopDeps): boolean {
     const remote = meta.remote!;
     if ((status === "running" || status === "orphaned") && processExists(meta.pid)) {
         try { rmSync(remote.abortDonePath, { force: true }); } catch { /* ignore */ }
         try { (deps.signalBridge ?? ((pid) => process.kill(pid, "SIGUSR2")))(meta.pid); } catch { /* bridge already gone */ }
-        const deadline = Date.now() + remote.abortWaitMs;
-        while (!existsSync(remote.abortDonePath) && Date.now() < deadline && processExists(meta.pid)) sleepSync(50);
+        return true;
     }
-    const result = (deps.remoteStop ?? stopRemoteProcess)(meta.remote!);
+    return false;
+}
+
+function abortPending(meta: RunMeta, deadline: number): boolean {
+    return !existsSync(meta.remote!.abortDonePath) && Date.now() < deadline && processExists(meta.pid);
+}
+
+/** Last step of a remote stop: record the verdict, finalize locally only when the remote is verified gone. */
+function finishRemoteStop(meta: RunMeta, status: string, result: RemoteStopResult, now: number): StopOutcome {
+    const remote = meta.remote!;
     if (!result.verified) {
         observeFailures(failurePath(meta.id), [{
             id: `remote-stop:${now}`, operation: "remote-stop", kind: "failure", category: "remote",
@@ -162,6 +169,57 @@ function stopRemoteRun(meta: RunMeta, status: string, probe: ProcessProbe, now: 
     }
     if (status === "lost") return { action: "finalized", id: meta.id, status: "lost" };
     return finalizeOrphanedWithoutProcess(meta, now);
+}
+
+/**
+ * A finished bridge whose remote work is known to be over (agent settled, or a failure recorded
+ * before any remote work) is stopped without ssh: there is nothing to reach.
+ */
+function remoteNeedsNoSsh(meta: RunMeta, status: string): boolean {
+    return (status === "exited" || status === "lost") && remoteSurelyGone(meta.id);
+}
+
+/**
+ * Remote stop sequence: (1) ask the local bridge to send RPC abort and wait for its marker,
+ * (2) terminate the remote session and verify it is gone, (3) only then finalize locally.
+ * An unverifiable remote stop fails closed: the run keeps its status and an incident explains why.
+ * This variant blocks; the tool/shutdown paths use `stopRunAsync`.
+ */
+function stopRemoteRun(meta: RunMeta, status: string, probe: ProcessProbe, now: number, deps: StopDeps): StopOutcome {
+    if (remoteNeedsNoSsh(meta, status)) {
+        return status === "lost" ? { action: "finalized", id: meta.id, status: "lost" } : finalizeOrphanedWithoutProcess(meta, now);
+    }
+    if (requestRemoteAbort(meta, status, deps)) {
+        const deadline = Date.now() + meta.remote!.abortWaitMs;
+        while (abortPending(meta, deadline)) sleepSync(50);
+    }
+    return finishRemoteStop(meta, status, (deps.remoteStop ?? stopRemoteProcess)(meta.remote!), now);
+}
+
+async function stopRemoteRunAsync(meta: RunMeta, status: string, now: number, deps: StopDeps): Promise<StopOutcome> {
+    if (remoteNeedsNoSsh(meta, status)) {
+        return status === "lost" ? { action: "finalized", id: meta.id, status: "lost" } : finalizeOrphanedWithoutProcess(meta, now);
+    }
+    if (requestRemoteAbort(meta, status, deps)) {
+        const deadline = Date.now() + meta.remote!.abortWaitMs;
+        while (abortPending(meta, deadline)) await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return finishRemoteStop(meta, status, await (deps.remoteStopAsync ?? stopRemoteProcessAsync)(meta.remote!), now);
+}
+
+/**
+ * Non-blocking `stopRun`: identical semantics, but a remote stop (abort wait + ssh) never blocks the
+ * event loop. Local runs take the synchronous path unchanged.
+ */
+export async function stopRunAsync(id: string, deps: StopDeps = {}): Promise<StopOutcome> {
+    const meta = readMeta(id);
+    if (!meta) throw new Error(`Unknown run id: ${id}`);
+    const status = effectiveStatus(meta);
+    if (meta.remote && (status === "running" || status === "orphaned" || status === "exited" || status === "lost")) {
+        const now = typeof deps.now === "function" ? deps.now() : Date.now();
+        return stopRemoteRunAsync(meta, status, now, deps);
+    }
+    return stopRun(id, deps);
 }
 
 /**

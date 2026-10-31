@@ -18,7 +18,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { readMeta, listRunRecords, effectiveStatus, isFinalResultStatus, steerDirFor, type RunMeta, type RunStatus } from "./registry.ts";
 import { enqueueSteer, formatParentSteer, formatSteerLine, formatSteerShort, newSteerId, steerQueueStatus } from "./steer-queue.ts";
 import { buildSubagentResultPayload } from "./finalization.ts";
-import { stopRun } from "./stop.ts";
+import { stopRunAsync } from "./stop.ts";
 import {
     SUBAGENT_LIST_DEFAULT_LIMIT,
     SUBAGENT_LIST_MAX_LIMIT,
@@ -531,7 +531,7 @@ export function subagentStopTool(
             const p = params as { id: string };
             // Shared stop semantics with the TUI navigator close action (#44/#68):
             // stopRun rereads meta + effective status from disk before acting.
-            const outcome = stopRun(p.id);
+            const outcome = await stopRunAsync(p.id);
             if (outcome.action === "not-running") {
                 return text(`Run ${p.id} is not running (${outcome.status}).`);
             }

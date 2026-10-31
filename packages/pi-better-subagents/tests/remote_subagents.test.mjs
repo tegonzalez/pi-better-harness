@@ -10,16 +10,17 @@
  */
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync, symlinkSync, statSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { parseRemoteTarget, parseRemoteTargets, selectRemoteTarget, buildLaunchScript, wrapRemoteScript, stopRemoteProcess } from "../remote.ts";
-import { handleRemoteExit, launchRemoteRun } from "../remote-run.ts";
+import { parseRemoteTarget, parseRemoteTargets, selectRemoteTarget, buildLaunchScript, buildEnvPayload, buildStopScript, wrapRemoteScript, stopRemoteProcess, assertRemoteOptionsSupported } from "../remote.ts";
+import { handleRemoteExit, launchRemoteRun, reconcileRemoteExit } from "../remote-run.ts";
 import { finalizeRun } from "../finalization.ts";
 import { parseRun } from "../parse.ts";
 import { logPathFor, readMeta, runDir, writeMeta, effectiveStatus } from "../registry.ts";
-import { stopRun } from "../stop.ts";
+import { stopRun, stopRunAsync } from "../stop.ts";
 import { processExists } from "../spawn.ts";
 import { readRunFailures } from "../failures.ts";
 
@@ -37,7 +38,7 @@ function targetConfig(over = {}) {
         cwd: "~/work",
         pi: { command: process.execPath, args: [join(fixtures, "fake-pi.mjs")] },
         env: { FAKE_EXTRA: "extra value" },
-        sandbox: { profile: "profile-a", env: { FAKE_SANDBOX_PROFILE: "{profile}" }, args: ["--sandbox-profile", "{profile}"] },
+        sandbox: { profile: "profile-a", env: { FAKE_SANDBOX_PROFILE: "{profile}" }, args: ["--sandbox-profile", "{profile}"], verifyTimeoutMs: 20_000 },
         termGraceSeconds: 2,
         ...over,
     };
@@ -103,6 +104,17 @@ describe("remote target schema", () => {
         assert.throws(() => parseRemoteTarget({ ...targetConfig(), root: "../x" }, "t"), /root/);
         assert.throws(() => parseRemoteTarget({ ...targetConfig(), port: 99999 }, "t"), /port/);
     });
+    it("rejects a sandbox with no way to pass the profile to the remote pi", () => {
+        const noCarrier = { profile: "p", args: ["--fixed"], env: { X: "y" }, verifyCommand: "true" };
+        assert.throws(() => parseRemoteTarget(targetConfig({ sandbox: noCarrier }), "t"), /no way to pass the profile/);
+        assert.doesNotThrow(() => parseRemoteTarget(targetConfig({ sandbox: { profile: "p", env: { X: "{profile}" } } }), "t"));
+    });
+    it("rejects options a remote run cannot honour instead of dropping them", () => {
+        for (const key of ["sandbox", "sandbox_dir", "cwd", "git_clone_workspace", "allow_nested", "clean"]) {
+            assert.throws(() => assertRemoteOptionsSupported({ [key]: key === "sandbox_dir" || key === "cwd" ? "/x" : false }), new RegExp(`not supported with a remote target: ${key}`));
+        }
+        assert.doesNotThrow(() => assertRemoteOptionsSupported({}));
+    });
     it("selects by spawn option, then by agent mapping; unknown names fail closed", () => {
         const settings = { remoteTargets: { a: targetConfig(), b: targetConfig({ host: "other" }) }, remoteAgents: { "agent.x": "b" } };
         assert.equal(selectRemoteTarget(settings, { remote: "a", agent: "agent.x" }).name, "a");
@@ -115,7 +127,9 @@ describe("remote target schema", () => {
         const target = parseRemoteTarget(targetConfig({ pi: { command: "pi", login: true }, cwd: "~/it's here" }), "t");
         const script = buildLaunchScript(target, "sa_x_1", { model: "m'1" });
         assert.match(script, /'--sandbox-profile' 'profile-a'/);
-        assert.match(script, /export FAKE_SANDBOX_PROFILE='profile-a'/);
+        assert.doesNotMatch(script, /FAKE_SANDBOX_PROFILE|extra value/, "environment never rides the command line");
+        assert.match(buildEnvPayload(target, "sa_x_1"), /^export FAKE_EXTRA='extra value'\nexport FAKE_SANDBOX_PROFILE='profile-a'\n__PI_REMOTE_ENV_END_sa_x_1__\n$/);
+        assert.match(script, /command -v setsid/);
         assert.match(script, /"\$HOME"\/'it'\\''s here'/);
         assert.match(script, /--model 'm'\\''1'/);
         assert.match(wrapRemoteScript(script, true), /^"\$SHELL" -lc /);
@@ -219,7 +233,7 @@ describe("remote run over a fake ssh transport", () => {
 
     it("fails closed when the required sandbox cannot be enabled, before any prompt is sent", async () => {
         const promptsBefore = piCmds().filter((c) => c.kind === "cmd" && c.value.type === "prompt").length;
-        const { id, exit } = await start("anything", { sandbox: { profile: "profile-a", verifyCommand: "echo no backend >&2; false" } });
+        const { id, exit } = await start("anything", { sandbox: { ...targetConfig().sandbox, verifyCommand: "echo no backend >&2; false" } });
         const code = await exit;
         assert.equal(code, 96);
         assert.equal(handleRemoteExit(id).failure.kind, "sandbox-unavailable");
@@ -239,5 +253,236 @@ describe("remote run over a fake ssh transport", () => {
         assert.deepEqual(stopRemoteProcess(remote, { run: () => ({ status: 0, stdout: "gone\n", stderr: "" }) }), { verified: true });
         assert.equal(stopRemoteProcess(remote, { run: () => ({ status: 1, stdout: "alive\n", stderr: "" }) }).verified, false);
         assert.equal(stopRemoteProcess(remote, { run: () => ({ status: 255, stdout: "", stderr: "unreachable" }) }).verified, false);
+    });
+});
+
+const sandboxLog = () => piCmds().filter((c) => c.kind === "cmd");
+const promptsSent = () => sandboxLog().filter((c) => c.value.type === "prompt").length;
+const sandboxIncident = (id) => Object.values(readRunFailures(id).observations).find((o) => o.category === "remote");
+const isGone = (pid) => { try { process.kill(pid, 0); } catch { return true; } return spawnSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8" }).stdout.trim().startsWith("Z"); };
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+
+describe("remote sandbox is verified, not requested (confinement review #2)", () => {
+    it("records policyHash/planHash from the sandbox launch entry and only then sends the prompt", async () => {
+        const before = promptsSent();
+        const { id, exit } = await start("say done");
+        const code = await exit;
+        assert.equal(code, 0);
+        const handled = await reconcileRemoteExit(id, code);
+        assert.equal(handled.finalize, true);
+        assert.equal(promptsSent(), before + 1);
+        const sandbox = readMeta(id).remote.sandbox;
+        assert.equal(sandbox.profile, "profile-a");
+        assert.equal(sandbox.policyHash, "policy-hash-1");
+        assert.equal(sandbox.planHash, "plan-hash-1");
+        assert.ok(readFileSync(logPathFor(id), "utf8").includes("remote_sandbox_verified"));
+    });
+
+    for (const [mode, expect] of [["none", /did not report a sandbox launch entry/], ["inactive", /not active/], ["wrong", /expected "profile-a"/], ["stale", /did not report a sandbox launch entry/], ["nohash", /no policyHash/]]) {
+        it(`fake pi reporting "${mode}" fails closed: incident, no prompt, remote pi killed`, async () => {
+            const before = promptsSent();
+            const target = targetConfig({ env: { FAKE_PI_SANDBOX: mode }, sandbox: { ...targetConfig().sandbox, verifyTimeoutMs: 1500 } });
+            const { id, exit } = await start("say done", target);
+            const rpid = await until(() => existsSync(join(remoteHome, ".pi-better-subagents", "runs", id, "pid")) && remotePid(id), "remote pid");
+            const code = await exit;
+            assert.equal(code, 96);
+            assert.equal(promptsSent(), before, "no prompt reached the remote");
+            const handled = handleRemoteExit(id);
+            assert.equal(handled.failure.kind, "sandbox-unverified");
+            assert.match(handled.failure.summary, expect);
+            assert.equal(handled.finalize, true, "remote verified stopped, so the run may finalize");
+            assert.equal(isGone(rpid), true, "remote pi was killed");
+            assert.equal(sandboxIncident(id).category, "remote");
+            assert.equal(readMeta(id).remote.sandbox, undefined);
+        });
+    }
+});
+
+describe("entryProfile (pi-better-sandbox reports its permission profile)", () => {
+    it("accepts an entry whose profile differs from the requested name when entryProfile says so, and rejects otherwise", async () => {
+        const ok = await start("say done", { env: { FAKE_PI_ENTRY_PROFILE: "main" }, sandbox: { ...targetConfig().sandbox, entryProfile: "main" } });
+        assert.equal(await ok.exit, 0);
+        const handled = await reconcileRemoteExit(ok.id, 0);
+        assert.equal(handled.finalize, true);
+        assert.equal(readMeta(ok.id).remote.sandbox.profile, "main");
+        const bad = await start("say done", { env: { FAKE_PI_ENTRY_PROFILE: "main" }, sandbox: { ...targetConfig().sandbox, verifyTimeoutMs: 1500 } });
+        assert.equal(await bad.exit, 96);
+        assert.match(handleRemoteExit(bad.id).failure.summary, /expected "profile-a"/);
+    });
+});
+
+describe("stop by session id (confinement review #11)", () => {
+    it("launch is refused when setsid is missing on the remote", async () => {
+        const bin = join(work, "nosetsid-bin");
+        mkdirSync(bin, { recursive: true });
+        for (const tool of ["sh", "mkdir", "cat", "date", "chmod", "rm", "tr", "ps", "awk", "sleep"]) {
+            const found = spawnSync("sh", ["-c", `command -v ${tool}`], { encoding: "utf8" }).stdout.trim();
+            if (found && !existsSync(join(bin, tool))) symlinkSync(found, join(bin, tool));
+        }
+        process.env.FAKE_REMOTE_PATH = bin;
+        try {
+            const before = piCmds().filter((c) => c.kind === "argv").length;
+            const { id, exit } = await start("anything");
+            const code = await exit;
+            assert.equal(code, 95);
+            assert.equal(handleRemoteExit(id).failure.kind, "setsid-missing");
+            assert.equal(piCmds().filter((c) => c.kind === "argv").length, before, "pi was never started");
+        } finally { delete process.env.FAKE_REMOTE_PATH; }
+    });
+
+    it("stop refuses to guess when the recorded pid is alive but not a session leader", async () => {
+        const target = parseRemoteTarget(targetConfig(), "t");
+        const id = `sa_remote_nosid_${process.pid}`;
+        const rd = join(remoteHome, ".pi-better-subagents", "runs", id);
+        mkdirSync(join(rd, "session"), { recursive: true });
+        const victim = spawn("sh", ["-c", "sleep 300; :", "x", join(rd, "session")], { stdio: "ignore" });
+        try {
+            writeFileSync(join(rd, "pid"), String(victim.pid));
+            const remote = { sshArgv: [], login: false, stopScript: buildStopScript(target, id), termGraceSeconds: 1, host: "h" };
+            const run = (argv) => { const r = spawnSync("sh", ["-c", argv.at(-1)], { encoding: "utf8", env: { ...process.env, HOME: remoteHome } }); return { status: r.status, stdout: r.stdout, stderr: r.stderr }; };
+            const result = stopRemoteProcess(remote, { run });
+            assert.equal(result.verified, false);
+            assert.match(result.reason, /not a session leader/);
+            assert.equal(isGone(victim.pid), false, "nothing was signalled");
+        } finally { spawnSync("pkill", ["-KILL", "-P", String(victim.pid)]); victim.kill("SIGKILL"); rmSync(rd, { recursive: true, force: true }); }
+    });
+
+    it("kills a grandchild detached into its own process group (same session)", async () => {
+        const file = join(work, "grandchild.pid");
+        rmSync(file, { force: true });
+        const { id, exit } = await start("hang grandchild persist", { env: { FAKE_GRANDCHILD_FILE: file } });
+        const gc = Number(await until(() => existsSync(file) && readFileSync(file, "utf8").trim(), "grandchild pid"));
+        const rpid = remotePid(id);
+        const [pgid, sid] = spawnSync("ps", ["-o", "pgid=,sid=", "-p", String(gc)], { encoding: "utf8" }).stdout.trim().split(/\s+/).map(Number);
+        assert.notEqual(pgid, rpid, "the grandchild is in its own process group");
+        assert.equal(sid, rpid, "but in the run's session");
+        assert.equal(isGone(gc), false);
+        assert.deepEqual(stopRun(id), { action: "stopped", id });
+        await until(() => isGone(gc), "grandchild gone", 3000);
+        assert.equal(isGone(rpid), true);
+        await exit;
+    });
+});
+
+describe("abnormal bridge exit (confinement review #12)", () => {
+    it("SIGKILLed bridge: the remote is stopped and verified before the run is finalized", async () => {
+        const { id, exit, spawned } = await start("hang and persist");
+        await until(() => parseRun(id).lastActivity.includes("working"), "run active");
+        const rpid = remotePid(id);
+        process.kill(spawned.pid, "SIGKILL");
+        const code = await exit;
+        assert.equal(code, null);
+        assert.equal(isGone(rpid), false, "the remote outlived its bridge");
+        const handled = await reconcileRemoteExit(id, code);
+        assert.deepEqual([handled.finalize, handled.abnormal], [true, true]);
+        assert.equal(isGone(rpid), true, "remote stopped before finalizing");
+        assert.ok(Object.values(readRunFailures(id).observations).some((o) => /ended abnormally/.test(o.summary)));
+    });
+
+    it("SIGKILLed bridge with an unverifiable remote stop is NOT finalized and stays stoppable", async () => {
+        const { id, exit, spawned } = await start("hang and persist");
+        await until(() => parseRun(id).lastActivity.includes("working"), "run active");
+        const rpid = remotePid(id);
+        process.kill(spawned.pid, "SIGKILL");
+        const code = await exit;
+        const handled = await reconcileRemoteExit(id, code, { stop: async () => ({ verified: false, reason: "ssh down" }) });
+        assert.deepEqual([handled.finalize, handled.abnormal], [false, true]);
+        assert.equal(readMeta(id).status, "running");
+        assert.equal(isGone(rpid), false);
+        assert.ok(Object.values(readRunFailures(id).observations).some((o) => /orphaned/.test(o.summary)));
+        assert.notEqual(stopRun(id).action, "not-running");
+        assert.equal(isGone(rpid), true);
+    });
+});
+
+describe("non-blocking stop and exited runs (review #19)", () => {
+    it("stopRunAsync keeps the event loop running while the remote stop works", async () => {
+        const { id, exit } = await start("hang stubborn persist until stopped");
+        await until(() => parseRun(id).lastActivity.includes("working"), "run active");
+        let ticks = 0;
+        const timer = setInterval(() => { ticks += 1; }, 5);
+        const outcome = await stopRunAsync(id);
+        clearInterval(timer);
+        assert.deepEqual(outcome, { action: "stopped", id });
+        assert.ok(ticks >= 10, `event loop kept ticking (${ticks})`);
+        assert.equal(readMeta(id).status, "killed");
+        await exit;
+    });
+
+    it("stopping a settled, exited run needs no ssh", async () => {
+        const { id, exit } = await start("say done");
+        await exit;
+        assert.equal(existsSync(join(runDir(id), "remote-settled.json")), true);
+        const calls = () => readFileSync(join(sshDir, "calls"), "utf8");
+        const before = calls();
+        writeFileSync(join(sshDir, "fail"), "1");
+        try {
+            assert.equal(effectiveStatus(readMeta(id)), "exited");
+            const outcome = stopRun(id, { remoteStop: () => { throw new Error("ssh must not be used"); } });
+            assert.notEqual(outcome.action, "not-running");
+            assert.equal(calls(), before);
+        } finally { rmSync(join(sshDir, "fail")); }
+    });
+});
+
+describe("environment handling (confinement review #14)", () => {
+    it("env values never appear on the ssh command line or in the bridge configuration; the staging file is gone", async () => {
+        const secret = "very-secret-value-1234";
+        const target = parseRemoteTarget(targetConfig({ env: { FAKE_EXTRA: secret } }), "t");
+        const { id, exit } = await (async () => {
+            const id = `sa_remote_env_${process.pid}`;
+            ids.push(id);
+            mkdirSync(runDir(id), { recursive: true });
+            const { spawned, remote } = await launchRemoteRun({ id, targetName: "t", target, prompt: "say done", options: {} });
+            writeMeta({ id, status: "running", pid: spawned.pid, spawnPid: process.pid, cwd: "~", promptPreview: "x", startedAt: Date.now(), logPath: logPathFor(id), sessionId: id, callback: false, remote });
+            const envFile = join(runDir(id), "remote-env");
+            const mode = existsSync(envFile) ? statSync(envFile).mode & 0o777 : undefined;
+            assert.ok(mode === undefined || mode === 0o600, `local env file mode ${mode?.toString(8)}`);
+            assert.equal(statSync(join(runDir(id), "remote-bridge.json")).mode & 0o777, 0o600);
+            const config = readFileSync(join(runDir(id), "remote-bridge.json"), "utf8");
+            assert.equal(config.includes(secret), false, "bridge config has no env values");
+            assert.equal(JSON.stringify(remote).includes(secret), false, "run metadata has no env values");
+            return { id, exit: spawned.exit };
+        })();
+        await exit;
+        assert.equal(piCmds().filter((c) => c.kind === "env").pop().value.EXTRA, secret, "the remote still received it");
+        assert.equal(existsSync(join(runDir(id), "remote-env")), false, "local payload deleted once sent");
+        assert.deepEqual(spawnSync("sh", ["-c", `ls "${join(remoteHome, ".pi-better-subagents", "runs", id)}" | grep -c '^env'`], { encoding: "utf8" }).stdout.trim(), "0", "remote staging file removed");
+    });
+});
+
+describe("resume by run id", () => {
+    it("a new remote pi continues the kept session and the sandbox is verified again", async () => {
+        const first = await start("say done");
+        await first.exit;
+        const promptsBefore = promptsSent();
+        const resumed = await start("follow up please", {}, { resumeSessionOf: first.id });
+        const code = await resumed.exit;
+        assert.equal(code, 0);
+        const handled = await reconcileRemoteExit(resumed.id, code);
+        assert.equal(handled.finalize, true);
+        const argv = piCmds().filter((c) => c.kind === "argv").pop().value;
+        assert.ok(argv.includes("--continue"));
+        assert.equal(argv.includes("--session-id"), false);
+        assert.ok(argv[argv.indexOf("--session-dir") + 1].endsWith(`/runs/${first.id}/session`));
+        assert.equal(promptsSent(), promptsBefore + 1);
+        assert.equal(readMeta(resumed.id).remote.sandbox.planHash, "plan-hash-1", "re-verified for the new process");
+        assert.equal(readMeta(resumed.id).remote.resumedFrom, first.id);
+    });
+
+    it("a stale sandbox entry from the earlier process does not satisfy the new process", async () => {
+        const first = await start("say done");
+        await first.exit;
+        const before = promptsSent();
+        const resumed = await start("again", { env: { FAKE_PI_SANDBOX: "stale" }, sandbox: { ...targetConfig().sandbox, verifyTimeoutMs: 1500 } }, { resumeSessionOf: first.id });
+        assert.equal(await resumed.exit, 96);
+        assert.equal(handleRemoteExit(resumed.id).failure.kind, "sandbox-unverified");
+        assert.equal(promptsSent(), before);
+    });
+
+    it("fails closed when the session to resume does not exist on the remote", async () => {
+        const resumed = await start("again", {}, { resumeSessionOf: "sa_no_such_run" });
+        assert.equal(await resumed.exit, 94);
+        assert.equal(handleRemoteExit(resumed.id).failure.kind, "session-missing");
     });
 });
