@@ -328,7 +328,8 @@ system runtime roots. *Read confinement* is an opt-in refinement of that mode: w
 policy file is configured, the agent can additionally read only
 
 - its project/worktree (writable) and the git dir a worktree `.git` file points to (writable, only when it
-  proves it belongs to this worktree; the git-dir write-deny set below applies; alternates are read-only),
+  proves it belongs to this worktree **and lies outside every writable root**, the project included; the `.git` file itself
+  is read-only; the git-dir write-deny set below applies; alternates are read-only),
 - whatever the project reaches through symlinks (read-only, followed transitively),
 - the tools the policy approves, with their libraries and interpreters (read-only),
 - those tools' approved config paths (read-only) and cache paths (private tmpfs, or a persistent per-agent directory).
@@ -365,7 +366,7 @@ at load time and block launches (fail closed). Path entries are absolute, `~/…
 | `limits.maxSymlinks` / `maxDepth` / `maxWalkEntries` / `maxBinds` / `maxWalkMs` | Caps on the symlink closure. Exceeding one fails the launch with an error naming the cap. | 2000 / 8 / 200000 / 500 / 15000 |
 | `limits.minPrefixDepth` | `install: "prefix"` is refused when the prefix has fewer path components, or contains/lies in the home, the project or a writable root. | `3` |
 | `env.allow[]` | Environment variable names the confined child may inherit, in addition to `PATH`, `HOME`, `LANG`, `LC_ALL`, `TERM`, `TMPDIR`, `TZ`. Everything else is cleared (`--clearenv`). `PATH` is always the synthetic one. | `[]` |
-| `readOnly[]` | Generic read-only paths (for example shared folders): absolute, `~/…` or `${VAR}/…`, no wildcards. Each is realpath'd and must pass the deny list (a path inside a denied path, or one that contains a denied path or a writable root, is refused and recorded in `denied`); a missing one is `skipped`. Mounted read-only; symlinks inside are not followed. | `[]` |
+| `readOnly[]` | Generic read-only paths (for example shared folders): absolute, `~/…` or `${VAR}/…`, no wildcards. Each is realpath'd and must pass the deny list (a path inside a denied path, or one that contains a denied path or lies inside or around a writable root or the sandbox's private `/tmp`, is refused and recorded in `denied`, and never counts as an approved location); a missing one is `skipped`. Mounted read-only; symlinks inside are not followed. | `[]` |
 | `limits.maxWildcardMatches` | Cap on the matches one wildcard pattern may expand to; exceeding it fails the launch. | `64` |
 | `walkSkipDirNames` | Directory names the symlink walk never enters (for example a large dependency tree). | `[]` |
 | `deny.paths` | Extra denied paths. A symlink target inside one, or a directory containing one, is skipped and recorded. | `[]` |
@@ -410,11 +411,14 @@ common dir) the planner computes one deny set: `hooks/`, `config`, `config.workt
 dirs, recursively) and every *other* `worktrees/*` entry. Refs, objects, index, logs, packed-refs and `HEAD` of the
 agent's own worktree stay writable. The same set is mounted read-only in bubblewrap and enforced by the in-process
 `write`/`edit` tools (`readConfinement.denyWrite`). Absent entries are blocked too: the sandbox mounts an empty
-read-only node, which **creates that empty file on the host** (`config.worktree`, `info/attributes`, the alternates
-files, `gitdir`; an absent `hooks` becomes an empty file, so a host `git init .` in such a repository then fails with
-"cannot stat hooks/*.sample: Not a directory"). An absent `commondir` is written at planning time with the content `.`
-(an empty one breaks git; `.` is what git accepts for a main repository or submodule git dir) and then mounted read-only,
-so it can neither be created nor redirected. At launch an existing
+read-only node. Every such placeholder is **written at planning time** (never by the sandbox at launch), so the plan hash is
+the same before and after the first launch and the placeholders are ordinary readable files: empty files for `config`,
+`config.worktree`, `info/attributes`, the alternates files and `gitdir`, an empty directory for an absent `hooks`
+(a `/dev/null` mount remains only as the last resort when the host path cannot be written), and `.` for an absent
+`commondir` (an empty one breaks git; `.` is what git accepts for a main repository or submodule git dir). They are then
+mounted read-only, so they can neither be created nor redirected. Planning creates them with non-following operations: a
+symbolic link anywhere inside a git dir's protected paths makes the plan **fail closed** (recorded in `denied`) instead of
+being followed or mounted over. At launch an existing
 `objects/info/alternates` is validated: each entry must be a git object directory and pass the deny rules, otherwise the
 plan **fails closed** (the refusal is recorded in `denied` and in the status entry's `reason`).
 
@@ -426,9 +430,19 @@ is computed from the deny list (`plan.denyRemove`), not from a fixed list. The i
 those directories, or any directory containing one, the same way. Files a region legitimately keeps writable (HEAD,
 index, refs) can still be deleted by `rm -rf`; the overlays and anchors stay.
 
+**The `.git` file of a linked worktree or submodule folder.** The file is mounted read-only (write, unlink and rename fail;
+the project root, a mount point, anchors it) and the in-process tools refuse the same, so the redirect cannot change under a
+running session. At planning time a `gitdir:` target (and a `commondir`) that lies inside, or around, the project or any other
+writable root is refused: the plan **fails closed** and the refusal is recorded in `denied` and the status entry's `reason`.
+That closes redirecting git to an agent-made directory; it does not make a host git run inside a writable folder safe (see the
+recommendation below). `git worktree repair`/`move` and `git submodule absorbgitdirs` rewrite that file and need a host run.
+
+**Deny entries under a `.git` file.** Nothing can be created below a `.git` file, so a rule such as the packaged
+`.git/hooks` is mapped onto the same relative path in the git dir(s) the file resolves to (the worktree's admin dir and the
+common dir, or the submodule's git dir), for the kernel mounts and for the in-process tools alike.
+
 **Not guarded.** Nested repositories and new submodules that the agent creates inside the writable project are not
-covered: their `config`, `hooks` and `.git` are ordinary writable files, and a host git run there can execute them. The
-`.git` file of a linked worktree or submodule folder is itself an ordinary project file.
+covered: their `config`, `hooks` and `.git` are ordinary writable files, and a host git run there can execute them.
 
 **Recommendation for hosts.** Never run git inside a folder an agent can write. Integrate with
 `git fetch <worktree> <branch>` from a trusted repository, and inspect with
@@ -477,7 +491,8 @@ The owner can check what a confined worker can read and write from a separate pi
    dir, policy path, `policyHash` and `planHash`, and whether the confinement is `active`.
 3. `/sandbox check <path>` reports read, write and exec for a path with the reason (the mount that grants it, or
    "not mounted"). It uses the same evaluator as the in-process tools, whose allow set is the kernel mount plan. Relative
-   paths resolve against the working folder; symlinks are decided on their realpath.
+   paths resolve against the working folder; symlinks are decided on their realpath. `/tmp` is the sandbox's private,
+   empty tmpfs: writable scratch, and the host's `/tmp` files are not visible.
 4. Probe with `!` commands:
    - `!cat <another-project>/file` → `No such file or directory`
    - `!echo x > <outside-the-working-folder>/file` → fails (a `readOnly` folder is readable, not writable)
@@ -485,9 +500,8 @@ The owner can check what a confined worker can read and write from a separate pi
 5. Compare the hashes with the worker: a remote subagent's `subagent_result` carries a
    `Remote workspace (<target>): cwd … · agent dir … · policyHash … · planHash …` line (also in
    `remote.sandbox` and `remote-sandbox.json` of the run). Equal `policyHash` means the same policy; equal `planHash`
-   means the same computed mounts. A `planHash` depends on the state of the working folder (for example the
-   placeholders the sandbox leaves for protected entries such as `.git/hooks` on a first launch), so compare after both
-   sessions have launched at least once in a checkout.
+   means the same computed mounts. A `planHash` depends on the state of the working folder, but the placeholders for
+   protected entries are written when the plan is computed, so a session's hash is stable from its first launch.
 
 ### Example policy (illustrative; adapt to your environment)
 
