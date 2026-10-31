@@ -30,7 +30,7 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
 
-import { credentialFilePaths, RUNTIME_ROOTS, type ReadConfinementMounts } from "./shared-sandbox-core.ts";
+import { broadCredentialPaths, RUNTIME_ROOTS, type ReadConfinementMounts } from "./shared-sandbox-core.ts";
 
 // ---------------------------------------------------------------------------
 // Policy schema
@@ -54,7 +54,9 @@ export type ReadConfinementTool = {
 
 export type ReadConfinementPolicy = {
     version: 1;
-    limits?: { maxSymlinks?: number; maxDepth?: number; maxWalkEntries?: number; maxBinds?: number };
+    limits?: { maxSymlinks?: number; maxDepth?: number; maxWalkEntries?: number; maxBinds?: number; maxWalkMs?: number; minPrefixDepth?: number };
+    /** Environment names the confined child may inherit; everything else is cleared. */
+    env?: { allow?: string[] };
     /** Directory base names never descended into by the symlink walk. */
     walkSkipDirNames?: string[];
     deny?: { paths?: string[]; credentialList?: boolean; otherHomes?: boolean };
@@ -63,11 +65,11 @@ export type ReadConfinementPolicy = {
     caches?: { persistentDir?: string };
     /** Where the synthetic PATH directory appears inside the sandbox. */
     syntheticPathMount?: string;
-    /** How long a computed plan may be reused, in ms. 0 recomputes on every launch. */
-    planTtlMs?: number;
 };
 
-const DEFAULT_LIMITS = { maxSymlinks: 2000, maxDepth: 8, maxWalkEntries: 200_000, maxBinds: 500 };
+const DEFAULT_LIMITS = { maxSymlinks: 2000, maxDepth: 8, maxWalkEntries: 200_000, maxBinds: 500, maxWalkMs: 15_000, minPrefixDepth: 3 };
+/** Environment names every confined child may inherit; policy `env.allow` extends this. */
+export const DEFAULT_ENV_ALLOW: readonly string[] = Object.freeze(["PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR", "TZ"]);
 /** Generic secret shapes; `(?i)` prefix = case-insensitive. Replaceable via `secretDetector.useDefaults: false`. */
 export const DEFAULT_SECRET_PATTERNS: readonly string[] = Object.freeze([
     "-----BEGIN [A-Z ]*PRIVATE KEY-----",
@@ -76,10 +78,18 @@ export const DEFAULT_SECRET_PATTERNS: readonly string[] = Object.freeze([
     "_authToken\\s*=",
     "\\bxox[abprs]-[A-Za-z0-9-]{10,}\\b",
     "(?i)(password|passwd|secret|api[_-]?key|token)\\s*[=:]\\s*\\S{8,}",
+    "://[^/\\s:@]+:[^/\\s@]+@",
+    "(?i)authorization\\s*:",
+    "(?i)\\b(password|passwd|pass)\\s*=\\s*\\S",
 ]);
 /** Generic widely standard locations; removable with `tools.builtinDefaults: false` or overridden per tool. */
 export const BUILTIN_TOOL_DEFAULTS: Readonly<Record<string, ReadConfinementTool>> = Object.freeze({
-    git: { name: "git", config: ["~/.gitconfig", "${XDG_CONFIG_HOME}/git", "~/.config/git"] },
+    // Only the files git needs to run; never the whole directory (it can hold a credential store).
+    git: { name: "git", config: [
+        "~/.gitconfig",
+        "${XDG_CONFIG_HOME}/git/config", "${XDG_CONFIG_HOME}/git/ignore", "${XDG_CONFIG_HOME}/git/attributes",
+        "~/.config/git/config", "~/.config/git/ignore", "~/.config/git/attributes",
+    ] },
 });
 
 function fail(path: string, message: string): never {
@@ -88,7 +98,10 @@ function fail(path: string, message: string): never {
 
 function checkKeys(value: unknown, path: string, allowed: readonly string[]): Record<string, unknown> {
     if (!value || typeof value !== "object" || Array.isArray(value)) fail(path, "expected an object");
-    for (const key of Object.keys(value)) if (!allowed.includes(key)) fail(`${path}.${key}`, "unknown key");
+    for (const key of Object.keys(value)) {
+        if (key === "planTtlMs") fail(`${path}.${key}`, "removed: the plan is computed once at pi launch and frozen for the session; delete this key");
+        if (!allowed.includes(key)) fail(`${path}.${key}`, "unknown key");
+    }
     return value as Record<string, unknown>;
 }
 
@@ -128,13 +141,13 @@ function compilePattern(pattern: string, path: string): RegExp {
 
 /** Strictly validate a policy document; unknown keys and malformed values fail closed. */
 export function parseReadConfinementPolicy(value: unknown): ReadConfinementPolicy {
-    const root = checkKeys(value, "$", ["version", "limits", "walkSkipDirNames", "deny", "tools", "secretDetector", "caches", "syntheticPathMount", "planTtlMs"]);
+    const root = checkKeys(value, "$", ["version", "limits", "walkSkipDirNames", "deny", "tools", "secretDetector", "caches", "syntheticPathMount", "env"]);
     if (root.version !== 1) fail("$.version", "must be 1");
     const policy: ReadConfinementPolicy = { version: 1 };
     if (root.limits !== undefined) {
-        const l = checkKeys(root.limits, "$.limits", ["maxSymlinks", "maxDepth", "maxWalkEntries", "maxBinds"]);
+        const l = checkKeys(root.limits, "$.limits", ["maxSymlinks", "maxDepth", "maxWalkEntries", "maxBinds", "maxWalkMs", "minPrefixDepth"]);
         policy.limits = {};
-        for (const key of ["maxSymlinks", "maxDepth", "maxWalkEntries", "maxBinds"] as const) {
+        for (const key of ["maxSymlinks", "maxDepth", "maxWalkEntries", "maxBinds", "maxWalkMs", "minPrefixDepth"] as const) {
             const n = count(l[key], `$.limits.${key}`);
             if (n !== undefined) policy.limits[key] = n;
         }
@@ -218,8 +231,12 @@ export function parseReadConfinementPolicy(value: unknown): ReadConfinementPolic
         }
         policy.syntheticPathMount = root.syntheticPathMount;
     }
-    const ttl = count(root.planTtlMs, "$.planTtlMs", 0);
-    if (ttl !== undefined) policy.planTtlMs = ttl;
+    if (root.env !== undefined) {
+        const e = checkKeys(root.env, "$.env", ["allow"]);
+        const allow = stringList(e.allow, "$.env.allow");
+        allow?.forEach((name, i) => { if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) fail(`$.env.allow[${i}]`, "expected an environment variable name"); });
+        policy.env = allow ? { allow } : {};
+    }
     return policy;
 }
 
@@ -275,8 +292,10 @@ export type ReadConfinementAudit = {
     denied: { path: string; reason: string; via?: string }[];
     skipped: { path: string; reason: string; via?: string }[];
     syntheticPath: { mount: string; tools: { name: string; target: string; implicit: boolean }[] } | undefined;
-    limits: { maxSymlinks: number; maxDepth: number; maxWalkEntries: number; maxBinds: number };
+    limits: { maxSymlinks: number; maxDepth: number; maxWalkEntries: number; maxBinds: number; maxWalkMs: number; minPrefixDepth: number };
     symlinksFollowed: number;
+    /** Environment names the confined child inherits; every other variable is cleared. */
+    envAllow: string[];
 };
 
 export type ReadConfinementPlan = ReadConfinementMounts & {
@@ -402,6 +421,7 @@ export function planReadConfinement(
     let symlinksFollowed = 0;
     let walked = 0;
     const walkedDirs = new Set<string>();
+    const startedAt = Date.now();
 
     // ---- deny list -------------------------------------------------------
     const denyEntries = new Set<string>();
@@ -411,7 +431,8 @@ export function planReadConfinement(
         if (real) denyEntries.add(real);
     };
     if (policy.deny?.credentialList !== false) {
-        for (const entry of credentialFilePaths(home)) addDeny(entry);
+        // The broad list: keyrings, gpg, rclone, agent tokens and the narrow list alike.
+        for (const entry of broadCredentialPaths(home, {})) addDeny(entry);
     }
     for (const entry of policy.deny?.paths ?? []) {
         const expanded = expandPath(entry, home, env);
@@ -458,6 +479,14 @@ export function planReadConfinement(
         }
         bound.set(path, { path, mode, dir, reason });
         return true;
+    };
+
+    /** A read-only mount laid over part of a writable bind (hooks, config): never skipped as "already covered". */
+    const addRoOverlay = (path: string, reason: string): void => {
+        let info;
+        try { info = statSync(path); } catch { skip(path, "absent, cannot be protected read-only", reason); return; }
+        if (denyMatch(path, info.isDirectory())) return;
+        bound.set(path, { path, mode: "ro", dir: info.isDirectory(), reason });
     };
 
     const capSymlinks = (): ReadConfinementError => new ReadConfinementError(
@@ -525,6 +554,9 @@ export function planReadConfinement(
             let entries;
             try { entries = readdirSync(current, { withFileTypes: true }); } catch { continue; }
             for (const entry of entries) {
+                if (walked % 512 === 0 && Date.now() - startedAt > limits.maxWalkMs) {
+                    throw new ReadConfinementError(`planning took longer than ${limits.maxWalkMs} ms (policy limits.maxWalkMs); add large directories to walkSkipDirNames or raise the cap.`);
+                }
                 if (++walked > limits.maxWalkEntries) {
                     throw new ReadConfinementError(`walked more than ${limits.maxWalkEntries} entries below ${dir} (policy limits.maxWalkEntries); add large directories to walkSkipDirNames or raise the cap.`);
                 }
@@ -536,40 +568,84 @@ export function planReadConfinement(
     };
 
     // ---- project, git dir ------------------------------------------------
+    // The `.git` file is agent-writable, so a redirect is only honoured when the
+    // target proves it belongs to this worktree (back-pointer) and is a real git
+    // dir (HEAD). Anything else is refused and recorded; nothing is bound.
     const writeRoots = new Set<string>([project]);
-    const gitDirCandidates: string[] = [];
-    try {
-        const dotGit = join(project, ".git");
-        if (lstatSync(dotGit).isFile()) {
-            const match = /^gitdir:\s*(.+)$/m.exec(readFileSync(dotGit, "utf8"));
-            if (match) gitDirCandidates.push(resolve(project, match[1]!.trim()));
-        }
-    } catch { /* not a git checkout */ }
-    for (const candidate of [...gitDirCandidates]) {
-        const real = realOrUndefined(candidate);
-        if (!real) continue;
-        try {
-            const common = readFileSync(join(real, "commondir"), "utf8").trim();
-            if (common) gitDirCandidates.push(resolve(real, common));
-        } catch { /* a plain gitdir */ }
-    }
-    for (const candidate of gitDirCandidates) {
-        const real = realOrUndefined(candidate);
-        if (!real) { skip(candidate, "git dir not found"); continue; }
-        if (contains(project, real)) { gitDirs.push(real); continue; }
-        if (!addBind(real, "rw", "git dir of worktree")) continue;
+    const cacheSources = new Set<string>();
+    const dotGit = join(project, ".git");
+    const isFile = (path: string): boolean => { try { return statSync(path).isFile(); } catch { return false; } };
+    const isDir = (path: string): boolean => { try { return statSync(path).isDirectory(); } catch { return false; } };
+    const readText = (path: string): string | undefined => { try { return readFileSync(path, "utf8"); } catch { return undefined; } };
+    const belongsToProject = (gitdir: string): boolean => {
+        const back = readText(join(gitdir, "gitdir"))?.trim();
+        if (back) return realOrUndefined(resolve(gitdir, back)) === realOrUndefined(dotGit);
+        // Submodule layout: no back-pointer file; the config names the worktree.
+        const worktree = /^\s*worktree\s*=\s*(.+)$/m.exec(readText(join(gitdir, "config")) ?? "")?.[1]?.trim();
+        return worktree !== undefined && realOrUndefined(resolve(gitdir, worktree)) === project;
+    };
+    const bindGitDir = (real: string, via: string): boolean => {
+        if (!addBind(real, "rw", via, dotGit)) return false;
         gitDirs.push(real);
         writeRoots.add(real);
-        try {
-            for (const line of readFileSync(join(real, "objects", "info", "alternates"), "utf8").split("\n")) {
+        // Writes here become host code execution later (hooks, config): keep them read-only.
+        for (const guarded of ["hooks", "config", "config.worktree"]) addRoOverlay(join(real, guarded), `${guarded} of ${via}, read-only`);
+        for (const objects of [join(real, "objects", "info", "alternates")]) {
+            for (const line of (readText(objects) ?? "").split("\n")) {
                 const alt = line.trim();
-                if (alt && isAbsolute(alt)) bindResolved(alt, join(real, "objects/info/alternates"), 1, "git alternates");
+                if (!alt || alt.startsWith("#")) continue;
+                const target = resolve(join(real, "objects"), alt);
+                const realAlt = realOrUndefined(target);
+                if (!realAlt || !isDir(realAlt) || !(isFile(join(dirname(realAlt), "HEAD")) || isDir(join(realAlt, "pack")))) {
+                    skip(target, "alternates entry is not a git object directory", objects);
+                    continue;
+                }
+                bindResolved(target, objects, 1, "git alternates (read-only)");
             }
-        } catch { /* no alternates */ }
+        }
         walk(real, 1);
+        return true;
+    };
+    try {
+        if (lstatSync(dotGit).isFile()) {
+            const match = /^gitdir:\s*(.+)$/m.exec(readFileSync(dotGit, "utf8"));
+            const candidate = match ? resolve(project, match[1]!.trim()) : undefined;
+            const real = candidate ? realOrUndefined(candidate) : undefined;
+            if (!candidate) skip(dotGit, "no gitdir: line");
+            else if (!real) skip(candidate, "git dir not found");
+            else if (contains(project, real)) gitDirs.push(real);
+            else if (!isFile(join(real, "HEAD"))) deny(real, "refused: .git redirect target is not a git dir (no HEAD)", dotGit);
+            else if (!belongsToProject(real)) deny(real, "refused: .git redirect target does not point back to this worktree", dotGit);
+            else if (bindGitDir(real, "git dir of worktree")) {
+                const commonText = readText(join(real, "commondir"))?.trim();
+                const common = commonText ? realOrUndefined(resolve(real, commonText)) : undefined;
+                if (commonText && !common) skip(resolve(real, commonText), "git common dir not found", real);
+                else if (common && !contains(project, common)) {
+                    if (!isFile(join(common, "HEAD")) || !isDir(join(common, "objects")) || !contains(join(common, "worktrees"), real)) {
+                        deny(common, "refused: commondir is not the common git dir of this worktree", real);
+                    } else bindGitDir(common, "common git dir of worktree");
+                }
+            }
+        }
+    } catch (error) {
+        if (error instanceof ReadConfinementError) throw error;
+        /* not a git checkout */
     }
     // The project's own symlinks (and those below the project's git dir if it is inside).
     walk(project, 0);
+
+    const persistentBase = policy.caches?.persistentDir ? expandPath(policy.caches.persistentDir, home, env) : undefined;
+    const persistentReal = persistentBase ? realOrUndefined(persistentBase) ?? persistentBase : undefined;
+
+    // ---- the policy file must not be agent-writable -----------------------
+    if (isAbsolute(loaded.source)) {
+        const realSource = realOrUndefined(loaded.source) ?? loaded.source;
+        const scratch = [tmpdir(), "/tmp", "/var/tmp", "/dev/shm"].map((root) => realOrUndefined(root) ?? root);
+        const exposed = [...writeRoots, ...(persistentReal ? [persistentReal] : []), ...scratch].find((root) => contains(root, realSource));
+        if (exposed) {
+            throw new ReadConfinementError(`the policy file ${realSource} is inside ${exposed}, which the sandboxed agent can write or the project owns; move it outside the project, writable roots and temp directories.`);
+        }
+    }
 
     // ---- approved tools --------------------------------------------------
     const pathDirs = (env.PATH ?? "").split(delimiter).filter((entry) => isAbsolute(entry));
@@ -621,10 +697,19 @@ export function planReadConfinement(
         if (!real) { skip(tool.lexical, "approved tool not resolvable"); return; }
         const why = denyMatch(real, false);
         if (why) { deny(real, why, `approved tool ${tool.name}`); return; }
+        // A tool the agent can write is a tool the agent can replace.
+        const writable = [...writeRoots, ...(persistentReal ? [persistentReal] : [])].find((root) => contains(root, real));
+        if (writable) { deny(real, `refused: approved tool resolves under writable root ${writable}`, `approved tool ${tool.name}`); return; }
         if (!covered(real)) {
             if (tool.spec.install === "prefix") {
                 const bin = dirname(real);
                 const prefix = /^s?bin$/.test(basename(bin)) ? dirname(bin) : bin;
+                const depth = prefix.split(sep).filter(Boolean).length;
+                const refusal = depth < limits.minPrefixDepth ? `shallower than ${limits.minPrefixDepth} levels (policy limits.minPrefixDepth)`
+                    : contains(prefix, home) || contains(prefix, project) || contains(home, prefix) || writeRoots.has(prefix)
+                        || [...writeRoots].some((root) => contains(prefix, root)) ? "contains or lies in the home, the project or a writable root"
+                    : undefined;
+                if (refusal) { deny(prefix, `refused: install prefix ${refusal}`, `approved tool ${tool.name}`); return; }
                 if (!addBind(prefix, "ro", `install prefix of ${tool.name}`, real)) return;
             } else if (!addBind(real, "ro", `approved tool ${tool.name}`)) return;
         }
@@ -676,14 +761,14 @@ export function planReadConfinement(
             }
             if (!info.isFile()) return undefined;
             if (++files > maxScanFiles) throw new ReadConfinementError(`config entry ${root} has more than ${maxScanFiles} files to scan (policy secretDetector.maxScanFiles).`);
-            const text = readHead(real, maxScanBytes).toString("latin1");
+            if (info.size > maxScanBytes) return `${real} is larger than the scan limit of ${maxScanBytes} bytes (policy secretDetector.maxScanBytes)`;
+            const text = readHead(real, Math.max(info.size, 1)).toString("latin1");
             const found = detectors.find((d) => d.regex.test(text));
             return found ? `${real} matches secret pattern ${JSON.stringify(found.pattern)}` : undefined;
         };
         return visit(root);
     };
 
-    const persistentBase = policy.caches?.persistentDir ? expandPath(policy.caches.persistentDir, home, env) : undefined;
     for (const tool of resolved.values()) {
         if (tool.implicit && !tool.spec.config && !tool.spec.cache) continue;
         for (const entry of tool.spec.config ?? []) {
@@ -708,8 +793,11 @@ export function planReadConfinement(
                 if (!persistentBase) { skip(expanded, "persistent cache requested but policy caches.persistentDir is unset", tool.name); continue; }
                 const source = join(persistentBase, seams.agentId ?? "agent", `${tool.name}-${createHash("sha256").update(expanded).digest("hex").slice(0, 10)}`);
                 mkdirSync(source, { recursive: true });
-                bound.set(expanded, { path: expanded, mode: "rw", dir: true, reason: `persistent cache of ${tool.name}`, source: realpathSync.native(source) });
-                writeRoots.add(expanded);
+                const realSource = realpathSync.native(source);
+                bound.set(expanded, { path: expanded, mode: "rw", dir: true, reason: `persistent cache of ${tool.name}`, source: realSource });
+                // In-process tools see the per-agent directory the sandbox maps there, never the host path.
+                writeRoots.add(realSource);
+                cacheSources.add(realSource);
             } else {
                 bound.set(expanded, { path: expanded, mode: "tmpfs", dir: true, reason: `private cache of ${tool.name}` });
             }
@@ -735,9 +823,13 @@ export function planReadConfinement(
     }
     for (const [path, text] of [...symlinkMounts].sort(([a], [b]) => a.length - b.length)) args.push("--symlink", text, path);
     if (syntheticDir) args.push("--ro-bind", syntheticDir, mount);
-    args.push("--setenv", "PATH", syntheticDir ? mount : "/nonexistent-pi-confined");
+    const pathValue = syntheticDir ? mount : "/nonexistent-pi-confined";
+    const envAllow = [...new Set([...DEFAULT_ENV_ALLOW, ...(policy.env?.allow ?? [])])].sort();
+    args.push("--setenv", "PATH", pathValue);
+    // Other allowlisted names are copied from the launching process when each command is built
+    // (see `sandbox-core`), so per-command values such as TERM or TMPDIR stay current.
 
-    const readRoots = [...new Set([project, ...entries.filter((b) => b.mode !== "tmpfs").map((b) => b.path)])].sort();
+    const readRoots = [...new Set([project, ...cacheSources, ...entries.filter((b) => b.mode !== "tmpfs" && !b.source).map((b) => b.path)])].sort();
     const audit: ReadConfinementAudit = {
         version: 1,
         policy: { source: loaded.source, sha256: loaded.sha256 },
@@ -751,12 +843,16 @@ export function planReadConfinement(
         syntheticPath: syntheticDir ? { mount, tools: syntheticTools.map((t) => ({ name: t.name, target: t.real, implicit: t.implicit })) } : undefined,
         limits,
         symlinksFollowed,
+        envAllow,
     };
     return {
         args,
         readRoots,
         writeRoots: [...writeRoots].sort(),
         audit,
+        project,
+        envAllow,
+        pathValue,
         hash: createHash("sha256").update(JSON.stringify(audit)).digest("hex"),
         syntheticDir,
     };

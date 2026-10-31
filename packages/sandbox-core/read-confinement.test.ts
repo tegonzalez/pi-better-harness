@@ -9,6 +9,7 @@
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createServer } from "node:net";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,7 +17,10 @@ import { join } from "node:path";
 import {
     buildSandboxCommand,
     compileWritePolicy,
+    confinedEnvironment,
     describeSandboxSupport,
+    publishProcessReadConfinement,
+    READ_CONFINEMENT_POLICY_ENV,
     evaluateReadAccess,
     evaluateWriteAccess,
     type SandboxCommandArgs,
@@ -192,16 +196,112 @@ describe("symlink closure", () => {
         assert.ok(result.args.join(" ").includes(`--symlink ${real} ${via}`));
     });
 
-    it("binds a worktree's git dir writable", () => {
-        const main = join(root, "main-repo");
-        const gitdir = join(main, ".git", "worktrees", "wt");
-        write(join(main, ".git", "HEAD"), "ref: x\n");
+    /** A main repo with a linked worktree whose `.git` file points back correctly. */
+    function linkedWorktree(name: string) {
+        const main = join(root, `${name}-main`);
+        const common = join(main, ".git");
+        const gitdir = join(common, "worktrees", "wt");
+        write(join(common, "HEAD"), "ref: x\n");
+        mkdirSync(join(common, "objects"), { recursive: true });
+        mkdirSync(join(common, "hooks"), { recursive: true });
+        write(join(common, "config"), "[core]\n");
+        write(join(gitdir, "HEAD"), "ref: y\n");
         write(join(gitdir, "commondir"), "../..\n");
-        const wt = join(root, "work", "wt");
+        const wt = join(root, "work", name);
         write(join(wt, ".git"), `gitdir: ${gitdir}\n`);
+        write(join(gitdir, "gitdir"), `${join(wt, ".git")}\n`);
+        return { main, common, gitdir, wt };
+    }
+
+    it("binds a validated worktree's git dir writable, with hooks and config read-only", () => {
+        const { common, gitdir, wt } = linkedWorktree("wt-ok");
         const result = plan({ version: 1 }, {}, wt);
-        assert.deepEqual(result.writeRoots, [wt, join(main, ".git"), gitdir].sort());
+        assert.deepEqual(result.writeRoots, [wt, common, gitdir].sort());
         assert.ok(result.audit.gitDirs.includes(gitdir));
+        const ro = result.audit.binds.filter((b) => b.mode === "ro").map((b) => b.path);
+        assert.ok(ro.includes(join(common, "hooks")) && ro.includes(join(common, "config")), "hooks and config are read-only overlays");
+        const at = (path: string) => result.args.findIndex((arg, i) => arg === path && result.args[i - 2] === "--ro-bind");
+        assert.ok(at(join(common, "hooks")) > result.args.indexOf("--bind"), "overlay comes after the writable bind");
+    });
+
+    it("refuses a .git redirect that is not a git dir of this worktree (fail closed, recorded)", () => {
+        const victim = join(root, "work", "redirect-victim");
+        write(join(victim, "HEAD"), "ref: x\n");
+        write(join(victim, "secret"), "s\n");
+        const proj = join(root, "work", "redirect-project");
+        write(join(proj, ".git"), `gitdir: ${victim}\n`);
+        let result = plan({ version: 1 }, {}, proj);
+        assert.ok(!result.writeRoots.includes(victim) && !result.args.includes(victim));
+        assert.match(result.audit.denied.find((d) => d.path === victim)?.reason ?? "", /does not point back/);
+        // No HEAD at all: not a git dir.
+        const bogus = join(root, "work", "redirect-bogus");
+        mkdirSync(bogus, { recursive: true });
+        write(join(proj, ".git"), `gitdir: ${bogus}\n`);
+        result = plan({ version: 1 }, {}, proj);
+        assert.match(result.audit.denied.find((d) => d.path === bogus)?.reason ?? "", /no HEAD/);
+        assert.deepEqual(result.writeRoots, [proj]);
+        // A back-pointer to another worktree is not ours.
+        const { gitdir } = linkedWorktree("redirect-elsewhere");
+        write(join(proj, ".git"), `gitdir: ${gitdir}\n`);
+        result = plan({ version: 1 }, {}, proj);
+        assert.match(result.audit.denied.find((d) => d.path === gitdir)?.reason ?? "", /does not point back/);
+        assert.deepEqual(result.writeRoots, [proj]);
+    });
+
+    it("refuses a commondir that is not this worktree's common dir, and binds alternates read-only", () => {
+        const { gitdir, wt, main } = linkedWorktree("wt-common");
+        const evil = join(root, "work", "evil-common");
+        write(join(evil, "HEAD"), "x\n");
+        mkdirSync(join(evil, "objects"), { recursive: true });
+        write(join(gitdir, "commondir"), `${evil}\n`);
+        const result = plan({ version: 1 }, {}, wt);
+        assert.match(result.audit.denied.find((d) => d.path === evil)?.reason ?? "", /not the common git dir/);
+        assert.ok(!result.writeRoots.includes(evil));
+        write(join(gitdir, "commondir"), "../..\n");
+        const store = join(root, "alt-store");
+        mkdirSync(join(store, "objects", "pack"), { recursive: true });
+        write(join(store, "HEAD"), "x\n");
+        write(join(main, ".git", "objects", "info", "alternates"), `${join(store, "objects")}\n`);
+        const withAlt = plan({ version: 1 }, {}, wt);
+        assert.equal(withAlt.audit.binds.find((b) => b.path === join(store, "objects"))?.mode, "ro");
+        assert.ok(!withAlt.writeRoots.includes(join(store, "objects")));
+    });
+
+    it("computes the plan from a snapshot: later project changes are not in an already-built plan", () => {
+        const proj = join(root, "work", "frozen");
+        mkdirSync(proj, { recursive: true });
+        const first = plan({ version: 1 }, {}, proj);
+        symlinkSync(shared, join(proj, "late-link"));
+        assert.ok(!first.readRoots.includes(shared), "a built plan never changes");
+        assert.ok(plan({ version: 1 }, {}, proj).readRoots.includes(shared), "only a new launch sees it");
+    });
+
+    it("denies broad credential stores reached through project symlinks", () => {
+        write(join(home, ".gnupg", "pubring.kbx"), "k");
+        write(join(home, ".pgpass"), "h:1:d:u:p");
+        write(join(home, ".claude", ".credentials.json"), "{}");
+        const proj = join(root, "work", "broad-cred");
+        mkdirSync(proj, { recursive: true });
+        symlinkSync(join(home, ".gnupg"), join(proj, "gpg"));
+        symlinkSync(join(home, ".pgpass"), join(proj, "pgpass"));
+        const result = plan({ version: 1 }, {}, proj);
+        const deniedPaths = result.audit.denied.map((d) => d.path);
+        assert.ok(deniedPaths.includes(join(home, ".gnupg")) && deniedPaths.includes(join(home, ".pgpass")), deniedPaths.join());
+        assert.deepEqual(result.readRoots, [proj]);
+    });
+
+    it("refuses a policy file inside the project, a writable root or a temp directory", () => {
+        const inside = join(project, "policy.json");
+        write(inside, "{}");
+        const attempt = (source: string, at = project) => planReadConfinement({ policy: parseReadConfinementPolicy({ version: 1 }), source, sha256: "x" }, at,
+            { home, env: { PATH: "/usr/bin" }, passwdHomes: () => [] });
+        assert.throws(() => attempt(inside), /policy file .* is inside/);
+        assert.throws(() => attempt("/tmp/some-policy.json"), /policy file/);
+        assert.throws(() => attempt("/var/tmp/some-policy.json"), /policy file/);
+        const { gitdir, wt } = linkedWorktree("policy-in-gitdir");
+        write(join(gitdir, "p.json"), "{}");
+        assert.throws(() => attempt(join(gitdir, "p.json"), wt), /policy file/);
+        assert.throws(() => parseReadConfinementPolicy({ version: 1, planTtlMs: 5 }), /removed.*once at pi launch/);
     });
 });
 
@@ -271,9 +371,79 @@ describe("approved tools, configs and caches", () => {
             tools: { approved: [{ name: "fixture-tool", cache: ["~/.cache/p"], cachePersistent: true }] } }, { agentId: "agent-1" });
         const bind = result.audit.binds.find((b) => b.path === join(home, ".cache", "p"));
         assert.equal(bind?.mode, "rw");
-        assert.ok(result.writeRoots.includes(join(home, ".cache", "p")));
         const index = result.args.indexOf("--bind");
-        assert.ok(result.args[index + 1]!.startsWith(join(base, "agent-1")));
+        const source = result.args[index + 1]!;
+        assert.ok(source.startsWith(join(base, "agent-1")));
+        // In-process tools use the per-agent source directory, never the host cache path.
+        assert.ok(result.writeRoots.includes(source) && result.readRoots.includes(source));
+        assert.ok(!result.writeRoots.includes(join(home, ".cache", "p")) && !result.readRoots.includes(join(home, ".cache", "p")));
+        const compiled = compileWritePolicy({
+            writableRoot: project, home, permissions: { projectFiles: "read-write", outsideProject: "off", storedCredentials: "off", commands: true, network: false },
+            readConfinement: result,
+        });
+        assert.equal(evaluateWriteAccess(join(source, "x"), compiled).allowed, true);
+        assert.equal(evaluateWriteAccess(join(home, ".cache", "p", "x"), compiled).allowed, false);
+    });
+
+    it("the built-in git default binds only config, ignore and attributes, never a credential store", () => {
+        write(join(home, ".config", "git", "config"), "[user]\nname = x\n");
+        write(join(home, ".config", "git", "credentials"), "https://user:pw@example.invalid\n");
+        const result = plan({ version: 1, tools: { approved: ["git"] } }, { env: { PATH: "/usr/bin:/bin" } });
+        if (!result.audit.syntheticPath?.tools.some((t) => t.name === "git")) return;
+        assert.ok(result.readRoots.includes(join(home, ".config", "git", "config")));
+        assert.ok(!result.readRoots.includes(join(home, ".config", "git")));
+        assert.ok(!result.readRoots.some((r) => r.endsWith("credentials")));
+    });
+
+    it("the secret detector catches URL userinfo, Authorization headers and oversize files", () => {
+        const cases: Record<string, string> = {
+            "url-userinfo": "https://alice:x@example.invalid/path\n",
+            "auth-header": "Authorization: Basic Zm9vOmJhcg==\n",
+            "short-password": "password=abc\n",
+        };
+        for (const [name, text] of Object.entries(cases)) write(join(home, ".config", `det-${name}`, "c"), text);
+        write(join(home, ".config", "det-big", "c"), `${"#".repeat(2000)}\n`);
+        write(join(home, ".config", "det-fine", "c"), "ok = 1\n");
+        const result = plan({ version: 1, secretDetector: { maxScanBytes: 1024 }, tools: { builtinDefaults: false, approved: [{ name: "fixture-tool",
+            config: [...Object.keys(cases), "big", "fine"].map((n) => `~/.config/det-${n}`) }] } });
+        const reasons = Object.fromEntries(result.audit.denied.map((d) => [d.path.split("/").at(-1), d.reason]));
+        for (const name of Object.keys(cases)) assert.match(reasons[`det-${name}`] ?? "", /secret detected/, name);
+        assert.match(reasons["det-big"] ?? "", /larger than the scan limit/);
+        assert.ok(result.readRoots.includes(join(home, ".config", "det-fine")));
+    });
+
+    it("refuses shallow, home-containing and project-containing install prefixes", () => {
+        const tool = (path: string) => ({ version: 1 as const, tools: { builtinDefaults: false, approved: [{ path, install: "prefix" as const }] } });
+        write(join(root, "p1", "bin", "t1"), "#!/bin/sh\n", 0o755);
+        const shallow = root.split("/").filter(Boolean).length + 2;
+        let result = plan({ ...tool(join(root, "p1", "bin", "t1")), limits: { minPrefixDepth: shallow } });
+        assert.ok(result.audit.denied.some((d) => /install prefix shallower than/.test(d.reason)), JSON.stringify(result.audit.denied));
+        assert.equal(result.audit.syntheticPath, undefined);
+        write(join(home, "t2", "bin", "t2"), "#!/bin/sh\n", 0o755);
+        result = plan(tool(join(home, "t2", "bin", "t2")));
+        assert.ok(result.audit.denied.some((d) => /contains or lies in the home/.test(d.reason)));
+        write(join(root, "deep", "a", "b", "bin", "t3"), "#!/bin/sh\n", 0o755);
+        result = plan(tool(join(root, "deep", "a", "b", "bin", "t3")));
+        assert.equal(result.audit.binds.find((b) => b.reason.startsWith("install prefix"))?.path, join(root, "deep", "a", "b"));
+        result = plan({ ...tool(join(root, "deep", "a", "b", "bin", "t3")), limits: { minPrefixDepth: 30 } });
+        assert.equal(result.audit.syntheticPath, undefined);
+    });
+
+    it("rejects an approved tool that resolves under a writable root", () => {
+        write(join(project, "bin", "planted"), "#!/bin/sh\necho planted\n", 0o755);
+        const result = plan({ version: 1, tools: { builtinDefaults: false, approved: ["planted"] } },
+            { env: { PATH: `${join(project, "bin")}:/usr/bin` } });
+        assert.equal(result.audit.syntheticPath, undefined);
+        assert.match(result.audit.denied.find((d) => d.path.endsWith("planted"))?.reason ?? "", /under writable root/);
+    });
+
+    it("builds the child environment from an allowlist plus the synthetic PATH", () => {
+        const result = plan({ version: 1, env: { allow: ["EXTRA_OK"] }, tools: { approved: ["sh"], builtinDefaults: false } },
+            { env: { PATH: "/usr/bin:/bin", HOME: home, LANG: "C", API_KEY: "k", EXTRA_OK: "1", GITHUB_TOKEN: "t" } });
+        const env = confinedEnvironment(result, { PATH: "/host", HOME: home, API_KEY: "k", EXTRA_OK: "1", GITHUB_TOKEN: "t", OPENAI_API_KEY: "o", LANG: "C" });
+        assert.deepEqual(env, { PATH: "/run/pi-confined/bin", HOME: home, EXTRA_OK: "1", LANG: "C" });
+        assert.ok(!result.args.some((a) => /KEY|TOKEN/.test(a)));
+        assert.throws(() => parseReadConfinementPolicy({ version: 1, env: { allow: ["bad name"] } }), /environment variable name/);
     });
 });
 
@@ -306,23 +476,25 @@ const bwrapUsable = (() => {
 })();
 
 describe("real bubblewrap", { skip: !bwrapUsable && "usable bubblewrap is not available" }, () => {
-    function run(result: ReturnType<typeof plan>, script: string, atProject = project, env: Record<string, string> = {}) {
+    function run(result: ReturnType<typeof plan>, script: string, atProject = project, env: Record<string, string> = {}, network = false) {
         const args: SandboxCommandArgs = {
             profilePath: join(root, "unused.sb"),
             execPath: "/bin/sh",
             execArgs: ["-c", script],
             policy: {
                 writableRoot: atProject, home, denyWrite: [],
-                permissions: { projectFiles: "read-write", outsideProject: "off", storedCredentials: "off", commands: true, network: false },
+                permissions: { projectFiles: "read-write", outsideProject: "off", storedCredentials: "off", commands: true, network },
                 readConfinement: result,
             },
         };
-        const command = buildSandboxCommand(args);
+        // The launching environment (what pi would hold) reaches only the allowlist.
+        const command = buildSandboxCommand(args, { env: { HOME: home, ...env } });
         return spawnSync(command.file, command.fileArgs, { encoding: "utf8", env: { HOME: home, ...env } });
     }
 
     const fixturePolicy: ReadConfinementPolicy = {
         version: 1,
+        env: { allow: ["FIXTURE_CONF"] },
         tools: { approved: [{ name: "fixture-tool", config: ["~/.config/fixture/ok.conf"] }, "sh", "cat"], builtinDefaults: false },
     };
 
@@ -371,6 +543,121 @@ describe("real bubblewrap", { skip: !bwrapUsable && "usable bubblewrap is not av
         assert.equal(existsSync("/tmp/scratch"), false, "/tmp is private to the sandbox");
     });
 
+    it("scrubs the environment: no key or token variable reaches the child, only the allowlist", () => {
+        const result = plan(fixturePolicy);
+        const secrets = { OPENAI_API_KEY: "sk-leak", GITHUB_TOKEN: "ghp_leak", AWS_SECRET_ACCESS_KEY: "leak", MY_PASSWORD: "leak", FIXTURE_CONF: "allowed-by-policy", TERM: "xterm" };
+        const out = run(result, "/usr/bin/env", project, secrets);
+        assert.equal(out.status, 0, out.stderr);
+        const seen = Object.fromEntries(out.stdout.split("\n").filter(Boolean).map((l) => [l.slice(0, l.indexOf("=")), l.slice(l.indexOf("=") + 1)]));
+        assert.deepEqual(Object.keys(seen).filter((k) => /KEY|TOKEN|SECRET|PASSWORD|SK-/i.test(k)), []);
+        assert.ok(!out.stdout.includes("leak"));
+        assert.equal(seen.FIXTURE_CONF, "allowed-by-policy");
+        assert.equal(seen.PATH, "/run/pi-confined/bin");
+        assert.deepEqual(Object.keys(seen).filter((k) => !["PATH", "HOME", "TERM", "FIXTURE_CONF", "PWD", "SHLVL", "_", "OLDPWD"].includes(k)), []);
+    });
+
+    it("applies --unshare-pid, --new-session and --clearenv; host processes cannot be signalled", () => {
+        const result = plan(fixturePolicy);
+        const command = buildSandboxCommand({
+            profilePath: join(root, "unused.sb"), execPath: "/bin/true", execArgs: [],
+            policy: { writableRoot: project, home, permissions: { projectFiles: "read-write", outsideProject: "off", storedCredentials: "off", commands: true, network: false }, readConfinement: result },
+        });
+        for (const flag of ["--clearenv", "--unshare-pid", "--new-session"]) assert.ok(command.fileArgs.includes(flag), flag);
+        assert.ok(!command.fileArgs.includes("--proc"));
+        const out = run(result, `kill -0 ${process.pid} 2>&1; echo status=$?; ls /proc 2>&1 | head -1`);
+        assert.match(out.stdout, /status=[1-9]/, out.stdout + out.stderr);
+    });
+
+    it("makes git hooks and config read-only inside a linked worktree's writable git dir", () => {
+        const main = join(root, "bw-main");
+        const common = join(main, ".git");
+        const gitdir = join(common, "worktrees", "wt");
+        write(join(common, "HEAD"), "x\n");
+        mkdirSync(join(common, "objects"), { recursive: true });
+        mkdirSync(join(common, "hooks"), { recursive: true });
+        write(join(common, "config"), "[core]\n");
+        write(join(gitdir, "HEAD"), "y\n");
+        write(join(gitdir, "commondir"), "../..\n");
+        const wt = join(root, "work", "bw-wt");
+        write(join(wt, ".git"), `gitdir: ${gitdir}\n`);
+        write(join(gitdir, "gitdir"), `${join(wt, ".git")}\n`);
+        const result = plan(fixturePolicy, {}, wt);
+        assert.equal(run(result, `echo r > '${join(common, "refs-x")}'`, wt).status, 0, "refs-like writes in the git dir still work");
+        assert.notEqual(run(result, `echo '#!/bin/sh' > '${join(common, "hooks", "pre-commit")}'`, wt).status, 0);
+        assert.notEqual(run(result, `echo '[core]' >> '${join(common, "config")}'`, wt).status, 0);
+        assert.equal(existsSync(join(common, "hooks", "pre-commit")), false);
+    });
+
+    it("a .git redirect to another project does not make that project writable", () => {
+        const victim = join(root, "work", "redirect-victim-bw");
+        write(join(victim, "HEAD"), "x\n");
+        const proj = join(root, "work", "redirect-bw");
+        write(join(proj, ".git"), `gitdir: ${victim}\n`);
+        const result = plan(fixturePolicy, {}, proj);
+        const out = run(result, `echo pwn > '${join(victim, "pwned")}'`, proj);
+        assert.notEqual(out.status, 0);
+        assert.equal(existsSync(join(victim, "pwned")), false);
+    });
+
+    it("a project-planted symlink to another project is not followed after launch, and a real policy rejects it on the next", () => {
+        const proj = join(root, "work", "late");
+        mkdirSync(proj, { recursive: true });
+        const result = plan(fixturePolicy, {}, proj);
+        symlinkSync(other, join(proj, "grab"));
+        assert.notEqual(run(result, `cat '${join(proj, "grab", "secret.txt")}'`, proj).status, 0, "the frozen plan never binds it");
+    });
+
+    it("a real connect attempt from inside the sandbox fails and never reaches a host listener", async (t) => {
+        if (spawnSync("/usr/bin/python3", ["-c", "pass"]).status !== 0) return t.skip("python3 not available");
+        const server = createServer();
+        let connections = 0;
+        server.on("connection", (socket) => { connections++; socket.destroy(); });
+        await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+        const port = (server.address() as { port: number }).port;
+        const result = plan({ ...fixturePolicy, tools: { approved: ["sh", "cat"], builtinDefaults: false } });
+        const script = `/usr/bin/python3 -c "import socket,sys\ns=socket.socket(); s.settimeout(3)\ntry:\n s.connect(('127.0.0.1',${port})); print('CONNECTED')\nexcept OSError as e:\n print('FAILED', e.errno)"`;
+        // The python runtime lives under /usr, which is bound read-only.
+        const out = run(result, script);
+        await new Promise<void>((done) => server.close(() => done()));
+        assert.match(out.stdout, /FAILED/, out.stdout + out.stderr);
+        assert.equal(connections, 0);
+    });
+
+    it("in-process allow decisions agree with what the kernel boundary allows", () => {
+        const result = plan(fixturePolicy);
+        const policy = compileWritePolicy({
+            writableRoot: project, home, runtimeCompatibility: true,
+            permissions: { projectFiles: "read-write", outsideProject: "off", storedCredentials: "off", commands: true, network: false },
+            readConfinement: result,
+        });
+        const probes = [
+            join(project, "file.txt"), join(project, "link-ok", "data.txt"), join(project, "chain", "data.txt"),
+            join(other, "secret.txt"), join(home, "notes.txt"), join(home, ".ssh", "id_fixture"),
+            join(home, ".config", "fixture", "ok.conf"), join(home, ".config", "fixture-secret", "leaky.conf"),
+            join(project, "link-denied", "id_fixture"),
+        ];
+        for (const probe of probes) {
+            const inProcess = evaluateReadAccess(probe, policy).allowed;
+            const kernel = run(result, `cat '${probe}' >/dev/null`).status === 0;
+            assert.equal(inProcess, kernel, `read ${probe}`);
+        }
+        for (const probe of [join(project, "parity-w.txt"), join(shared, "ok", "parity-w.txt"), join(other, "parity-w.txt"), join(home, "parity-w.txt")]) {
+            const inProcess = evaluateWriteAccess(probe, policy).allowed;
+            const kernel = run(result, `echo w > '${probe}'`).status === 0;
+            rmSync(probe, { force: true });
+            assert.equal(inProcess, kernel, `write ${probe}`);
+        }
+    });
+
+    it("a persistent cache is the per-agent directory in the sandbox, and in-process tools use that same directory", () => {
+        const base = join(root, "persist-bw");
+        const result = plan({ version: 1, caches: { persistentDir: base }, tools: { builtinDefaults: false, approved: [{ name: "sh", cache: ["~/.cache/pc"], cachePersistent: true }, "cat"] } }, { agentId: "a9" });
+        assert.equal(run(result, `echo cached > '${join(home, ".cache", "pc", "f")}'`).status, 0);
+        assert.equal(existsSync(join(home, ".cache", "pc")), false, "the host cache path is never written");
+        const source = result.writeRoots.find((r) => r.startsWith(base))!;
+        assert.equal(spawnSync("cat", [join(source, "f")], { encoding: "utf8" }).stdout, "cached\n");
+    });
+
     it("keeps the network namespace unshared", () => {
         const result = plan(fixturePolicy);
         const command = buildSandboxCommand({
@@ -378,6 +665,57 @@ describe("real bubblewrap", { skip: !bwrapUsable && "usable bubblewrap is not av
             policy: { writableRoot: project, home, permissions: { projectFiles: "read-write", outsideProject: "off", storedCredentials: "off", commands: true, network: false }, readConfinement: result },
         });
         assert.ok(command.fileArgs.includes("--unshare-net"));
+    });
+});
+
+describe("process-wide plan: every actor applies it or fails closed", () => {
+    const permissions = { projectFiles: "read-write" as const, outsideProject: "off" as const, storedCredentials: "off" as const, commands: true, network: false };
+    const policyFor = (writableRoot: string) => ({ writableRoot, home, permissions });
+    const linux = { platform: () => "linux" };
+    const prior = process.env[READ_CONFINEMENT_POLICY_ENV];
+    after(() => {
+        publishProcessReadConfinement(undefined);
+        if (prior === undefined) delete process.env[READ_CONFINEMENT_POLICY_ENV]; else process.env[READ_CONFINEMENT_POLICY_ENV] = prior;
+    });
+
+    it("applies a published plan to a policy that supplies none (background tasks, task runtime, subagent launches)", () => {
+        const mounts = plan({ version: 1 });
+        publishProcessReadConfinement({ state: "active", mounts });
+        const compiled = compileWritePolicy(policyFor(project), linux);
+        assert.deepEqual(compiled.readConfinement?.readRoots, mounts.readRoots);
+        assert.equal(compiled.readConfinement?.pathValue, mounts.pathValue);
+        publishProcessReadConfinement(undefined);
+    });
+
+    it("refuses when the plan failed, was computed for another project, or is absent but required", () => {
+        publishProcessReadConfinement({ state: "failed", reason: "cap exceeded" });
+        assert.throws(() => compileWritePolicy(policyFor(project), linux), /failed closed: cap exceeded/);
+        publishProcessReadConfinement({ state: "active", mounts: plan({ version: 1 }) });
+        assert.throws(() => compileWritePolicy(policyFor(other), linux), /computed for .*not/);
+        publishProcessReadConfinement(undefined);
+        process.env[READ_CONFINEMENT_POLICY_ENV] = "/etc/never-read.json";
+        assert.throws(() => compileWritePolicy(policyFor(project), linux), /no launch plan/);
+        // Profiles that do not select Outside project = Off are unaffected.
+        assert.ok(compileWritePolicy({ writableRoot: project, home, permissions: { ...permissions, outsideProject: "read" } }, linux));
+        assert.throws(() => compileWritePolicy(policyFor(project), { platform: () => "darwin", canonicalize: (p) => p }), /only implemented for Linux/);
+        delete process.env[READ_CONFINEMENT_POLICY_ENV];
+        assert.ok(compileWritePolicy(policyFor(project), linux), "no policy configured: original behavior");
+    });
+
+    it("a launcher that supplies no plan (background-task shaped) gets the published mounts, cleared env and private PID namespace", () => {
+        const mounts = plan({ version: 1, env: { allow: ["KEPT"] } });
+        publishProcessReadConfinement({ state: "active", mounts });
+        const command = buildSandboxCommand({ profilePath: "/unused", execPath: "/bin/true", execArgs: [], policy: policyFor(project) },
+            { ...linux, lookupExecutable: () => "/usr/bin/bwrap", env: { KEPT: "1", SECRET_TOKEN: "x" } });
+        publishProcessReadConfinement(undefined);
+        const joined = command.fileArgs.join(" ");
+        assert.match(joined, /^--clearenv --unshare-pid --new-session --tmpfs \//);
+        assert.ok(joined.includes("--setenv KEPT 1") && !joined.includes("SECRET_TOKEN"));
+        assert.ok(joined.endsWith("--remount-ro / --unshare-net -- /bin/true") || joined.includes("--remount-ro /"));
+    });
+
+    it("confinedEnvironment is the identity without a plan", () => {
+        assert.deepEqual(confinedEnvironment(undefined, { A: "1" }), { A: "1" });
     });
 });
 
