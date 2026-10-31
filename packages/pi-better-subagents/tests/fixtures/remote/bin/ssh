@@ -21,6 +21,8 @@ esac
 if [ -n "$FAKE_SSH_FAIL" ] || [ -f "$DIR/fail" ]; then echo "ssh: Could not resolve hostname $target" >&2; exit 255; fi
 if [ "$master" = 1 ]; then touch "$DIR/master"; exit 0; fi
 export HOME="${FAKE_REMOTE_HOME:?}"
+# Tests hold the remote stop script (the one defining kill_members) while $DIR/stop-hold exists.
+case "$cmd" in *'kill_members()'*) while [ -f "$DIR/stop-hold" ]; do sleep 0.1; done;; esac
 ${FAKE_REMOTE_PATH:+env "PATH=$FAKE_REMOTE_PATH"} sh -c "$cmd" <&0 &
 rp=$!
 while kill -0 "$rp" 2>/dev/null; do

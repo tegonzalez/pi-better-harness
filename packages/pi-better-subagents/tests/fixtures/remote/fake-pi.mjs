@@ -2,6 +2,7 @@
 //   contains "hang"    -> keeps running until aborted (or killed)
 //   contains "persist" -> additionally ignores stdin EOF
 //   contains "stubborn" -> acknowledges abort but keeps running (only a kill ends it)
+//   contains "silent"  -> accepts the prompt and then stays quiet (no events at all) until killed
 //   contains "wait"    -> finishes only after a steer / follow_up arrives
 //   contains "grandchild" -> additionally starts a detached (own process group) sleeper, pid in $FAKE_GRANDCHILD_FILE
 // Sandbox launch audit entry (get_entries), selected by FAKE_PI_SANDBOX: unset/"active" = active entry for
@@ -14,7 +15,7 @@ const startedIso = new Date().toISOString();
 function sandboxEntries() {
   const kind = process.env.FAKE_PI_SANDBOX ?? "active";
   const entry = (data, timestamp = startedIso, id = "e1") => ({ type: "custom", id, parentId: null, timestamp, customType: "pi-better-sandbox-read-confinement", data });
-  const base = { version: 1, active: true, profile: process.env.FAKE_PI_ENTRY_PROFILE ?? process.env.FAKE_SANDBOX_PROFILE, policyHash: "policy-hash-1", planHash: "plan-hash-1" };
+  const base = { version: 1, active: true, profile: process.env.FAKE_PI_ENTRY_PROFILE ?? process.env.FAKE_SANDBOX_PROFILE, policyHash: process.env.FAKE_PI_POLICY_HASH ?? "policy-hash-1", planHash: "plan-hash-1" };
   if (kind === "none") return [];
   if (kind === "inactive") return [entry({ ...base, active: false })];
   if (kind === "wrong") return [entry({ ...base, profile: "some-other-profile" })];
@@ -58,6 +59,7 @@ process.stdin.on("data", (chunk) => {
       log("prompt-received", true);
       ok({ disposition: "started" });
       running = true;
+      if (mode.includes("silent")) continue;
       out({ type: "agent_start" });
       if (mode.includes("hang") || mode.includes("wait") || mode.includes("grandchild")) { out({ type: "message_end", message: assistant("working") }); continue; }
       setTimeout(() => finish("remote done"), 50);

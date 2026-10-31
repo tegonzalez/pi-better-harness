@@ -55,6 +55,7 @@ Schema (validated on use; unknown fields are rejected):
 | `sandbox.verifyCommand` | no | Extra remote shell command that must exit 0 before launch (backend present, policy installed, ...). It is a convenience pre-check, not the verification. |
 | `sandbox.entryType` | no | `customType` of the remote sandbox's launch audit entry. Default `pi-better-sandbox-read-confinement`. |
 | `sandbox.entryProfile` | no | `profile` value the audit entry must carry (default: `sandbox.profile`). The pi-better-sandbox entry reports its permission profile, `"main"`, so set `"entryProfile": "main"` for it. |
+| `sandbox.policyHash` | no | Expected `policyHash` (64-hex sha256) of the remote sandbox policy. When set, an audit entry with any other hash fails closed (`sandbox-unverified`, no prompt); when omitted the hash is only recorded, so any active remote policy is accepted. Pin it when the remote policy must not change unnoticed. |
 | `sandbox.verifyTimeoutMs` | no | How long the bridge waits for that entry (default 30000). |
 | `abortWaitMs` | no | How long stop waits for the RPC abort to be acknowledged (default 3000). |
 | `termGraceSeconds` | no | Seconds between remote TERM and KILL on stop (default 5). |
@@ -63,6 +64,15 @@ The extension does not implement sandboxing. It passes the profile through, the 
 its own sandbox, and the bridge **verifies** that it did (next section). Model, thinking, tool allowlist/denylist and `approve` from the launch are
 passed as the usual `pi` flags. Local extensions and the local task sandbox do not apply to a
 remote run; extensions backing requested tools must be installed on the remote host.
+
+## Parent sandbox: a remote spawn is network use
+
+With pi-better-sandbox active, a `subagent_spawn` / `subagent_spawn_batch` that runs remotely (`remote`,
+`resume`, or an agent mapped in `remoteAgents`) opens an SSH connection from the unconfined extension and runs
+the child with network on the target. It is therefore **refused while the parent's Network access is Off**, with
+the message "Sandbox: Network access is Off. A remote, resumed or remoteAgents-mapped subagent ...". Turn Network
+access on in `/sandbox` or spawn a local subagent. If the `subagents` settings cannot be read, a spawn that names
+an agent is refused (it cannot be proved local).
 
 ## Sandbox verification (the prompt is never sent on trust)
 
@@ -125,7 +135,8 @@ without the definition carrying anything.
 4. Steering. A steer request file (`steer.json`, the existing child-steer path; the deadline steer
    uses it) is delivered with RPC `steer`, or `follow_up` when the request has `"mode":
    "follow_up"`, followed by a `.delivered` receipt.
-5. The remote pi runs in its own session (`setsid` is **required**: the launch fails with a
+5. The remote host must be **Linux**: the launch and stop scripts need `setsid` and `ps -eo pid=,sid=,stat=` (session
+   ids). Other systems are not supported. The remote pi runs in its own session (`setsid` is **required**: the launch fails with a
    `setsid-missing` incident without it), with the session id recorded in `<root>/<run id>/pid`. The session file stays in the run directory after the run so it can be
    found by run id.
 
@@ -163,6 +174,8 @@ unfinalized (health marks it orphaned) with a `bridge-died` incident.
 | Remote sandbox launch entry missing, inactive, other profile or without hashes | Run fails with a `sandbox-unverified` incident; the remote is stopped; the prompt is never sent. |
 | Session to resume missing | Run fails with a `session-missing` incident. |
 | Remote cwd missing | Run fails with a `cwd-missing` incident. |
+| Verification fails and the remote stop cannot be verified | The marker is `remote-unstopped` (written *before* the stop is attempted, replaced by `sandbox-unverified` only after a verified stop), so a bridge killed meanwhile never reads as "surely gone"; `subagent_stop` retries. |
+| SSH channel drops after the prompt was sent (even before the first event) | Same as mid-run: `channel-lost`, not finalized. Only a drop *before* the prompt is `ssh-failed`. |
 | SSH channel drops mid-run | A `channel-lost` incident is recorded and the run is not finalized: normal health reconciliation marks it orphaned/lost. `subagent_stop` still kills the remote process. |
 
 ## Tests

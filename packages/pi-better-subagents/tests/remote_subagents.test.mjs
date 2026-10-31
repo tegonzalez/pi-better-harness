@@ -16,7 +16,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseRemoteTarget, parseRemoteTargets, selectRemoteTarget, buildLaunchScript, buildEnvPayload, buildStopScript, wrapRemoteScript, stopRemoteProcess, assertRemoteOptionsSupported } from "../remote.ts";
-import { handleRemoteExit, launchRemoteRun, reconcileRemoteExit } from "../remote-run.ts";
+import { handleRemoteExit, launchRemoteRun, reconcileRemoteExit, readRemoteFailure } from "../remote-run.ts";
 import { finalizeRun } from "../finalization.ts";
 import { parseRun } from "../parse.ts";
 import { logPathFor, readMeta, runDir, writeMeta, effectiveStatus } from "../registry.ts";
@@ -484,5 +484,81 @@ describe("resume by run id", () => {
         const resumed = await start("again", {}, { resumeSessionOf: "sa_no_such_run" });
         assert.equal(await resumed.exit, 94);
         assert.equal(handleRemoteExit(resumed.id).failure.kind, "session-missing");
+    });
+});
+
+describe("review 2: N6 ordering and prompt tracking, N7 policyHash pin", () => {
+    it("failClosed writes remote-unstopped before the stop is attempted (a SIGKILLed bridge leaves the may-run marker)", async () => {
+        const hold = join(sshDir, "stop-hold");
+        writeFileSync(hold, "1");
+        try {
+            const target = { env: { FAKE_PI_SANDBOX: "none" }, sandbox: { ...targetConfig().sandbox, verifyTimeoutMs: 800 } };
+            const { id, spawned } = await start("say done", target);
+            await until(() => readRemoteFailure(id)?.kind === "remote-unstopped", "remote-unstopped written while the stop is still held");
+            await until(() => existsSync(join(remoteHome, ".pi-better-subagents", "runs", id, "pid")), "remote pid file");
+            const rpid = remotePid(id);
+            process.kill(spawned.pid, "SIGKILL");
+            await spawned.exit;
+            const handled = handleRemoteExit(id);
+            assert.equal(handled.failure.kind, "remote-unstopped");
+            assert.equal(handled.finalize, false, "never finalized while the remote may still run");
+            rmSync(hold, { force: true });
+            const outcome = stopRun(id);
+            assert.notEqual(outcome.action, "not-running");
+            await until(() => isGone(rpid), "remote killed by the retried stop", 8000);
+        } finally { rmSync(hold, { force: true }); }
+    });
+
+    it("after a verified stop the marker becomes sandbox-unverified (finalizable)", async () => {
+        const { id, exit } = await start("say done", { env: { FAKE_PI_SANDBOX: "none" }, sandbox: { ...targetConfig().sandbox, verifyTimeoutMs: 800 } });
+        assert.equal(await exit, 96);
+        assert.equal(readRemoteFailure(id).kind, "sandbox-unverified");
+        assert.equal(handleRemoteExit(id).finalize, true);
+    });
+
+    it("an ssh drop after the prompt was sent but before any event is lost (not finalized), not ssh-failed", async () => {
+        const received = () => piCmds().filter((c) => c.kind === "prompt-received").length;
+        const seen = received();
+        const { id, exit } = await start("silent hang persist");
+        await until(() => received() > seen, "prompt reached the remote");
+        await until(() => existsSync(join(remoteHome, ".pi-better-subagents", "runs", id, "pid")), "remote pid file");
+        const rpid = remotePid(id);
+        writeFileSync(join(sshDir, "drop"), "1");
+        const code = await exit;
+        rmSync(join(sshDir, "drop"));
+        assert.equal(code, 255);
+        const handled = handleRemoteExit(id);
+        assert.equal(handled.failure.kind, "channel-lost");
+        assert.equal(handled.finalize, false);
+        stopRun(id);
+        await until(() => isGone(rpid), "remote killed", 8000);
+    });
+
+    it("a drop before the prompt (no verification yet) is still ssh-failed and finalizable", async () => {
+        const { id, exit } = await start("say done", { env: { FAKE_PI_SANDBOX: "none" }, sandbox: { ...targetConfig().sandbox, verifyTimeoutMs: 20_000 } });
+        writeFileSync(join(sshDir, "drop"), "1");
+        const code = await exit;
+        rmSync(join(sshDir, "drop"));
+        assert.equal(code, 255);
+        const handled = handleRemoteExit(id);
+        assert.equal(handled.failure.kind, "ssh-failed");
+        assert.equal(handled.finalize, true);
+    });
+
+    it("sandbox.policyHash pins the remote policy: a mismatch fails closed, a match passes, absent only records", async () => {
+        assert.throws(() => parseRemoteTarget(targetConfig({ sandbox: { ...targetConfig().sandbox, policyHash: "nothex" } }), "t"), /64-character hex/);
+        const before = promptsSent();
+        const bad = await start("say done", { sandbox: { ...targetConfig().sandbox, policyHash: "a".repeat(64), verifyTimeoutMs: 1500 } });
+        assert.equal(await bad.exit, 96);
+        const failure = handleRemoteExit(bad.id).failure;
+        assert.equal(failure.kind, "sandbox-unverified");
+        assert.match(failure.summary, /does not match the pinned sandbox.policyHash/);
+        assert.equal(promptsSent(), before, "no prompt on a mismatch");
+        // The fake reports policy-hash-1; a pin must be a sha256, so give the fake a matching hash.
+        const pin = "b".repeat(64);
+        const good = await start("say done", { env: { FAKE_PI_POLICY_HASH: pin }, sandbox: { ...targetConfig().sandbox, policyHash: pin.toUpperCase() } });
+        assert.equal(await good.exit, 0);
+        assert.equal((await reconcileRemoteExit(good.id, 0)).finalize, true);
+        assert.equal(readMeta(good.id).remote.sandbox.policyHash, pin);
     });
 });

@@ -34,6 +34,8 @@ let stderrTail = "";
 const delivered = new Set();
 let startedMs;
 let failedClosed = false;
+// Set just before the prompt is written: from then on the remote may be doing work.
+let promptSent = false;
 const STARTED_RE = /^pi-remote-started (\d+)$/;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -127,8 +129,9 @@ async function finishSettled() {
 }
 
 function classify(code) {
+    // After the prompt went out, a dropped channel is "lost" (never finalized): the remote may be working.
     const tail = stderrTail.trim().split("\n").filter(Boolean).pop() ?? "";
-    if (code === 255) return sawEvent
+    if (code === 255) return sawEvent || promptSent
         ? { kind: "channel-lost", summary: "SSH channel to the remote host was lost while the run was active; the remote process may still be running. Use subagent_stop to terminate it.", code }
         : { kind: "ssh-failed", summary: `SSH connection failed: ${tail || "no detail"}`, code };
     if (code === 127) return { kind: "pi-missing", summary: tail || "remote pi was not found", code };
@@ -201,11 +204,14 @@ function runRemoteStop() {
 async function failClosed(kind, summary) {
     if (failedClosed) return;
     failedClosed = true;
-    writeJson(config.failurePath, { kind, summary, code: 96 });
+    // Assume the remote is still running until the stop is verified: a bridge killed in between
+    // must leave the "may still run" marker, not one that reads as surely gone.
+    writeJson(config.failurePath, { kind: "remote-unstopped", summary: `${summary}; stopping the remote process (not yet verified). Use subagent_stop if this persists.`, code: 96 });
     log(`[bridge] ${summary}`);
     try { child.stdin.end(); } catch { /* ignore */ }
     const stopped = await runRemoteStop();
-    if (!stopped) writeJson(config.failurePath, { kind: "remote-unstopped", summary: `${summary}; the remote process could not be verified stopped. Use subagent_stop.`, code: 96 });
+    if (stopped) writeJson(config.failurePath, { kind, summary, code: 96 });
+    else writeJson(config.failurePath, { kind: "remote-unstopped", summary: `${summary}; the remote process could not be verified stopped. Use subagent_stop.`, code: 96 });
     try { child.kill("SIGTERM"); } catch { /* ignore */ }
     process.exit(96);
 }
@@ -230,6 +236,7 @@ async function verifySandbox() {
                 if (d.active !== true) return { ok: false, reason: `the remote sandbox reports it is not active (profile ${JSON.stringify(d.profile)})` };
                 if (d.profile !== want.entryProfile) return { ok: false, reason: `the remote sandbox profile is ${JSON.stringify(d.profile)}, expected ${JSON.stringify(want.entryProfile)}` };
                 if (typeof d.policyHash !== "string" || !d.policyHash || typeof d.planHash !== "string" || !d.planHash) return { ok: false, reason: "the remote sandbox entry carries no policyHash/planHash" };
+                if (want.policyHash && d.policyHash.toLowerCase() !== want.policyHash) return { ok: false, reason: `the remote sandbox policyHash ${d.policyHash} does not match the pinned sandbox.policyHash` };
                 return { ok: true, value: { profile: d.profile, requested: want.profile, policyHash: d.policyHash, planHash: d.planHash, ...(typeof entry.id === "string" ? { entryId: entry.id } : {}), at: Date.now() } };
             }
         } else reason = `get_entries failed: ${response.error ?? "no response"}`;
@@ -254,6 +261,7 @@ void (async () => {
     }
     writeJson(config.sandbox.verifiedPath, verdict.value);
     log(JSON.stringify({ type: "remote_sandbox_verified", data: verdict.value }));
+    promptSent = true;
     const response = await send({ type: "prompt", message: prompt }, config.startTimeoutMs ?? 120_000);
     if (!response.success && !finished) {
         writeJson(config.failurePath, { kind: "remote-exit", summary: `remote pi rejected the prompt: ${response.error ?? "no response"}`, code: 1 });

@@ -43,6 +43,11 @@ export interface RemoteSandboxPolicy {
     entryProfile?: string;
     /** How long the bridge waits for that entry. Default 30000. */
     verifyTimeoutMs?: number;
+    /**
+     * Expected `policyHash` (sha256 hex) of the remote sandbox policy. When set, any other value in the
+     * audit entry fails closed; when omitted the hash is only recorded.
+     */
+    policyHash?: string;
 }
 
 export interface RemoteTarget {
@@ -151,13 +156,18 @@ export function parseRemoteTarget(value: unknown, name: string): RemoteTarget {
     if (obj.env !== undefined) target.env = envMap(obj.env, `${where}.env`);
     if (obj.sandbox === undefined) fail(`${where}.sandbox`, "a remote sandbox profile is required");
     const sandbox = plainObject(obj.sandbox, `${where}.sandbox`);
-    noUnknown(sandbox, ["profile", "args", "env", "verifyCommand", "entryType", "entryProfile", "verifyTimeoutMs"], `${where}.sandbox`);
+    noUnknown(sandbox, ["profile", "args", "env", "verifyCommand", "entryType", "entryProfile", "verifyTimeoutMs", "policyHash"], `${where}.sandbox`);
     target.sandbox = { profile: str(sandbox.profile, `${where}.sandbox.profile`) };
     if (sandbox.args !== undefined) target.sandbox.args = strList(sandbox.args, `${where}.sandbox.args`);
     if (sandbox.env !== undefined) target.sandbox.env = envMap(sandbox.env, `${where}.sandbox.env`);
     if (sandbox.verifyCommand !== undefined) target.sandbox.verifyCommand = str(sandbox.verifyCommand, `${where}.sandbox.verifyCommand`, { allowSpace: true });
     if (sandbox.entryType !== undefined) target.sandbox.entryType = str(sandbox.entryType, `${where}.sandbox.entryType`);
     if (sandbox.entryProfile !== undefined) target.sandbox.entryProfile = str(sandbox.entryProfile, `${where}.sandbox.entryProfile`);
+    if (sandbox.policyHash !== undefined) {
+        const hash = str(sandbox.policyHash, `${where}.sandbox.policyHash`);
+        if (!/^[0-9a-f]{64}$/i.test(hash)) fail(`${where}.sandbox.policyHash`, "must be a 64-character hex sha256 digest");
+        target.sandbox.policyHash = hash.toLowerCase();
+    }
     if (sandbox.verifyTimeoutMs !== undefined) {
         if (!Number.isInteger(sandbox.verifyTimeoutMs) || (sandbox.verifyTimeoutMs as number) < 1 || (sandbox.verifyTimeoutMs as number) > 600_000) fail(`${where}.sandbox.verifyTimeoutMs`, "must be an integer between 1 and 600000");
         target.sandbox.verifyTimeoutMs = sandbox.verifyTimeoutMs as number;
@@ -410,7 +420,7 @@ export interface BridgeConfig {
     stopArgv: string[];
     /** Written when the remote agent settled: the remote work is over. */
     settledPath: string;
-    sandbox: { profile: string; entryProfile: string; entryType: string; timeoutMs: number; verifiedPath: string };
+    sandbox: { profile: string; entryProfile: string; entryType: string; timeoutMs: number; verifiedPath: string; policyHash?: string };
 }
 
 export function remoteFailurePath(runDirPath: string): string {
@@ -480,6 +490,7 @@ export function buildRemotePlan(input: {
                 entryType: target.sandbox.entryType ?? DEFAULT_SANDBOX_ENTRY_TYPE,
                 timeoutMs: target.sandbox.verifyTimeoutMs ?? DEFAULT_SANDBOX_VERIFY_TIMEOUT_MS,
                 verifiedPath: remoteSandboxPath(runDirPath),
+                ...(target.sandbox.policyHash ? { policyHash: target.sandbox.policyHash } : {}),
             },
         },
     };
