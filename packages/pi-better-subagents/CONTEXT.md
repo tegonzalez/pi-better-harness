@@ -99,3 +99,12 @@ work and no normal completion record was captured.
 A lost run is terminal with unknown outcome. It is not the same as a failed run:
 failure means the subagent produced or exited with failure evidence, while lost
 means supervision evidence ran out.
+
+### Remote Run
+
+A run whose child process executes on another host as `pi --mode rpc`, supervised by a local
+bridge process over an SSH channel. The bridge is the run's local process: its pid/pgid drive
+health, and the remote process is reached separately through the run's remote metadata. A dropped
+channel is not completion: the run stays non-final for reconciliation, and Stop still terminates
+the remote process and verifies it is gone. The remote target, working directory, pi invocation,
+environment and required sandbox profile are configuration, never code.
