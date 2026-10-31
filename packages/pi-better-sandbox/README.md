@@ -324,7 +324,8 @@ On Linux bubblewrap, **Outside project = Off** already hides everything except t
 system runtime roots. *Read confinement* is an opt-in refinement of that mode: when a
 policy file is configured, the agent can additionally read only
 
-- its project/worktree (writable) and the git dir a worktree `.git` file points to (writable),
+- its project/worktree (writable) and the git dir a worktree `.git` file points to (writable, only when it
+  proves it belongs to this worktree; `hooks/` and `config` stay read-only; alternates are read-only),
 - whatever the project reaches through symlinks (read-only, followed transitively),
 - the tools the policy approves, with their libraries and interpreters (read-only),
 - those tools' approved config paths (read-only) and cache paths (private tmpfs, or a persistent per-agent directory).
@@ -351,18 +352,20 @@ at load time and block launches (fail closed). Path entries are absolute, `~/…
 | Key | Meaning | Default |
 | --- | --- | --- |
 | `version` | Must be `1`. | required |
-| `limits.maxSymlinks` / `maxDepth` / `maxWalkEntries` / `maxBinds` | Caps on the symlink closure. Exceeding one fails the launch with an error naming the cap. | 2000 / 8 / 200000 / 500 |
+| `limits.maxSymlinks` / `maxDepth` / `maxWalkEntries` / `maxBinds` / `maxWalkMs` | Caps on the symlink closure. Exceeding one fails the launch with an error naming the cap. | 2000 / 8 / 200000 / 500 / 15000 |
+| `limits.minPrefixDepth` | `install: "prefix"` is refused when the prefix has fewer path components, or contains/lies in the home, the project or a writable root. | `3` |
+| `env.allow[]` | Environment variable names the confined child may inherit, in addition to `PATH`, `HOME`, `LANG`, `LC_ALL`, `TERM`, `TMPDIR`, `TZ`. Everything else is cleared (`--clearenv`). `PATH` is always the synthetic one. | `[]` |
 | `walkSkipDirNames` | Directory names the symlink walk never enters (for example a large dependency tree). | `[]` |
 | `deny.paths` | Extra denied paths. A symlink target inside one, or a directory containing one, is skipped and recorded. | `[]` |
-| `deny.credentialList` | Include the built-in stored-credential locations in the deny list. | `true` |
+| `deny.credentialList` | Include the broad built-in stored-credential locations (keyrings, gpg, rclone, cloud and agent tokens) in the deny list. | `true` |
 | `deny.otherHomes` | Deny every account home (passwd database) other than the current user's. | `true` |
 | `tools.approved[]` | A name (looked up on the launching `PATH`), or `{ name \| path, config[], cache[], cachePersistent, bind[], install }`. `install: "prefix"` binds the install prefix instead of just the executable; `bind` adds extra read-only paths. | `[]` |
 | `tools.approvedPathDirs[]` | Approve every executable in a directory that is on the launching `PATH`. | `[]` |
-| `tools.builtinDefaults` | Apply the generic built-in map (`git` → `~/.gitconfig`, `$XDG_CONFIG_HOME/git`, `~/.config/git`) to approved tools without their own `config`. Set `false` to remove it. | `true` |
-| `secretDetector.useDefaults` / `patterns[]` / `maxScanBytes` / `maxScanFiles` | Config entries whose files match a pattern (private-key headers, common token shapes, `_authToken=`, `password=…`) are refused, not bound. `(?i)` prefix = case-insensitive. | defaults on |
+| `tools.builtinDefaults` | Apply the generic built-in map (`git` → `~/.gitconfig` and the `config`/`ignore`/`attributes` files below `$XDG_CONFIG_HOME/git` and `~/.config/git`, never the whole directory) to approved tools without their own `config`. Set `false` to remove it. | `true` |
+| `secretDetector.useDefaults` / `patterns[]` / `maxScanBytes` / `maxScanFiles` | Config entries whose files match a pattern (private-key headers, common token shapes, `_authToken=`, `password=…`) are refused, not bound. Defaults also match URL userinfo (`://user:pw@`), `Authorization:` headers and short `password=` values. A file larger than `maxScanBytes` is refused, not truncated. `(?i)` prefix = case-insensitive. | defaults on |
 | `caches.persistentDir` | Base for `cachePersistent` caches: `<dir>/<agent>/<tool>-<hash>`. | unset (persistent caches skipped) |
 | `syntheticPathMount` | Where the PATH directory appears in the sandbox. | `/run/pi-confined/bin` |
-| `planTtlMs` | How long a computed plan is reused before the closure is re-walked. | `30000` |
+| `planTtlMs` | **Removed.** The plan is never recomputed during a session; the key is rejected so stale policies are noticed. | — |
 
 At launch the planner resolves the launching `PATH`, takes the realpath of each approved
 tool, follows script shebangs (including `env`) and, for ELF binaries, asks the binary's own
@@ -371,12 +374,46 @@ A directory holding symlinks to other symlinks gets matching `--symlink` mounts 
 exactly as on the host. The `PATH` inside the sandbox contains only the approved tools (plus
 interpreters they need, marked in the report); unapproved tools are absent.
 
-### Audit
+### When the plan is computed (frozen at launch)
 
-Each distinct computed plan is appended to the session as a custom entry
-(`pi-better-sandbox-read-confinement`: binds with reasons, denied and skipped entries with
-reasons, symlink mounts, the synthetic `PATH`, the policy source and its SHA-256).
-`/sandbox diagnostics confinement` prints the latest plan. Secret values are never recorded.
+The plan (symlink walk, `.git` validation, tool resolution) is computed **once, when the
+session starts** — the pi process launch for a normal run — and is frozen for the session.
+There is no TTL and no re-planning: symlinks or `.git` edits the agent makes later have no
+effect until a new session (a new pi launch, `/new`, `/resume`, reload) computes a new plan.
+That is also why the agent cannot grant itself access: it can only change the project after
+the walk. The plan is published process-wide, so every actor in this process that launches
+sandboxed commands with Outside project = Off (foreground bash, task-runtime bash, background
+tasks, subagent launches) applies the same frozen mounts, cleared environment and private PID
+namespace, or **fails closed**: a failed plan, a plan for another project, a missing plan while a
+policy is configured, or a non-Linux backend refuses the launch. A subagent child therefore starts
+with only the allowlisted environment; add the variables it needs to `env.allow` knowingly.
+The policy file must not lie inside the project, a writable root (including git dirs and the
+persistent cache directory) or a temp directory; such a policy is refused.
+
+The sandbox also gets `--clearenv` (only `env.allow` names, taken from the launching process when each
+command is built, reach the child; the task runtime's own env passthrough is filtered the same way),
+`--unshare-pid` (the child cannot signal host processes; `/proc` is not mounted) and `--new-session`.
+Approved tools whose real path is under a writable root are refused (the agent could replace them).
+
+### Audit and machine-readable status
+
+Each status change is appended to the session as a custom entry with
+**`customType: "pi-better-sandbox-read-confinement"`** (exported as `READ_CONFINEMENT_ENTRY`). It is written
+when the session's permissions are published, so it exists before the first prompt; a remote parent
+can read it with RPC `get_entries` and refuse to prompt unless `active` is `true`.
+
+| Field | Meaning |
+| --- | --- |
+| `version` | `1` |
+| `active` | `true` only while the frozen plan is in force: Linux bubblewrap, Main profile enabled, Outside project = Off. `false` when a plan failed or is not in force (then `reason` says why). |
+| `profile` | `"main"` (the permission profile the plan applies to). |
+| `policyHash` | SHA-256 of the parsed policy (whitespace and key order independent). |
+| `planHash` | SHA-256 of the audit. |
+| `hash`, `audit` | (active only) legacy alias of `planHash`, and the full audit: binds with reasons, denied and skipped entries with reasons, symlink mounts, the synthetic `PATH`, the policy source and hash. |
+| `reason` | (inactive only) why the plan is not in force or failed. |
+
+An entry is appended once per change, not per announcement. A session with no configured policy
+writes no entry. `/sandbox diagnostics confinement` prints the latest plan. Secret values are never recorded.
 
 ### Example policy (illustrative; adapt to your environment)
 
@@ -404,7 +441,9 @@ reasons, symlink mounts, the synthetic `PATH`, the policy source and its SHA-256
   and what is bound *outside* those roots.
 - A confined shell can still run any executable it can read by absolute path, for example one under `/usr`.
 - Libraries a tool loads with `dlopen` are not visible to the loader listing; add them with `bind`.
-- A symlink created after the plan was computed is not mounted until the plan is recomputed (`planTtlMs`).
+- A symlink created after the plan was computed is not mounted until a new session starts (see "frozen at launch"). A project symlink present at launch to a non-denied path is still followed: use `deny.paths` and `walkSkipDirNames` for what must never be reachable.
+- Git dirs outside the project are writable except `hooks/` and `config`; common-dir `objects` stay writable because commits need them.
+- Planning is synchronous and bounded (`maxWalkEntries`, `maxWalkMs`); it runs at session start.
 - Secret detection is pattern-based; it reduces, not eliminates, the chance that a bound config holds a secret.
 - The synthetic `PATH` only constrains lookups by name; this mode is a read boundary, not a command allowlist.
 

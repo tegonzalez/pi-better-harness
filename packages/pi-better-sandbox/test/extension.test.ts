@@ -38,6 +38,7 @@ import piBetterSandbox from "../index.ts";
 import { permissionSettingsPath, readPermissionSettings, writePermissionSettings } from "../permission-settings.ts";
 import { defaultSandboxPermissions } from "../permissions.ts";
 import { SESSION_PERMISSION_ENTRY } from "../session-permissions.ts";
+import { READ_CONFINEMENT_ENTRY, READ_CONFINEMENT_POLICY_ENV } from "../read-confinement-settings.ts";
 import type { Component } from "@earendil-works/pi-tui";
 import { sandboxArgumentCompletions } from "../commands.ts";
 import { denyRuleOverridePath } from "../deny-rules.ts";
@@ -1582,4 +1583,39 @@ test("completions cover activation defaults and deny actions", () => {
         sandboxArgumentCompletions("deny add")[0]?.description,
         "Add a write-denied path",
     );
+});
+
+test("the launch audit entry is appended through pi.appendEntry with {active, profile, policyHash, planHash}", async () => {
+    forgetSandboxPreference();
+    // Outside the project and every temp directory, as the policy file must be.
+    const policyDir = mkdtempSync(join(packageRoot, "test", ".rc-policy-"));
+    const policyFile = join(policyDir, "policy.json");
+    writeFileSync(policyFile, JSON.stringify({ version: 1 }));
+    const previous = process.env[READ_CONFINEMENT_POLICY_ENV];
+    process.env[READ_CONFINEMENT_POLICY_ENV] = policyFile;
+    const settings = defaultSandboxPermissions();
+    settings.main = { ...settings.main, enabled: true, outsideProject: "off", storedCredentials: "off" };
+    const recorded = record([sessionEntry({ version: 1, permissions: settings })]);
+    try {
+        piBetterSandbox(recorded.pi);
+        await startSession(recorded, project("audit-entry"), "resume", false);
+        const entries = recorded.branch.filter((e) => e.type === "custom" && e.customType === READ_CONFINEMENT_ENTRY);
+        assert.equal(entries.length, 1);
+        const data = (entries[0] as unknown as { data: Record<string, unknown> }).data;
+        assert.equal(data.active, support.supported && support.backend === "linux-bubblewrap");
+        assert.equal(data.profile, "main");
+        if (data.active) {
+            assert.match(String(data.policyHash), /^[0-9a-f]{64}$/);
+            assert.match(String(data.planHash), /^[0-9a-f]{64}$/);
+            assert.equal(data.version, 1);
+        } else assert.match(String(data.reason), /./);
+        // Repeating the announcement does not repeat the entry.
+        recorded.events.emit(FOREGROUND_SANDBOX_POLICY_REQUEST_CHANNEL, undefined);
+        await recorded.handlers.get("session_tree")?.({ type: "session_tree" }, context(project("audit-entry"), { branch: () => recorded.branch }).ctx);
+        assert.equal(recorded.branch.filter((e) => e.type === "custom" && e.customType === READ_CONFINEMENT_ENTRY).length, 1);
+    } finally {
+        await recorded.handlers.get("session_shutdown")?.({ type: "session_shutdown" }, context(project("audit-entry")).ctx);
+        if (previous === undefined) delete process.env[READ_CONFINEMENT_POLICY_ENV]; else process.env[READ_CONFINEMENT_POLICY_ENV] = previous;
+        rmSync(policyDir, { recursive: true, force: true });
+    }
 });
