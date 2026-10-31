@@ -15,6 +15,7 @@ import { createTaskBashOperations } from '../shared-task-sandbox.ts';
 import taskGuard, { trustedToolRefusal } from '../task-guard.ts';
 import { parseTaskPolicy, prepareTaskRuntime } from '../task-policy.ts';
 import { planTaskTools } from '../subagent-tools.ts';
+import { nonTempFixtureBase } from './fixture-base.mjs';
 
 function fixture(t, permissions = {}, fixtureParent = process.platform === 'win32' ? tmpdir() : '/var/tmp') {
     const base = realpathSync(mkdtempSync(join(fixtureParent, 'pi-task-runtime-')));
@@ -357,7 +358,7 @@ test('default SDK task can retrieve a synthetic macOS Keychain item', { skip: !s
 test('default Outside Write: caches work, sibling repos stay, controls and provenance stay unwritable', { skip: !supported || process.platform === 'win32' }, async (t) => {
     // A home outside every temp root: temp is always removable, so a fixture
     // home there would prove nothing about the home rules.
-    const f = fixture(t, { outsideProject: 'write' }, fileURLToPath(new URL('.', import.meta.url)));
+    const f = fixture(t, { outsideProject: 'write' }, nonTempFixtureBase(fileURLToPath(new URL('.', import.meta.url))));
     const home = f.policy.home;
     const sibling = join(home, 'projects', 'other-repo');
     mkdirSync(join(home, '.cache'), { recursive: true });
