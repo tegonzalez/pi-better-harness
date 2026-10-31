@@ -1,0 +1,30 @@
+#!/bin/bash
+# Fake ssh transport for unit tests: honours the ControlMaster verbs and runs the "remote" command
+# locally under FAKE_REMOTE_HOME. Records every invocation. No real network.
+DIR="${FAKE_SSH_DIR:?}"
+op=""; target=""; cmd=""; master=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) [ "$2" = "ControlMaster=yes" ] && master=1; shift 2;;
+    -O) op="$2"; shift 2;;
+    -p|-i|-J|-L) shift 2;;
+    -T|-N|-f) shift;;
+    --) target="$2"; cmd="$3"; break;;
+    *) shift;;
+  esac
+done
+echo "${op:-exec} $target" >> "$DIR/calls"
+case "$op" in
+  check) [ -f "$DIR/master" ] && exit 0 || exit 255;;
+  exit) rm -f "$DIR/master"; exit 0;;
+esac
+if [ -n "$FAKE_SSH_FAIL" ] || [ -f "$DIR/fail" ]; then echo "ssh: Could not resolve hostname $target" >&2; exit 255; fi
+if [ "$master" = 1 ]; then touch "$DIR/master"; exit 0; fi
+export HOME="${FAKE_REMOTE_HOME:?}"
+sh -c "$cmd" <&0 &
+rp=$!
+while kill -0 "$rp" 2>/dev/null; do
+  if [ -f "$DIR/drop" ]; then exit 255; fi
+  sleep 0.1
+done
+wait "$rp"; exit $?

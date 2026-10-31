@@ -133,6 +133,8 @@ import {
     subagentSteerTool,
 } from "./tools.ts";
 import { stopRun } from "./stop.ts";
+import { selectRemoteTarget } from "./remote.ts";
+import { handleRemoteExit, launchRemoteRun } from "./remote-run.ts";
 import {
     WIDGET_CLEAR,
     fmtElapsed,
@@ -1682,6 +1684,8 @@ export default function (pi: ExtensionAPI) {
         exclude_tools?: string; clean?: boolean; sandbox?: boolean;
         sandbox_dir?: string; callback?: boolean; cwd?: string;
         git_clone_workspace?: boolean; approve?: boolean; allow_nested?: boolean;
+        /** Named remote target (config `remoteTargets`); runs the child on that host. */
+        remote?: string;
         agent?: string; role?: string | readonly string[]; alias?: string;
         catalog?: CatalogRunRecord; catalogResolved?: boolean;
     } & TimingParams;
@@ -1736,6 +1740,62 @@ export default function (pi: ExtensionAPI) {
         }
         const callbackOrigin = callbackOriginFromContext(ctx);
         activeCallbackOrigin = callbackOrigin;
+
+        // Remote target: the child runs on another host as `pi --mode rpc` behind a local bridge, and
+        // is otherwise an ordinary run (log, navigator, incidents, timing, callback, stop). The remote
+        // pi applies its own sandbox profile (required by the target); local extensions and the local
+        // task runtime do not apply there.
+        const remoteSel = selectRemoteTarget(cfg, { remote: p.remote, agent: p.agent });
+        if (remoteSel) {
+            const maxConcurrent = activeConcurrencyCap();
+            if (countRunning() >= maxConcurrent) {
+                throw new Error(`Max concurrent subagents (${maxConcurrent}) reached. Stop or let some finish first.`);
+            }
+            const id = nextRunId();
+            mkdirSync(runDir(id), { recursive: true });
+            const clean = p.clean === true;
+            const allow = normalizeTools(p.tools ?? cfg.defaultTools ?? (clean ? SAFE_CLEAN_TOOLS : SAFE_DEFAULT_TOOLS));
+            let launched: Awaited<ReturnType<typeof launchRemoteRun>>;
+            try {
+                launched = await launchRemoteRun({
+                    id, targetName: remoteSel.name, target: remoteSel.target, prompt: p.prompt,
+                    options: { model, thinking, tools: allow || undefined, excludeTools: p.exclude_tools || undefined, approve: p.approve === true },
+                });
+            } catch (error) {
+                discardFailedLaunch(id);
+                throw new Error(`Remote launch on target "${remoteSel.name}" failed closed: ${error instanceof Error ? error.message : String(error)}`);
+            }
+            const { spawned, remote } = launched;
+            const startedAt = Date.now();
+            const meta: RunMeta = {
+                id, name: p.name, status: "running",
+                pid: spawned.pid, spawnPid: process.pid, spawnPidStartTime: parentStartToken(), model,
+                effort: thinking, cwd: remoteSel.target.cwd ?? "~",
+                ...captureProcessIdentity(spawned.pid, spawnIdentityProbe),
+                promptPreview: p.prompt.slice(0, 200),
+                startedAt, logPath: logPathFor(id), sessionId: id,
+                callbackOrigin, callback: p.callback !== false,
+                ...batchInfo,
+                ...(p.catalog ? { catalog: p.catalog as unknown as RunMeta["catalog"] } : {}),
+                timing: resolveRunTiming({ params: p, settings: cfg, env: process.env, startedAt }),
+                remote,
+            };
+            writeMeta(meta);
+            void spawned.exit.then((code) => {
+                if (!handleRemoteExit(id).finalize) return;
+                finalizeRun(pi, ctx, id, code);
+            });
+            uiCtx = ctx;
+            ensureTicker();
+            ensureHealthTicker();
+            updateNavigatorFooter(ctx);
+            return {
+                id, meta, spawned,
+                runtime: `Runtime: remote ${remoteSel.name} (${remote.host}) · sandbox profile ${remoteSel.target.sandbox.profile} · session kept at ${remote.remoteDir}\n` +
+                    (meta.timing ? `${formatTimingLimits(meta.timing, startedAt)}\n` : ""),
+                warn: "", modelNote: catalogDefaultNote(p.catalog, model, thinking),
+            };
+        }
 
         // Sandbox is opt-in. sandbox_dir moves the confinement + working
         // dir elsewhere. git_clone_workspace prepares a disposable clone with
@@ -1912,7 +1972,12 @@ export default function (pi: ExtensionAPI) {
         };
         writeMeta(meta);
 
-        void spawned.exit.then((code) => finalizeRun(pi, ctx, id, code));
+        void spawned.exit.then((code) => {
+            // A dropped SSH channel leaves the remote process possibly alive: do not finalize; health
+            // reconciliation marks the run orphaned/lost and subagent_stop still reaches the remote.
+            if (meta.remote && !handleRemoteExit(id).finalize) return;
+            finalizeRun(pi, ctx, id, code);
+        });
 
         uiCtx = ctx;
         ensureTicker();
@@ -1977,6 +2042,7 @@ export default function (pi: ExtensionAPI) {
             git_clone_workspace: Type.Optional(Type.Boolean({ description: "Prepare a disposable Git clone workspace for sandboxed Git-mutating subagents. The clone has a real .git/ directory inside the sandbox writable root and is self-contained after setup." })),
             approve: Type.Optional(Type.Boolean({ description: "Trust project-local files in the child (default: false; headless runs cannot prompt for trust)." })),
             allow_nested: Type.Optional(Type.Boolean({ description: "Allow the child to spawn its own subagents (default: false). Loads this extension in the child and allowlists its tools." })),
+            remote: Type.Optional(Type.String({ description: "Name of a configured remote target (settings remoteTargets). The child runs on that host over SSH as a normal monitored run, under the target's required remote sandbox profile. Omit for a local child (or the target mapped to the agent in remoteAgents)." })),
             ...timingSchemaFields(),
         }),
 
@@ -2087,6 +2153,7 @@ export default function (pi: ExtensionAPI) {
                 git_clone_workspace: Type.Optional(Type.Boolean({ description: "Prepare a disposable Git clone workspace for each job (same semantics as subagent_spawn)." })),
                 approve: Type.Optional(Type.Boolean({ description: "Trust project-local files in children." })),
                 allow_nested: Type.Optional(Type.Boolean({ description: "Allow children to spawn their own subagents." })),
+                remote: Type.Optional(Type.String({ description: "Configured remote target name applied to every job (same semantics as subagent_spawn)." })),
                 ...timingSchemaFields(),
             }, { description: "Options applied to every job; per-job values override these." })),
             jobs: Type.Array(Type.Object({
@@ -2107,6 +2174,7 @@ export default function (pi: ExtensionAPI) {
                 git_clone_workspace: Type.Optional(Type.Boolean()),
                 approve: Type.Optional(Type.Boolean()),
                 allow_nested: Type.Optional(Type.Boolean()),
+                remote: Type.Optional(Type.String()),
                 ...timingSchemaFields(),
             }, { description: "A single batch job." }), {
                 minItems: 1,

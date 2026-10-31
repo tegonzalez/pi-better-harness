@@ -66,6 +66,10 @@ export interface SubagentConfig extends TimingSettings {
      * names are not inferred substitutes. Cross-provider candidates need
      * `{ model, crossProvider: true }` and must also be tier members.
      */
+    /** Named remote hosts a run may execute on (validated by remote.ts `parseRemoteTargets`; see docs/remote-subagents.md). */
+    remoteTargets?: Record<string, unknown> | null;
+    /** Agent id → remote target name: launching that agent runs it on the target. */
+    remoteAgents?: Record<string, string> | null;
     tierPolicy?: Readonly<Record<string, {
         members?: readonly string[];
         candidates?: readonly (string | { model: string; crossProvider?: boolean })[];

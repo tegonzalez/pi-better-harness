@@ -12,6 +12,7 @@
  * run directory does not delete them.
  */
 
+import type { RemoteRunMeta } from "./remote.ts";
 import type { RunTiming } from "./timing.ts";
 import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
@@ -183,6 +184,11 @@ export interface RunMeta {
      * Additive: runs launched before it have none and are never timed.
      */
     timing?: RunTiming;
+    /**
+     * Present for a run whose child executes on a remote host (remote.ts). `pid`/`pgid` then
+     * identify the local bridge process; the remote process is stopped through `remote`.
+     */
+    remote?: RemoteRunMeta;
 }
 
 /** Root runtime dir, deliberately OUTSIDE any repo. */

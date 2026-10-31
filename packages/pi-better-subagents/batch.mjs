@@ -93,6 +93,7 @@ export function mergeJobOptions(shared, job) {
         // spawnSubagentRun so batch jobs can request disposable clone workspaces.
         git_clone_workspace: job.git_clone_workspace ?? shared?.git_clone_workspace,
         approve: job.approve ?? shared?.approve,
+        remote: job.remote ?? shared?.remote,
         allow_nested: job.allow_nested ?? shared?.allow_nested,
         // Harness timing; an explicit null means "not set", so it falls through to shared.
         deadline_minutes: job.deadline_minutes ?? shared?.deadline_minutes,
