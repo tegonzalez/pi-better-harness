@@ -22,7 +22,7 @@ import {
     type ReadConfinementSeams,
 } from "./shared-read-confinement.ts";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createTaskScratch, ensureHarnessRuntimeDirectories, harnessRuntimeDirectories, runtimeCodeRoot, writableRuntimeAlias } from "./shared-task-sandbox.ts";
 
@@ -30,6 +30,8 @@ import { parseSandboxPermissions, type SandboxPermissionSettings, type SandboxPe
 import {
     canonicalizePath,
     describeSandboxSupport,
+    publishProcessReadConfinement,
+    READ_CONFINEMENT_POLICY_ENV,
     type SandboxBackendId,
     type SandboxWritePolicy,
 } from "./shared-sandbox-core.ts";
@@ -107,8 +109,17 @@ export type ReadConfinementControllerSeams = {
     /** Defaults to the configured policy file; return undefined when the mode is not configured. */
     loadPolicy?: () => LoadedReadConfinementPolicy | undefined;
     plan?: ReadConfinementSeams;
-    now?: () => number;
 };
+
+/**
+ * Machine-readable read-confinement status, appended to the session as a custom
+ * entry (`READ_CONFINEMENT_ENTRY`). A remote parent reads it with RPC
+ * `get_entries` before prompting. `active:true` means the frozen plan is in
+ * force for the Main profile (Linux bubblewrap, Outside project = Off).
+ */
+export type ReadConfinementRecord =
+    | { version: 1; active: true; profile: "main"; policyHash: string; planHash: string; hash: string; audit: ReadConfinementPlan["audit"] }
+    | { version: 1; active: false; profile: "main"; reason: string; policyHash?: string; planHash?: string };
 
 export type ForegroundSandboxSeams = PolicySeams & {
     readConfinement?: ReadConfinementControllerSeams;
@@ -141,9 +152,13 @@ export class ForegroundSandboxController {
     #policyProblem: string | undefined;
     #runtimePaths: readonly string[] = [];
     #taskScratch: ReturnType<typeof createTaskScratch> | undefined;
-    #confinement: { key: string; plan: ReadConfinementPlan; at: number } | undefined;
+    /** Computed once per session start and frozen: never recomputed, never aged out. */
+    #confinement: { project: string; loaded: LoadedReadConfinementPolicy; plan: ReadConfinementPlan } | { project: string; failure: Error } | { project: string; none: true } | undefined;
     #lastAuditHash: string | undefined;
+    #lastRecordKey: string | undefined;
+    #envMarker: boolean = false;
     #onConfinementPlan: ((plan: ReadConfinementPlan) => void) | undefined;
+    #onConfinementRecord: ((record: ReadConfinementRecord) => void) | undefined;
 
     constructor(seams: ForegroundSandboxSeams = {}) {
         this.#seams = seams;
@@ -166,7 +181,7 @@ export class ForegroundSandboxController {
         this.#sessionOverride = undefined;
         this.#permissions = undefined;
         this.#policyProblem = undefined;
-        this.#dropConfinement();
+        this.#freezeConfinement(projectRoot);
         return this.status();
     }
 
@@ -175,41 +190,100 @@ export class ForegroundSandboxController {
         this.#onConfinementPlan = listener;
     }
 
+    /** Called with the machine-readable status whenever it changes (see `ReadConfinementRecord`). */
+    onReadConfinementRecord(listener: (record: ReadConfinementRecord) => void): void {
+        this.#onConfinementRecord = listener;
+    }
+
+    /** The current machine-readable status, or undefined when no policy is configured. */
+    readConfinementRecord(): ReadConfinementRecord | undefined {
+        const c = this.#confinement;
+        if (!c || "none" in c) return undefined;
+        if ("failure" in c) return { version: 1, active: false, profile: "main", reason: c.failure.message };
+        const status = this.status();
+        const off = status.permissions?.enabled && status.permissions.outsideProject === "off";
+        const base = { policyHash: c.loaded.sha256, planHash: c.plan.hash };
+        if (status.state === "enabled" && off && status.backend === "linux-bubblewrap") {
+            return { version: 1, active: true, profile: "main", ...base, hash: c.plan.hash, audit: c.plan.audit };
+        }
+        return { version: 1, active: false, profile: "main", ...base,
+            reason: "A plan was computed but is not in force: the Main profile is not an enabled Linux bubblewrap sandbox with Outside project = Off." };
+    }
+
+    /** Emit the status entry if it changed since the last emission. */
+    recordReadConfinement(): void {
+        const record = this.readConfinementRecord();
+        if (!record) return;
+        const key = JSON.stringify([record.active, "planHash" in record ? record.planHash : "", record.active ? "" : record.reason]);
+        if (key === this.#lastRecordKey) return;
+        this.#lastRecordKey = key;
+        try { this.#onConfinementRecord?.(record); } catch { /* an audit-write failure must not widen or block access */ }
+    }
+
     /** Human-readable audit of the latest read-confinement plan, for the diagnostics command. */
     readConfinementReport(): string {
-        if (!this.#confinement) {
+        const c = this.#confinement;
+        if (c && "failure" in c) return `Read confinement: refused. ${c.failure.message}`;
+        if (!c || !("plan" in c)) {
             return "Read confinement: no plan computed in this session. It applies to Linux bubblewrap with Outside project = Off and a configured policy file (PI_SANDBOX_READ_CONFINEMENT_POLICY or the sandboxReadConfinement setting).";
         }
-        return formatReadConfinementAudit(this.#confinement.plan.audit, this.#confinement.plan.hash);
+        return formatReadConfinementAudit(c.plan.audit, c.plan.hash) + "\n  (computed once at session start and frozen; later symlink or .git changes apply to the next session)";
     }
 
     #dropConfinement(): void {
-        if (this.#confinement?.plan.syntheticDir) rmSync(this.#confinement.plan.syntheticDir, { recursive: true, force: true });
+        const c = this.#confinement;
+        if (c && "plan" in c && c.plan.syntheticDir) rmSync(c.plan.syntheticDir, { recursive: true, force: true });
         this.#confinement = undefined;
+        publishProcessReadConfinement(undefined);
+        if (this.#envMarker) { delete process.env[READ_CONFINEMENT_POLICY_ENV]; this.#envMarker = false; }
     }
 
-    #readConfinement(project: string): ReadConfinementPlan | undefined {
+    /**
+     * Compute the read-confinement plan once, at session start, and freeze it:
+     * symlinks or `.git` edits made by the agent afterwards have no effect until a
+     * new session starts. The same session reusing this controller (for example a
+     * session-tree restore) keeps the existing plan. The result is published
+     * process-wide so every actor that launches sandboxed commands applies it or
+     * fails closed.
+     */
+    #freezeConfinement(project: string): void {
+        if (this.#confinement && this.#confinement.project === project) return;
+        this.#dropConfinement();
         const rc = this.#seams.readConfinement ?? {};
         let loaded: LoadedReadConfinementPolicy | undefined;
         try {
             loaded = (rc.loadPolicy ?? loadConfiguredReadConfinementPolicy)();
         } catch (error) {
-            throw new Error(`Read confinement failed closed: ${error instanceof Error ? error.message : String(error)}`);
+            const failure = new Error(`Read confinement failed closed: ${error instanceof Error ? error.message : String(error)}`);
+            this.#confinement = { project, failure };
+            publishProcessReadConfinement({ state: "failed", reason: failure.message });
+            return;
         }
-        if (!loaded) return undefined;
-        const now = (rc.now ?? Date.now)();
-        const key = `${project}\0${loaded.sha256}`;
-        const ttl = loaded.policy.planTtlMs ?? 30_000;
-        const cached = this.#confinement;
-        if (cached && cached.key === key && now - cached.at < ttl) return cached.plan;
-        const plan = planReadConfinement(loaded, project, { home: (this.#seams.home ?? homedir)(), agentId: "main", ...rc.plan });
-        this.#dropConfinement();
-        this.#confinement = { key, plan, at: now };
-        if (plan.hash !== this.#lastAuditHash) {
+        if (!loaded) { this.#confinement = { project, none: true }; return; }
+        if (!process.env[READ_CONFINEMENT_POLICY_ENV] && isAbsolute(loaded.source)) {
+            // Child processes inherit the signal that confinement is required.
+            process.env[READ_CONFINEMENT_POLICY_ENV] = loaded.source;
+            this.#envMarker = true;
+        }
+        try {
+            const plan = planReadConfinement(loaded, project, { home: (this.#seams.home ?? homedir)(), agentId: "main", ...rc.plan });
+            this.#confinement = { project, loaded, plan };
+            publishProcessReadConfinement({ state: "active", mounts: plan });
             this.#lastAuditHash = plan.hash;
             try { this.#onConfinementPlan?.(plan); } catch { /* an audit-write failure must not widen or block access */ }
+        } catch (error) {
+            const failure = error instanceof Error ? error : new Error(String(error));
+            this.#confinement = { project, failure };
+            publishProcessReadConfinement({ state: "failed", reason: failure.message });
         }
-        return plan;
+    }
+
+    #readConfinement(project: string): ReadConfinementPlan | undefined {
+        const c = this.#confinement;
+        if (!c || "none" in c) return undefined;
+        if ("failure" in c) throw c.failure;
+        if (c.project !== project) throw new Error(`Read confinement failed closed: the frozen plan is for ${c.project}, not ${project}.`);
+        return c.plan;
     }
 
     /** Re-enable protection for operations launched from now on. */

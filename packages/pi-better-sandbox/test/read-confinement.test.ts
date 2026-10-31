@@ -13,7 +13,7 @@ import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { handleDiagnosticsCommand } from "../diagnostics-command.ts";
 import { defaultSandboxPermissions } from "../permissions.ts";
 import { configuredReadConfinementPolicyFile, loadConfiguredReadConfinementPolicy } from "../read-confinement-settings.ts";
-import { compileWritePolicy, evaluateReadAccess } from "../shared-sandbox-core.ts";
+import { compileWritePolicy, evaluateReadAccess, processReadConfinement, READ_CONFINEMENT_POLICY_ENV } from "../shared-sandbox-core.ts";
 import { hashPolicy, parseReadConfinementPolicy } from "../shared-read-confinement.ts";
 import { ForegroundSandboxController, type ForegroundSandboxSeams } from "../state.ts";
 
@@ -28,7 +28,7 @@ writeFileSync(join(target, "f"), "x");
 symlinkSync(target, join(project, "link"));
 
 function seams(over: Partial<ForegroundSandboxSeams> = {}): ForegroundSandboxSeams {
-    const raw = { version: 1 as const, planTtlMs: 60_000 };
+    const raw = { version: 1 as const };
     return {
         platform: () => "linux",
         lookupExecutable: () => "/usr/bin/bwrap",
@@ -61,9 +61,8 @@ test("Outside project = Off with a policy attaches the computed mount plan and i
     const compiled = compileWritePolicy(launch.policy, seams());
     assert.equal(evaluateReadAccess(join(project, "link", "f"), compiled).allowed, true);
     assert.equal(evaluateReadAccess(join(fixtures, "other"), compiled).allowed, false);
-    // Cached within the TTL: same plan, one audit notification.
     controller.requireLaunchPlan();
-    assert.equal(plans.length, 1);
+    assert.equal(plans.length, 0, "the plan was computed at session start, before the listener");
     assert.match(controller.readConfinementReport(), /policy fixture-policy/);
     controller.dispose();
 });
@@ -109,5 +108,68 @@ test("/sandbox diagnostics confinement shows the audited plan", async () => {
     const ctx = { ui: { notify: (m: string) => out.push(m) } } as unknown as ExtensionCommandContext;
     await handleDiagnosticsCommand("confinement", ctx, () => controller.readConfinementReport());
     assert.match(out[0]!, /Read confinement: project .*\n\s+policy fixture-policy sha256:/);
+    controller.dispose();
+});
+
+test("the plan is computed once at session start and frozen: later symlinks have no effect, a new session sees them", () => {
+    const late = join(fixtures, "late-target");
+    mkdirSync(late, { recursive: true });
+    const proj = join(fixtures, "frozen-project");
+    mkdirSync(proj, { recursive: true });
+    const controller = new ForegroundSandboxController(seams());
+    controller.beginSession(proj);
+    const settings = defaultSandboxPermissions();
+    settings.main = { ...settings.main, enabled: true, outsideProject: "off", storedCredentials: "off" };
+    controller.setPermissionSettings(settings);
+    symlinkSync(late, join(proj, "late-link"));
+    controller.beginSession(proj); // e.g. a session-tree restore: same frozen plan
+    controller.setPermissionSettings(settings);
+    const first = controller.requireLaunchPlan();
+    assert.ok(first.confined && first.policy.readConfinement && !first.policy.readConfinement.readRoots.includes(late));
+    for (let i = 0; i < 3; i++) controller.requireLaunchPlan();
+    assert.equal(processReadConfinement()?.state, "active");
+    controller.dispose();
+    assert.equal(processReadConfinement(), undefined, "dispose clears the published plan");
+    const next = new ForegroundSandboxController(seams());
+    next.beginSession(proj);
+    next.setPermissionSettings(settings);
+    const second = next.requireLaunchPlan();
+    assert.ok(second.confined && second.policy.readConfinement?.readRoots.includes(late));
+    next.dispose();
+});
+
+test("a failed plan is published process-wide so other actors fail closed, and the status record says so", () => {
+    const controller = new ForegroundSandboxController(seams({ readConfinement: { loadPolicy: () => { throw new Error("nope"); } } }));
+    controller.beginSession(project);
+    const settings = defaultSandboxPermissions();
+    settings.main = { ...settings.main, enabled: true, outsideProject: "off", storedCredentials: "off" };
+    controller.setPermissionSettings(settings);
+    assert.equal(processReadConfinement()?.state, "failed");
+    assert.throws(() => compileWritePolicy({ writableRoot: project, home, permissions: { ...settings.main, commands: true, network: false } }, { platform: () => "linux" }), /failed closed: .*nope/);
+    const record = controller.readConfinementRecord();
+    assert.ok(record && record.active === false && /nope/.test(record.reason));
+    controller.dispose();
+    assert.equal(process.env[READ_CONFINEMENT_POLICY_ENV], undefined);
+});
+
+test("the status record carries {active, profile, policyHash, planHash} only while the plan is in force", () => {
+    const controller = enabled("off");
+    const record = controller.readConfinementRecord();
+    assert.ok(record?.active);
+    assert.equal(record.profile, "main");
+    assert.match(record.policyHash, /^[0-9a-f]{64}$/);
+    assert.match(record.planHash, /^[0-9a-f]{64}$/);
+    const seen: unknown[] = [];
+    controller.onReadConfinementRecord((r) => seen.push(r));
+    controller.recordReadConfinement();
+    controller.recordReadConfinement();
+    assert.equal(seen.length, 1, "emitted once per change");
+    const settings = defaultSandboxPermissions();
+    settings.main = { ...settings.main, enabled: true, outsideProject: "read", storedCredentials: "off" };
+    controller.setPermissionSettings(settings);
+    const inactive = controller.readConfinementRecord();
+    assert.equal(inactive?.active, false);
+    controller.recordReadConfinement();
+    assert.equal(seen.length, 2);
     controller.dispose();
 });

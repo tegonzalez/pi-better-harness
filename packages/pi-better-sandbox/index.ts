@@ -50,8 +50,9 @@ import { SandboxDiagnostics, diagnosticPackageVersion } from "./shared-sandbox-d
 export default function piBetterSandbox(pi: ExtensionAPI): void {
     const controller = new ForegroundSandboxController();
     // Audit trail: every distinct read-confinement mount plan is recorded in the session.
-    controller.onReadConfinementPlan((plan) => {
-        pi.appendEntry(READ_CONFINEMENT_ENTRY, { version: 1, hash: plan.hash, audit: plan.audit });
+    // Fields: {version, active, profile, policyHash, planHash, hash, audit} (see README).
+    controller.onReadConfinementRecord((record) => {
+        pi.appendEntry(READ_CONFINEMENT_ENTRY, record);
     });
     let diagnosticsWarning: ((error: unknown) => void) | undefined;
     const diagnostics = new SandboxDiagnostics({ context: "foreground",
@@ -108,6 +109,7 @@ export default function piBetterSandbox(pi: ExtensionAPI): void {
 
     const announce = (status: ForegroundSandboxStatus): void => {
         publishForegroundSandboxPolicy(pi.events, status, controller.backgroundStatus());
+        controller.recordReadConfinement();
     };
 
     // A consumer that loaded after the last publication can ask for the current
