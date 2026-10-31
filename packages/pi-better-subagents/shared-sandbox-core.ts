@@ -64,6 +64,18 @@ export type SandboxPermissions = {
     processAccess?: "off" | "read";
 };
 
+/**
+ * A precomputed Linux read-confinement mount plan (see `read-confinement.ts`).
+ * It only takes effect with `outsideProject: "off"`. `args` are bubblewrap
+ * mount/env arguments inserted after the runtime roots; `readRoots` and
+ * `writeRoots` are the canonical allow set the in-process file tools use.
+ */
+export type ReadConfinementMounts = {
+    args: readonly string[];
+    readRoots: readonly string[];
+    writeRoots: readonly string[];
+};
+
 /** Whether a file access level allows creating and overwriting files. */
 export function canWrite(mode: SandboxFileAccess | undefined): boolean {
     return mode === "write" || mode === "read-write";
@@ -95,6 +107,8 @@ export type SandboxWritePolicy = {
     runtimeWrite?: readonly string[];
     /** Bounded historical default runtime directories; inactive without a capability profile. */
     runtimeCompatibility?: boolean;
+    /** Linux `outsideProject: "off"` only: extra read-only/writable mounts and the in-process allow set. */
+    readConfinement?: ReadConfinementMounts;
 };
 
 /** The executable and argv to run inside the sandbox, preserved verbatim. */
@@ -177,6 +191,7 @@ export type CompiledSandboxWritePolicy = {
     readonly compatibilityWrite?: readonly string[];
     /** Present only for the broad-write profile (Outside project = `write`). */
     readonly broad?: CompiledBroadWrite;
+    readonly readConfinement?: ReadConfinementMounts;
 };
 
 /** The canonical inputs of a broad-write profile. */
@@ -269,7 +284,7 @@ const BROAD_TEMP_ROOTS: Record<string, readonly string[]> = {
 // A process relying on /etc or /proc configuration (DNS, certificates, NSS)
 // may not start or function under Linux outsideProject=off; callers must not
 // silently remount these broad host trees to work around that failure.
-const RUNTIME_ROOTS = ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/System/Library", "/System/Cryptexes", "/Library/Apple", "/Library/Developer", "/opt/homebrew"];
+export const RUNTIME_ROOTS = ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/System/Library", "/System/Cryptexes", "/Library/Apple", "/Library/Developer", "/opt/homebrew"];
 const TEMP_ROOTS = ["/private/var/folders", "/private/tmp", "/tmp", "/dev"];
 const READ_RUNTIME_ROOTS = [...RUNTIME_ROOTS, "/dev"];
 
@@ -384,6 +399,13 @@ function compile(
     ])];
     return {
         writableRoot, denyWrite, home: policy.home,
+        ...(policy.readConfinement && policy.permissions?.outsideProject === "off" && {
+            readConfinement: {
+                args: [...policy.readConfinement.args],
+                readRoots: policy.readConfinement.readRoots.map((path) => canonicalizePath(path, seams)),
+                writeRoots: policy.readConfinement.writeRoots.map((path) => canonicalizePath(path, seams)),
+            },
+        }),
         ...(policy.permissions && {
             permissions: { ...policy.permissions },
             credentialPaths: broadMode ? broadCredentialPaths(policy.home, seams) : credentialFilePaths(policy.home, seams),
@@ -603,6 +625,8 @@ export function evaluateReadAccess(
         : contains(policy.writableRoot, path) ? permissions.projectFiles
         : policy.compatibilityWrite?.some((root) => contains(root, path)) ? "read-write"
         : path === sep || runtimeRoots(seams).some((root) => contains(root, path)) ? "read"
+        : policy.readConfinement?.readRoots.some((root) => contains(root, path)) ? "read"
+        : policy.readConfinement?.writeRoots.some((root) => contains(root, path)) ? "read"
         : permissions.outsideProject;
     return mode === "off" ? { allowed: false, path, reason: "read-denied" } : { allowed: true, path };
 }
@@ -633,6 +657,7 @@ export function evaluateWriteAccess(
             : contains(policy.writableRoot, path) ? policy.permissions.projectFiles
             : policy.compatibilityWrite?.some((root) => contains(root, path)) ? "read-write"
             : contains(canonicalizePath("/dev", seams), path) ? "read-write"
+            : policy.readConfinement?.writeRoots.some((root) => contains(root, path)) ? "read-write"
             : policy.permissions.outsideProject;
         if (!canWrite(mode)) return { allowed: false, path, reason: "permission-denied" };
     }
@@ -1193,6 +1218,7 @@ function buildLinuxPermissionCommand(
         mounts.push(permissions.outsideProject === "read" && !policy.compatibilityWrite?.includes(canonicalizePath("/tmp", seams)) ? "--ro-bind" : "--bind", "/tmp", "/tmp");
     }
     mounts.push("--dev", "/dev");
+    if (policy.readConfinement && permissions.outsideProject === "off") mounts.push(...policy.readConfinement.args);
     const scopedMounts: { option: "--bind" | "--ro-bind"; path: string }[] = [];
     const writableAncestors = new Set<string>();
     const readOnlyGuards = new Set<string>();
@@ -1284,6 +1310,10 @@ function buildLinuxPermissionCommand(
     for (const path of [...readOnlyGuards].sort((a, b) => a.length - b.length)) {
         mounts.push("--ro-bind", path, path);
     }
+    // Last, so every mount point above could still be created: the synthetic
+    // root and the parents of bound paths become read-only; only the explicit
+    // writable binds and the private /tmp stay writable.
+    if (policy.readConfinement && permissions.outsideProject === "off") mounts.push("--remount-ro", "/");
     return {
         file: bwrap,
         fileArgs: [...mounts, ...(!permissions.network ? ["--unshare-net"] : []),
