@@ -54,12 +54,22 @@ export type ReadConfinementTool = {
 
 export type ReadConfinementPolicy = {
     version: 1;
-    limits?: { maxSymlinks?: number; maxDepth?: number; maxWalkEntries?: number; maxBinds?: number; maxWalkMs?: number; minPrefixDepth?: number };
+    limits?: { maxSymlinks?: number; maxDepth?: number; maxWalkEntries?: number; maxBinds?: number; maxWalkMs?: number; minPrefixDepth?: number; maxWildcardMatches?: number };
+    /**
+     * Generic read-only paths (for example shared folders): absolute, `~/…` or `${VAR}/…`. Each is
+     * realpath'd, must pass the deny list and must not contain a writable root. Symlinks inside are not followed.
+     */
+    readOnly?: string[];
     /** Environment names the confined child may inherit; everything else is cleared. */
     env?: { allow?: string[] };
     /** Directory base names never descended into by the symlink walk. */
     walkSkipDirNames?: string[];
     deny?: { paths?: string[]; credentialList?: boolean; otherHomes?: boolean };
+    /**
+     * `approvedPathDirs` entries and a tool `path` may hold single-segment `*` wildcards (never `**`). They are
+     * expanded at launch; every match must realpath into an approved or bound location (a `readOnly` path,
+     * a tool `bind`, or a runtime root) and is recorded in the audit.
+     */
     tools?: { approved?: (string | ReadConfinementTool)[]; approvedPathDirs?: string[]; builtinDefaults?: boolean };
     secretDetector?: { useDefaults?: boolean; patterns?: string[]; maxScanBytes?: number; maxScanFiles?: number };
     caches?: { persistentDir?: string };
@@ -68,6 +78,8 @@ export type ReadConfinementPolicy = {
 };
 
 const DEFAULT_LIMITS = { maxSymlinks: 2000, maxDepth: 8, maxWalkEntries: 200_000, maxBinds: 500, maxWalkMs: 15_000, minPrefixDepth: 3 };
+/** Cap on the matches one wildcard pattern may expand to (policy `limits.maxWildcardMatches`). */
+export const DEFAULT_MAX_WILDCARD_MATCHES = 64;
 /** Environment names every confined child may inherit; policy `env.allow` extends this. */
 export const DEFAULT_ENV_ALLOW: readonly string[] = Object.freeze(["PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR", "TZ"]);
 /** Generic secret shapes; `(?i)` prefix = case-insensitive. Replaceable via `secretDetector.useDefaults: false`. */
@@ -124,6 +136,13 @@ function count(value: unknown, path: string, min = 1): number | undefined {
     return value;
 }
 
+/** A wildcard pattern: absolute, `*` only inside a single segment, never `**`, no `..`. */
+function wildcardPath(entry: string, path: string): void {
+    if (!isAbsolute(entry)) fail(path, "must be absolute");
+    if (entry.includes("**")) fail(path, '"**" is not supported; use a single-segment "*"');
+    if (entry.includes("*") && entry.split(sep).includes("..")) fail(path, 'a wildcard pattern must not contain ".." segments');
+}
+
 function pathLike(entry: string, path: string): void {
     if (!isAbsolute(entry) && !entry.startsWith("~/") && !entry.startsWith("${")) {
         fail(path, `"${entry}" must be absolute, "~/…" or "\${VAR}/…"`);
@@ -141,19 +160,25 @@ function compilePattern(pattern: string, path: string): RegExp {
 
 /** Strictly validate a policy document; unknown keys and malformed values fail closed. */
 export function parseReadConfinementPolicy(value: unknown): ReadConfinementPolicy {
-    const root = checkKeys(value, "$", ["version", "limits", "walkSkipDirNames", "deny", "tools", "secretDetector", "caches", "syntheticPathMount", "env"]);
+    const root = checkKeys(value, "$", ["version", "limits", "walkSkipDirNames", "deny", "tools", "secretDetector", "caches", "syntheticPathMount", "env", "readOnly"]);
     if (root.version !== 1) fail("$.version", "must be 1");
     const policy: ReadConfinementPolicy = { version: 1 };
     if (root.limits !== undefined) {
-        const l = checkKeys(root.limits, "$.limits", ["maxSymlinks", "maxDepth", "maxWalkEntries", "maxBinds", "maxWalkMs", "minPrefixDepth"]);
+        const l = checkKeys(root.limits, "$.limits", ["maxSymlinks", "maxDepth", "maxWalkEntries", "maxBinds", "maxWalkMs", "minPrefixDepth", "maxWildcardMatches"]);
         policy.limits = {};
-        for (const key of ["maxSymlinks", "maxDepth", "maxWalkEntries", "maxBinds", "maxWalkMs", "minPrefixDepth"] as const) {
+        for (const key of ["maxSymlinks", "maxDepth", "maxWalkEntries", "maxBinds", "maxWalkMs", "minPrefixDepth", "maxWildcardMatches"] as const) {
             const n = count(l[key], `$.limits.${key}`);
             if (n !== undefined) policy.limits[key] = n;
         }
     }
     const skip = stringList(root.walkSkipDirNames, "$.walkSkipDirNames");
     if (skip) policy.walkSkipDirNames = skip;
+    const readOnly = stringList(root.readOnly, "$.readOnly");
+    readOnly?.forEach((entry, i) => {
+        pathLike(entry, `$.readOnly[${i}]`);
+        if (entry.includes("*")) fail(`$.readOnly[${i}]`, "wildcards are not supported here; list the paths");
+    });
+    if (readOnly) policy.readOnly = readOnly;
     if (root.deny !== undefined) {
         const d = checkKeys(root.deny, "$.deny", ["paths", "credentialList", "otherHomes"]);
         const paths = stringList(d.paths, "$.deny.paths");
@@ -181,6 +206,7 @@ export function parseReadConfinementPolicy(value: unknown): ReadConfinementPolic
                 if ((e.name === undefined) === (e.path === undefined)) fail(at, "exactly one of name or path is required");
                 if (e.name !== undefined && (typeof e.name !== "string" || e.name === "" || e.name.includes("/"))) fail(`${at}.name`, "expected a bare executable name");
                 if (e.path !== undefined && (typeof e.path !== "string" || !isAbsolute(e.path))) fail(`${at}.path`, "expected an absolute path");
+                if (typeof e.path === "string") wildcardPath(e.path, `${at}.path`);
                 if (e.install !== undefined && e.install !== "file" && e.install !== "prefix") fail(`${at}.install`, 'expected "file" or "prefix"');
                 const tool: ReadConfinementTool = {};
                 if (e.name !== undefined) tool.name = e.name as string;
@@ -197,7 +223,7 @@ export function parseReadConfinementPolicy(value: unknown): ReadConfinementPolic
             });
         }
         const dirs = stringList(t.approvedPathDirs, "$.tools.approvedPathDirs");
-        dirs?.forEach((entry, i) => { if (!isAbsolute(entry)) fail(`$.tools.approvedPathDirs[${i}]`, "must be absolute"); });
+        dirs?.forEach((entry, i) => wildcardPath(entry, `$.tools.approvedPathDirs[${i}]`));
         if (dirs) policy.tools.approvedPathDirs = dirs;
         const builtin = boolean(t.builtinDefaults, "$.tools.builtinDefaults");
         if (builtin !== undefined) policy.tools.builtinDefaults = builtin;
@@ -294,7 +320,9 @@ export type ReadConfinementAudit = {
     denied: { path: string; reason: string; via?: string }[];
     skipped: { path: string; reason: string; via?: string }[];
     syntheticPath: { mount: string; tools: { name: string; target: string; implicit: boolean }[] } | undefined;
-    limits: { maxSymlinks: number; maxDepth: number; maxWalkEntries: number; maxBinds: number; maxWalkMs: number; minPrefixDepth: number };
+    limits: { maxSymlinks: number; maxDepth: number; maxWalkEntries: number; maxBinds: number; maxWalkMs: number; minPrefixDepth: number; maxWildcardMatches?: number };
+    /** Wildcard expansions (only present when the policy uses a wildcard): every match and whether it was accepted. */
+    wildcards?: { pattern: string; kind: "approvedPathDir" | "toolPath"; matches: { path: string; real?: string; accepted: boolean; reason?: string }[] }[];
     symlinksFollowed: number;
     /** Environment names the confined child inherits; every other variable is cleared. */
     envAllow: string[];
@@ -711,6 +739,25 @@ export function planReadConfinement(
         }
     }
 
+    // ---- read-only paths (policy `readOnly`) -----------------------------
+    const approvedLocations: string[] = [...runtimeReal];
+    for (const entry of policy.readOnly ?? []) {
+        const via = "readOnly";
+        const expanded = expandPath(entry, home, env);
+        if (!expanded) { skip(entry, "path variable is unset or path is relative", via); continue; }
+        const real = realOrUndefined(expanded);
+        if (!real) { skip(expanded, "not found", via); continue; }
+        const dir = statSync(real).isDirectory();
+        const why = denyMatch(expanded, false) ?? denyMatch(real, dir);
+        if (why) { deny(real, why, via); continue; }
+        const containing = [...writeRoots].find((root) => contains(real, root));
+        if (containing) { deny(real, `refused: readOnly path contains the writable root ${containing}`, via); continue; }
+        if (covered(real)) { skip(real, "already readable or writable through the project or another bind", via); approvedLocations.push(real); continue; }
+        // The path itself is resolved as the kernel would; symlinks inside a shared folder are not followed.
+        const resolvedReal = resolveChain(expanded, via);
+        if (resolvedReal !== undefined && addBind(resolvedReal, "ro", `read-only path from policy readOnly (${entry})`, via)) approvedLocations.push(resolvedReal);
+    }
+
     // ---- approved tools --------------------------------------------------
     const pathDirs = (env.PATH ?? "").split(delimiter).filter((entry) => isAbsolute(entry));
     const lookup = (name: string): string | undefined => {
@@ -723,22 +770,86 @@ export function planReadConfinement(
     const defaults = policy.tools?.builtinDefaults === false ? {} : BUILTIN_TOOL_DEFAULTS;
     const resolved = new Map<string, ToolSpec & { real: string }>();
     const queue: ToolSpec[] = [];
+
+    // ---- limited wildcards (single-segment `*`, expanded now, every match checked and audited) ----
+    const maxMatches = limits.maxWildcardMatches ?? DEFAULT_MAX_WILDCARD_MATCHES;
+    const wildcardAudit: NonNullable<ReadConfinementAudit["wildcards"]> = [];
+    for (const entry of policy.tools?.approved ?? []) {
+        if (typeof entry === "object") for (const bind of entry.bind ?? []) {
+            const expanded = expandPath(bind, home, env);
+            const real = expanded ? realOrUndefined(expanded) : undefined;
+            if (real && !denyMatch(real, statSync(real).isDirectory())) approvedLocations.push(real);
+        }
+    }
+    const wildcardMatcher = (segment: string): RegExp => new RegExp(`^${segment.split("*").map((part) => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join("[^/]*")}$`);
+    /** Expand `pattern` against the filesystem; throws when it would exceed the match cap. */
+    const expandWildcard = (pattern: string): string[] => {
+        let current: string[] = [sep];
+        for (const segment of pattern.split(sep).filter(Boolean)) {
+            const next: string[] = [];
+            const matcher = segment.includes("*") ? wildcardMatcher(segment) : undefined;
+            for (const base of current) {
+                if (!matcher) { const candidate = join(base, segment); if (existsSync(candidate)) next.push(candidate); continue; }
+                let names: string[] = [];
+                try { names = readdirSync(base).sort(); } catch { continue; }
+                for (const name of names) {
+                    // As in a shell, `*` does not match a leading dot.
+                    if (matcher.test(name) && (segment.startsWith(".") || !name.startsWith("."))) next.push(join(base, name));
+                }
+            }
+            if (next.length > maxMatches) {
+                throw new ReadConfinementError(`wildcard ${pattern} matches more than ${maxMatches} paths (policy limits.maxWildcardMatches); narrow the pattern or raise the cap.`);
+            }
+            current = next;
+        }
+        return current;
+    };
+    /** Accepted matches of one pattern; every match is recorded, and one outside approved/bound locations is denied. */
+    const acceptedMatches = (pattern: string, kind: "approvedPathDir" | "toolPath", via: string): string[] => {
+        const record: NonNullable<ReadConfinementAudit["wildcards"]>[number] = { pattern, kind, matches: [] };
+        wildcardAudit.push(record);
+        const accepted: string[] = [];
+        for (const match of expandWildcard(pattern)) {
+            const real = realOrUndefined(match);
+            if (!real) { record.matches.push({ path: match, accepted: false, reason: "not resolvable" }); continue; }
+            const location = approvedLocations.find((root) => contains(root, real));
+            if (!location) {
+                const reason = "refused: wildcard match is not inside an approved or bound location (readOnly path, tool bind or runtime root)";
+                record.matches.push({ path: match, real, accepted: false, reason });
+                deny(real, reason, via);
+                continue;
+            }
+            record.matches.push({ path: match, real, accepted: true });
+            accepted.push(match);
+        }
+        if (!record.matches.length) skip(pattern, "wildcard matched nothing", via);
+        return accepted;
+    };
+
     for (const entry of policy.tools?.approved ?? []) {
         const spec: ReadConfinementTool = typeof entry === "string" ? (entry.startsWith("/") ? { path: entry } : { name: entry }) : entry;
-        const name = spec.name ?? basename(spec.path!);
-        const lexical = spec.path ?? lookup(name);
-        if (!lexical || !isExecutableFile(lexical)) { skip(spec.path ?? name, "approved tool not found on PATH"); continue; }
-        const builtin = defaults[name];
-        queue.push({ name, lexical, implicit: false, spec: { ...(builtin && spec.config === undefined ? { config: builtin.config } : {}), ...spec } });
-    }
-    for (const dirEntry of policy.tools?.approvedPathDirs ?? []) {
-        const realDir = realOrUndefined(dirEntry);
-        if (!realDir) { skip(dirEntry, "approved PATH directory not found"); continue; }
-        if (!pathDirs.some((dir) => realOrUndefined(dir) === realDir)) { skip(dirEntry, "approved PATH directory is not on the launching PATH"); continue; }
-        for (const name of readdirSync(realDir).sort()) {
-            const lexical = join(dirEntry, name);
+        const candidates: ReadConfinementTool[] = spec.path?.includes("*")
+            ? acceptedMatches(spec.path, "toolPath", "approved tool path").map((match) => ({ ...spec, path: match }))
+            : [spec];
+        for (const one of candidates) {
+            const name = one.name ?? basename(one.path!);
+            const lexical = one.path ?? lookup(name);
+            if (!lexical || !isExecutableFile(lexical)) { skip(one.path ?? name, "approved tool not found on PATH"); continue; }
             const builtin = defaults[name];
-            if (isExecutableFile(lexical)) queue.push({ name, lexical, implicit: false, spec: { name, ...(builtin ? { config: builtin.config } : {}) } });
+            queue.push({ name, lexical, implicit: false, spec: { ...(builtin && one.config === undefined ? { config: builtin.config } : {}), ...one } });
+        }
+    }
+    for (const patternEntry of policy.tools?.approvedPathDirs ?? []) {
+        const dirEntries = patternEntry.includes("*") ? acceptedMatches(patternEntry, "approvedPathDir", "approved PATH directory") : [patternEntry];
+        for (const dirEntry of dirEntries) {
+            const realDir = realOrUndefined(dirEntry);
+            if (!realDir) { skip(dirEntry, "approved PATH directory not found"); continue; }
+            if (!pathDirs.some((dir) => realOrUndefined(dir) === realDir)) { skip(dirEntry, "approved PATH directory is not on the launching PATH"); continue; }
+            for (const name of readdirSync(realDir).sort()) {
+                const lexical = join(dirEntry, name);
+                const builtin = defaults[name];
+                if (isExecutableFile(lexical)) queue.push({ name, lexical, implicit: false, spec: { name, ...(builtin ? { config: builtin.config } : {}) } });
+            }
         }
     }
 
@@ -909,6 +1020,7 @@ export function planReadConfinement(
         skipped,
         syntheticPath: syntheticDir ? { mount, tools: syntheticTools.map((t) => ({ name: t.name, target: t.real, implicit: t.implicit })) } : undefined,
         limits,
+        ...(wildcardAudit.length ? { wildcards: wildcardAudit } : {}),
         symlinksFollowed,
         envAllow,
         denyWrite: [...denyWriteSet].sort(),
