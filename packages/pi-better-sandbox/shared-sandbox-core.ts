@@ -1541,7 +1541,9 @@ function buildLinuxPermissionCommand(
         for (const path of leaves) {
             if (!materialize(path)) throw new Error(`Cannot protect denied path: ${path}`);
         }
-        for (const parent of protectedAncestors(leaves).filter((path) => contains(writableRoot, path) && path !== writableRoot)) {
+        // A redirected root is bound inside read-only overlays of the plan; re-binding its ancestors writable
+        // would sit after those overlays and hide them. Its leaves are anchored by their own read-only mounts.
+        if (!mappedOnly) for (const parent of protectedAncestors(leaves).filter((path) => contains(writableRoot, path) && path !== writableRoot)) {
             writableAncestors.add(parent);
         }
         for (const path of leaves) readOnlyGuards.add(path);
