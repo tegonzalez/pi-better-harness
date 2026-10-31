@@ -45,6 +45,8 @@ Schema (validated on use; unknown fields are rejected):
 | --- | --- | --- |
 | `host` | yes | SSH `Host` alias. User, port, keys and jump hosts come from your ssh configuration; `user` and `port` may be set here. |
 | `cwd` | no | Remote working directory (`~/` expands remotely). Default: the remote login directory. |
+| `cwdRoots` | no | Allowed working-folder roots (absolute or `~/…`; not `/` or `~`). Declaring them lets a spawn pass its own `cwd` (see below). The remote launch script resolves the working folder and every root with `pwd -P` and refuses to start pi (`cwd-denied`) unless the folder is inside a root; this check also covers `cwd` and the login directory. |
+| `agentDir` | no | Agent dir for the remote pi: exported as `PI_CODING_AGENT_DIR` through the same env payload as `env` (absolute or `~/…`). Setting `PI_CODING_AGENT_DIR` in `env`/`sandbox.env` as well is rejected. |
 | `root` | no | Where run directories live. Relative means under the remote `$HOME`. Default `.pi-better-subagents/runs`. |
 | `pi.command` | yes | Remote pi executable: a name on the remote `PATH` or an absolute path. |
 | `pi.args` | no | Fixed arguments placed before the generated ones. |
@@ -74,6 +76,24 @@ the message "Sandbox: Network access is Off. A remote, resumed or remoteAgents-m
 access on in `/sandbox` or spawn a local subagent. If the `subagents` settings cannot be read, a spawn that names
 an agent is refused (it cannot be proved local).
 
+## Workspace: working folder, agent dir, policy
+
+A workspace is (working folder, agent dir, filesystem policy). With `pi-better-sandbox` the policy location can live in
+the agent dir's settings (`piBetterHarness.sandboxReadConfinement.policyFile`), so the same workspace is usable by a
+monitored remote subagent and by the owner's own pi started in that working folder with `PI_CODING_AGENT_DIR=<agent-dir>`.
+
+- **Fixed working folder:** set `cwd` (unchanged behavior). A spawn `cwd` is rejected.
+- **Per-spawn working folder:** set `cwdRoots`; `subagent_spawn` / `subagent_spawn_batch` (per job or `shared`) then accept
+  `cwd`, which replaces the target's `cwd` for that spawn. The remote host resolves it with `pwd -P` and requires it to lie
+  inside one of the (also resolved) roots, so symlinks, `..` and prefix tricks cannot escape; otherwise pi is never started
+  (`cwd-denied`, exit 99). A missing folder is `cwd-missing`. Each spawn is its own run with its own remote session; `resume`
+  keeps the earlier run's working folder (a different `cwd` is refused). The run records the folder in `remote.cwd`.
+- **Agent dir:** set `agentDir` so the remote children use the workspace's agent dir (settings, models, policy location).
+- **Compare with your own session:** `subagent_result` shows a `Remote workspace (<target>): cwd … · agent dir … ·
+  policyHash … · planHash …` line (the verified values from the sandbox launch entry). Run pi in the same working folder with
+  the same agent dir and use `/sandbox workspace` (see "Verify a workspace interactively" in the pi-better-sandbox README) to
+  compare, and `/sandbox check <path>` and `!` probes to see what the worker can read and write.
+
 ## Sandbox verification (the prompt is never sent on trust)
 
 After starting `pi --mode rpc` the bridge calls RPC `get_entries` and requires the sandbox launch
@@ -102,7 +122,7 @@ use the remote host's own credential mechanisms.
 ## Unsupported options
 
 A remote run honours `model`, `thinking`, `tools`, `exclude_tools`, `approve`, `callback`, timing, `name`.
-`sandbox`, `sandbox_dir`, `cwd` (set the target's `cwd`), `git_clone_workspace`, `allow_nested` and
+`sandbox`, `sandbox_dir`, `cwd` (unless the target declares `cwdRoots`; otherwise set the target's `cwd`), `git_clone_workspace`, `allow_nested` and
 `clean` are rejected with an error when a remote target applies, instead of being ignored.
 
 ## Resume
@@ -174,6 +194,7 @@ unfinalized (health marks it orphaned) with a `bridge-died` incident.
 | Remote sandbox launch entry missing, inactive, other profile or without hashes | Run fails with a `sandbox-unverified` incident; the remote is stopped; the prompt is never sent. |
 | Session to resume missing | Run fails with a `session-missing` incident. |
 | Remote cwd missing | Run fails with a `cwd-missing` incident. |
+| Working folder outside the target's `cwdRoots` | Run fails with a `cwd-denied` incident; pi is never started. |
 | Verification fails and the remote stop cannot be verified | The marker is `remote-unstopped` (written *before* the stop is attempted, replaced by `sandbox-unverified` only after a verified stop), so a bridge killed meanwhile never reads as "surely gone"; `subagent_stop` retries. |
 | SSH channel drops after the prompt was sent (even before the first event) | Same as mid-run: `channel-lost`, not finalized. Only a drop *before* the prompt is `ssh-failed`. |
 | SSH channel drops mid-run | A `channel-lost` incident is recorded and the run is not finalized: normal health reconciliation marks it orphaned/lost. `subagent_stop` still kills the remote process. |

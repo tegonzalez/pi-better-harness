@@ -346,7 +346,14 @@ changes.
 The policy is a JSON file whose location is configuration, never code:
 
 1. `PI_SANDBOX_READ_CONFINEMENT_POLICY=/absolute/path/policy.json`, or
-2. the harness setting `sandboxReadConfinement: { "policyFile": "/absolute/path/policy.json" }`.
+2. the harness setting `sandboxReadConfinement: { "policyFile": "/absolute/path/policy.json" }`, stored under
+   `piBetterHarness` in the **agent dir's** `settings.json` (`$PI_CODING_AGENT_DIR`, default `~/.pi/agent`).
+
+Because the setting lives in the agent dir, a plain `PI_CODING_AGENT_DIR=<dir> pi` started in a working folder applies
+the same policy with no extra environment. A *workspace* is the triple (working folder, agent dir, policy): the same
+binding serves a monitored remote subagent (target `cwd`/`cwdRoots` and `agentDir`) and the owner's own separate pi
+(see [Verify a workspace interactively](#verify-a-workspace-interactively)). The policy file must stay outside every
+writable root (the existing refusal below), so it cannot live in the working folder.
 
 Unknown keys, wrong types, relative paths and invalid regular expressions are refused
 at load time and block launches (fail closed). Path entries are absolute, `~/…`, or
@@ -358,12 +365,14 @@ at load time and block launches (fail closed). Path entries are absolute, `~/…
 | `limits.maxSymlinks` / `maxDepth` / `maxWalkEntries` / `maxBinds` / `maxWalkMs` | Caps on the symlink closure. Exceeding one fails the launch with an error naming the cap. | 2000 / 8 / 200000 / 500 / 15000 |
 | `limits.minPrefixDepth` | `install: "prefix"` is refused when the prefix has fewer path components, or contains/lies in the home, the project or a writable root. | `3` |
 | `env.allow[]` | Environment variable names the confined child may inherit, in addition to `PATH`, `HOME`, `LANG`, `LC_ALL`, `TERM`, `TMPDIR`, `TZ`. Everything else is cleared (`--clearenv`). `PATH` is always the synthetic one. | `[]` |
+| `readOnly[]` | Generic read-only paths (for example shared folders): absolute, `~/…` or `${VAR}/…`, no wildcards. Each is realpath'd and must pass the deny list (a path inside a denied path, or one that contains a denied path or a writable root, is refused and recorded in `denied`); a missing one is `skipped`. Mounted read-only; symlinks inside are not followed. | `[]` |
+| `limits.maxWildcardMatches` | Cap on the matches one wildcard pattern may expand to; exceeding it fails the launch. | `64` |
 | `walkSkipDirNames` | Directory names the symlink walk never enters (for example a large dependency tree). | `[]` |
 | `deny.paths` | Extra denied paths. A symlink target inside one, or a directory containing one, is skipped and recorded. | `[]` |
 | `deny.credentialList` | Include the broad built-in stored-credential locations (keyrings, gpg, rclone, cloud and agent tokens) in the deny list. | `true` |
 | `deny.otherHomes` | Deny every account home (passwd database) other than the current user's. | `true` |
 | `tools.approved[]` | A name (looked up on the launching `PATH`), or `{ name \| path, config[], cache[], cachePersistent, bind[], install }`. `install: "prefix"` binds the install prefix instead of just the executable; `bind` adds extra read-only paths. | `[]` |
-| `tools.approvedPathDirs[]` | Approve every executable in a directory that is on the launching `PATH`. | `[]` |
+| `tools.approvedPathDirs[]` | Approve every executable in a directory that is on the launching `PATH`. An entry (and a tool `path`) may contain a **single-segment `*`** (for example `<base>/*/bin`; never `**`, no `..`), expanded at launch. Every match must be on the launching `PATH` (directories) and its realpath must lie inside an approved or bound location: a `readOnly` path, a tool `bind`, or a runtime root. Other matches are refused and recorded in `denied`; every match, accepted or not, is listed under `audit.wildcards`. `*` does not match leading-dot names. | `[]` |
 | `tools.builtinDefaults` | Apply the generic built-in map (`git` → `~/.gitconfig` and the `config`/`ignore`/`attributes` files below `$XDG_CONFIG_HOME/git` and `~/.config/git`, never the whole directory) to approved tools without their own `config`. Set `false` to remove it. | `true` |
 | `secretDetector.useDefaults` / `patterns[]` / `maxScanBytes` / `maxScanFiles` | Config entries whose files match a pattern (private-key headers, common token shapes, `_authToken=`, `password=…`) are refused, not bound. Defaults also match URL userinfo (`://user:pw@`), `Authorization:` headers and short `password=` values. A file larger than `maxScanBytes` is refused, not truncated. `(?i)` prefix = case-insensitive. | defaults on |
 | `caches.persistentDir` | Base for `cachePersistent` caches: `<dir>/<agent>/<tool>-<hash>`. | unset (persistent caches skipped) |
@@ -431,6 +440,36 @@ can read it with RPC `get_entries` and refuse to prompt unless `active` is `true
 
 An entry is appended once per change, not per announcement. A session with no configured policy
 writes no entry. `/sandbox diagnostics confinement` prints the latest plan. Secret values are never recorded.
+
+### Verify a workspace interactively
+
+The owner can check what a confined worker can read and write from a separate pi in the same working folder.
+`!bash` and `!!` commands already run through the sandboxed bash, so they experience the identical confinement.
+
+1. Start pi in the workspace's working folder with the workspace's agent dir (no other setup; the policy location
+   comes from that agent dir's settings):
+
+   ```sh
+   cd <working-folder>
+   PI_CODING_AGENT_DIR=<agent-dir> pi
+   ```
+
+   Main must be enabled with Outside project = Off in that agent dir (the same permissions the worker uses).
+2. `/sandbox workspace` (also the first block of `/sandbox diagnostics confinement`) shows the working folder, agent
+   dir, policy path, `policyHash` and `planHash`, and whether the confinement is `active`.
+3. `/sandbox check <path>` reports read, write and exec for a path with the reason (the mount that grants it, or
+   "not mounted"). It uses the same evaluator as the in-process tools, whose allow set is the kernel mount plan. Relative
+   paths resolve against the working folder; symlinks are decided on their realpath.
+4. Probe with `!` commands:
+   - `!cat <another-project>/file` → `No such file or directory`
+   - `!echo x > <outside-the-working-folder>/file` → fails (a `readOnly` folder is readable, not writable)
+   - `!curl <host>` or any network use → fails while Network access is Off
+5. Compare the hashes with the worker: a remote subagent's `subagent_result` carries a
+   `Remote workspace (<target>): cwd … · agent dir … · policyHash … · planHash …` line (also in
+   `remote.sandbox` and `remote-sandbox.json` of the run). Equal `policyHash` means the same policy; equal `planHash`
+   means the same computed mounts. A `planHash` depends on the state of the working folder (for example the
+   placeholders the sandbox leaves for protected entries such as `.git/hooks` on a first launch), so compare after both
+   sessions have launched at least once in a checkout.
 
 ### Example policy (illustrative; adapt to your environment)
 
@@ -509,6 +548,8 @@ directory. Existing evidence is retained; enforcement is unaffected.
 /sandbox deny remove <path>  allow writes to a path again
 /sandbox deny reset          drop your changes and restore the packaged defaults
 /sandbox rules               open the write-denied paths editor
+/sandbox workspace           show the working folder, agent dir, policy path, policyHash and planHash
+/sandbox check <path>        read / write / exec decision and reason for a path (same evaluator as the tools)
 ```
 
 Sandbox status is not displayed in the footer. Use `/sandbox` to inspect the
