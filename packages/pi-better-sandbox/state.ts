@@ -22,14 +22,18 @@ import {
     type ReadConfinementSeams,
 } from "./shared-read-confinement.ts";
 import { homedir, tmpdir } from "node:os";
-import { dirname, isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { formatWorkspace, type AccessVerdict, type PathCheck, type WorkspaceInfo } from "./workspace.ts";
 import { fileURLToPath } from "node:url";
 import { createTaskScratch, ensureHarnessRuntimeDirectories, harnessRuntimeDirectories, runtimeCodeRoot, writableRuntimeAlias } from "./shared-task-sandbox.ts";
 
 import { parseSandboxPermissions, type SandboxPermissionSettings, type SandboxPermissionProfile, type SubagentToolSettings } from "./permissions.ts";
 import {
     canonicalizePath,
+    compileWritePolicy,
     describeSandboxSupport,
+    evaluateReadAccess,
+    evaluateWriteAccess,
     hasProcessReadConfinement,
     publishProcessReadConfinement,
     READ_CONFINEMENT_POLICY_ENV,
@@ -236,12 +240,74 @@ export class ForegroundSandboxController {
 
     /** Human-readable audit of the latest read-confinement plan, for the diagnostics command. */
     readConfinementReport(): string {
+        const workspace = formatWorkspace(this.workspaceInfo()) + "\n\n";
         const c = this.#confinement;
-        if (c && "failure" in c) return `Read confinement: refused. ${c.failure.message}`;
+        if (c && "failure" in c) return `${workspace}Read confinement: refused. ${c.failure.message}`;
         if (!c || !("plan" in c)) {
-            return "Read confinement: no plan computed in this session. It applies to Linux bubblewrap with Outside project = Off and a configured policy file (PI_SANDBOX_READ_CONFINEMENT_POLICY or the sandboxReadConfinement setting).";
+            return workspace + "Read confinement: no plan computed in this session. It applies to Linux bubblewrap with Outside project = Off and a configured policy file (PI_SANDBOX_READ_CONFINEMENT_POLICY, or the sandboxReadConfinement setting in the agent dir's settings.json).";
         }
-        return formatReadConfinementAudit(c.plan.audit, c.plan.hash) + "\n  (computed once at session start and frozen; later symlink or .git changes apply to the next session)";
+        return workspace + formatReadConfinementAudit(c.plan.audit, c.plan.hash) + "\n  (computed once at session start and frozen; later symlink or .git changes apply to the next session)";
+    }
+
+    /** The active workspace: working folder, agent dir, policy location and the hashes to compare with another session. */
+    workspaceInfo(): WorkspaceInfo {
+        const base = { cwd: this.#projectRoot, agentDir: getAgentDir() };
+        const c = this.#confinement;
+        if (!c || "none" in c) return { ...base, confinement: "unconfigured" };
+        if ("failure" in c) return { ...base, confinement: "failed", note: c.failure.message };
+        const record = this.readConfinementRecord();
+        return {
+            ...base, confinement: record?.active ? "active" : "not-in-force",
+            policyPath: c.loaded.source, policyHash: c.loaded.sha256, planHash: c.plan.hash,
+            ...(record && !record.active ? { note: record.reason } : {}),
+        };
+    }
+
+    /**
+     * What the confined session may do with `target`: the same evaluators the in-process tools use
+     * (and whose allow set is the kernel mount plan), plus the reason for the decision.
+     */
+    checkPath(target: string): PathCheck {
+        const status = this.status();
+        const base = this.#projectRoot ?? process.cwd();
+        const expanded = target === "~" ? (this.#seams.home ?? homedir)() : target.startsWith("~/") ? join((this.#seams.home ?? homedir)(), target.slice(2)) : target;
+        const input = resolve(base, expanded);
+        const path = canonicalizePath(input, this.#seams);
+        const blocked = (reason: string): PathCheck => {
+            const verdict: AccessVerdict = { allowed: false, reason };
+            return { input: target, path, read: verdict, write: verdict, exec: verdict, note: reason };
+        };
+        if (status.state === "inactive" || status.state === "disabled") {
+            const open: AccessVerdict = { allowed: true, reason: "the sandbox is not enforcing for this session (unrestricted)" };
+            return { input: target, path, read: open, write: open, exec: open, note: `sandbox ${status.state}: ${status.reason}` };
+        }
+        let plan: ForegroundSandboxLaunchPlan;
+        try { plan = this.requireLaunchPlan(); } catch (error) { return blocked(error instanceof Error ? error.message : String(error)); }
+        if (!plan.confined) return blocked("no confined launch plan");
+        const policy = compileWritePolicy(plan.policy, this.#seams);
+        const read = evaluateReadAccess(path, policy, this.#seams);
+        const write = evaluateWriteAccess(path, policy, this.#seams);
+        const mounts = plan.policy.readConfinement;
+        const c = this.#confinement;
+        const audit = c && "plan" in c ? c.plan.audit : undefined;
+        const bind = audit?.binds.filter((b) => path === b.path || path.startsWith(b.path.endsWith(sep) ? b.path : b.path + sep))
+            .sort((a, b) => b.path.length - a.path.length)[0];
+        const root = status.writableRoot;
+        const inProject = root !== undefined && (path === root || path.startsWith(root + sep));
+        const readVerdict: AccessVerdict = read.allowed
+            ? { allowed: true, reason: bind ? `${bind.mode === "rw" ? "read-write" : "read-only"} mount: ${bind.reason} (${bind.path})`
+                : inProject ? "inside the working folder" : mounts ? "system runtime root" : "allowed by the Outside project permission" }
+            : { allowed: false, reason: mounts ? "not mounted: outside the working folder, runtime roots and approved or bound locations (the kernel reports No such file or directory)" : `${read.reason} (permission)` };
+        const writeVerdict: AccessVerdict = write.allowed
+            ? { allowed: true, reason: inProject ? "inside the writable working folder" : bind ? `writable mount: ${bind.reason}` : "allowed by the file permissions (private scratch or a writable location)" }
+            : { allowed: false, reason: `${write.reason}${"deniedBy" in write && write.deniedBy ? ` by ${write.deniedBy}` : ""}${read.allowed ? " (readable but not writable)" : ""}` };
+        const commands = status.permissions?.commands !== false;
+        const tool = audit?.syntheticPath?.tools.find((t) => t.target === path);
+        const exec: AccessVerdict = !commands ? { allowed: false, reason: "Run commands & applications is Off" }
+            : !read.allowed ? { allowed: false, reason: "not mounted, so it cannot be executed" }
+            : tool ? { allowed: true, reason: `approved tool ${tool.name} on the synthetic PATH` }
+            : { allowed: true, reason: "readable, so runnable by absolute path (approval only controls PATH lookups)" };
+        return { input: target, path, read: readVerdict, write: writeVerdict, exec };
     }
 
     #dropConfinement(): void {
