@@ -9,7 +9,8 @@
 import type { CallbackBatchEvent, UrgentCallbackEvent } from "./shared-callback-batcher.ts";
 import { activeFailures, pendingAttentionNote, pendingAttentionRows, requiresAction, terminalFailureParts,
     type FailureState } from "./shared-failure-observations.ts";
-import type { RunMeta } from "./registry.ts";
+import { steerDirFor, type RunMeta } from "./registry.ts";
+import { formatUndeliveredSteerNote, steerQueueStatus } from "./steer-queue.ts";
 import { describeTiming } from "./timing.ts";
 
 export function runLabel(meta: Pick<RunMeta, "id" | "name">): string {
@@ -46,6 +47,9 @@ export function completionCallbackFields(meta: RunMeta, state: FailureState, inc
     const { failureRows, incidentCount, notes } = terminalFields(state, incidents);
     // Harness timing reason (deadline / ceiling / stuck) is a lifecycle fact, shown next to the status.
     const timing = describeTiming({ ...meta, status: meta.status });
+    // A steer still without a receipt at run end is reported, never dropped silently.
+    const steer = formatUndeliveredSteerNote(steerQueueStatus(steerDirFor(meta.id)));
+    const decision = [...notes, steer].filter(Boolean).join(" ");
     return {
         source: "subagent",
         id: meta.id,
@@ -54,7 +58,7 @@ export function completionCallbackFields(meta: RunMeta, state: FailureState, inc
         detailTool: "subagent_result",
         outcome: meta.status,
         failureRows,
-        ...(notes.length ? { decision: notes.join(" ") } : {}),
+        ...(decision ? { decision } : {}),
         incidentCount,
     };
 }

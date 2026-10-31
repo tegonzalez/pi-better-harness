@@ -43,9 +43,11 @@ import {
     inspectRunMeta,
     logPathFor,
     originOf,
+    steerDirFor,
     type RunCallbackOrigin,
     type RunMeta,
 } from "./registry.ts";
+import { steerRevisionFacts } from "./steer-queue.ts";
 import {
     actionableFailures,
     failureJournalFingerprint,
@@ -189,7 +191,10 @@ export function ownership(meta: RunMeta, origin: RunCallbackOrigin, parentPid = 
     return recorded ? "foreign" : "unavailable";
 }
 
-/** Lifecycle metadata and log identity. A metadata-only transition is a change. */
+/**
+ * Lifecycle metadata, steer requests and receipts, and log identity. A metadata-only
+ * transition, a newly queued steer, and a steer delivery are each a change.
+ */
 function contentRevisionFor(id: string, meta: RunMeta): string {
     return lifecycleContentRevision([
         meta.status,
@@ -198,6 +203,7 @@ function contentRevisionFor(id: string, meta: RunMeta): string {
         meta.endedAt ?? null,
         meta.lifecycleClassification ?? null,
         meta.failureReason ?? null,
+        steerRevisionFacts(steerDirFor(id)),
     ], logPathFor(id));
 }
 
@@ -838,8 +844,9 @@ export function listIncidentLabel(id: string, cwd: string, terminal: boolean): s
 }
 
 /**
- * Status revisions for a list: every row's lifecycle facts (content) and
- * every row's full failure signature (failure-only changes).
+ * Status revisions for a list: every row's lifecycle facts and steer
+ * requests/receipts (content) and every row's full failure signature
+ * (failure-only changes).
  */
 export function listRevisions(
     items: Array<{ id: string; status: string; meta?: RunMeta }>,
@@ -852,6 +859,7 @@ export function listRevisions(
             item.meta?.status ?? null,
             item.meta?.exitCode ?? null,
             item.meta?.endedAt ?? null,
+            steerRevisionFacts(steerDirFor(item.id)),
         ])),
         failureRevision: revisionOf(items.map((item, index) => [item.id, failureSignatures[index] ?? ""])),
     };

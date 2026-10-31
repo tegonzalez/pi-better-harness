@@ -5,6 +5,9 @@
 Accepted, 2026-09-27. Amended to disable wall-clock limits by default while
 retaining default-on stall detection.
 
+Superseded in part by [ADR 0005](0005-parent-mid-run-steering.md): the steer
+request file is replaced by a per-run steer queue with per-request receipts.
+
 ## Problem
 
 An orchestrator's 30-minute attempt limit was written into its prompt and enforced by nothing. In fmm session `01a0e22e`, run `sa_mujphiql_10`, the parent noticed only at 38 minutes, stopped the child in the middle of a 20-minute backend test run, and respawned the same brief in the same workspace, discarding in-flight work. The child was progressing (32 edits, 667/667 frontend tests), not stuck. Since #315 a child's own tool errors no longer wake the parent, so nothing woke it at a deadline either.

@@ -94,7 +94,8 @@ is present; without this extension it uses adaptive guidance.
   result (as a `followUp` by default; optional busy steering is described below). The foreground
   is nudged once, at completion — never on a wait/poll loop.
 - **Subagents are autonomous; communication is one-way (parent → child).** The
-  parent front-loads everything the child needs into the spawn; the child runs to
+  parent puts what the child needs into the spawn and may amend it mid-run with
+  [`subagent_steer`](#steering-a-running-subagent); the child runs to
   completion and **returns a result**. There is no mid-task child→parent blocking
   call for a subagent to waste wall-clock on — a child missing a piece of info
   resolves it from what it was given, or records it unavailable and returns.
@@ -129,8 +130,9 @@ thresholds continue to take precedence for subagent health.
 
 ## Steering a running subagent
 
-`subagent_steer` sends a running child one more instruction, for example "MTP
-is now a hard requirement", without stopping or respawning it.
+`subagent_steer` sends a running child one more instruction, for example "Treat
+the format requirement as mandatory; drop candidates that fail it.", without
+stopping or respawning it.
 
 - **Delivery.** The child receives it as an ordinary user message, prefixed
   `Instruction amendment from your parent:`, at its next turn boundary: after
@@ -142,18 +144,21 @@ is now a hard requirement", without stopping or respawning it.
 - **Acknowledgement.** The tool returns at once with `queued` and a steer id;
   that is not delivery. `subagent_list` rows show `steer: N delivered, M pending`;
   `subagent_output` and `subagent_result` show the counts, the pending ids, and
-  the last delivery time. If a steer is still undelivered when the run ends,
-  `subagent_result` says `NOT delivered` with its id; it is never dropped silently.
+  the last delivery time. If a steer still has no delivery receipt when the run
+  ends, `subagent_result` and the completion callback say `NOT delivered` with
+  its id; it is never dropped silently. Status cursors change when a steer is
+  queued and when it is delivered.
 - **Idle child.** A child runs one prompt and exits when its agent loop
   settles. If that has already happened, the tool says the steer may not be
   delivered.
 - **Mechanics.** Each request is its own file in the run's `steer/` queue
-  directory. The harness extension in the child picks pending requests up
+  directory (passed to the child as `PI_SUBAGENT_STEER_DIR`). The harness extension in the child picks pending requests up
   (polled every 2 s and at each turn end), hands them to Pi's steering queue in
   order, once each, and writes a per-request receipt when the message enters
   the conversation. The soft-deadline wrap-up uses the same queue. The receipt
   matches the message's exact text, so if another extension rewrites user
-  input, the steer keeps showing as pending even after it arrived.
+  input, the steer keeps showing as pending even after it arrived. See
+  [ADR 0005](adr/0005-parent-mid-run-steering.md).
 
 ## Finding a saved conversation
 

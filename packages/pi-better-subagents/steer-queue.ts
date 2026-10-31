@@ -151,6 +151,18 @@ export function steerQueueStatus(dir: string): SteerQueueStatus {
     return { requests, pending, delivered: receipts.size, lastDeliveredAt, receipts };
 }
 
+/**
+ * Steer facts for a status-cursor content revision: each request id with its
+ * receipt (id and time) or null while pending. A newly queued steer and a
+ * pending → delivered transition both change it; an empty queue is [].
+ */
+export function steerRevisionFacts(dir: string): Array<[string, string | null, number | null]> {
+    return listSteerRequests(dir).map((request) => {
+        const receipt = readSteerReceipt(dir, request);
+        return [request.id, receipt?.id ?? null, receipt?.at ?? null];
+    });
+}
+
 /** Compact list-row token, or "" when the run was never steered. */
 export function formatSteerShort(status: SteerQueueStatus, running: boolean): string {
     if (status.requests.length === 0) return "";
@@ -168,5 +180,13 @@ export function formatSteerLine(status: SteerQueueStatus, running: boolean): str
     if (pending === 0) return `Steer: ${delivered}, 0 pending.`;
     const ids = status.pending.map((r) => r.id).join(", ");
     if (running) return `Steer: ${delivered}, ${pending} pending (${ids}) — delivered at the child's next turn boundary.`;
-    return `Steer: ${delivered}; ${pending} NOT delivered — the child ended before ${pending === 1 ? "it was" : "they were"} delivered (${ids}).`;
+    return `Steer: ${delivered}; ${pending} NOT delivered — no delivery receipt when the run ended (${ids}).`;
+}
+
+/** Completion-callback note for steers without a receipt at run end, or undefined when none. */
+export function formatUndeliveredSteerNote(status: SteerQueueStatus): string | undefined {
+    const pending = status.pending.length;
+    if (pending === 0) return undefined;
+    const ids = status.pending.map((r) => r.id).join(", ");
+    return `${pending} steer${pending === 1 ? "" : "s"} NOT delivered (no delivery receipt): ${ids}.`;
 }

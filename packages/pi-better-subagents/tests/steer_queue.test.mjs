@@ -17,12 +17,16 @@ import {
     enqueueSteer,
     formatSteerLine,
     formatSteerShort,
+    formatUndeliveredSteerNote,
     listSteerRequests,
     readSteerReceipt,
     receiptForId,
     steerQueueStatus,
+    steerRevisionFacts,
     writeSteerReceipt,
 } from "../steer-queue.ts";
+import { completionCallbackFields } from "../callback-fields.ts";
+import { emptyFailureState } from "../shared-failure-observations.ts";
 import childSteer from "../child-steer.ts";
 import { writeMeta, runDir, logPathFor, steerDirFor } from "../registry.ts";
 import { subagentListTool, subagentOutputTool, subagentResultTool, subagentSteerTool } from "../tools.ts";
@@ -31,6 +35,7 @@ const TypeStub = { Object: (v) => v, String: (v) => v, Number: (v) => v, Boolean
 const ORIGIN = { cwd: "/tmp", sessionId: "steer-session" };
 const SESSION = { getActiveOrigin: () => ORIGIN };
 const textOf = (result) => result.content.map((c) => c.text ?? "").join("\n");
+const statusCursorOf = (body) => body.match(/\bstatusCursor=(\S+)/)?.[1];
 
 const dirs = [];
 function tempDir() {
@@ -112,7 +117,7 @@ describe("steer queue files", () => {
         assert.equal(formatSteerShort(status, true), "steer: 2 delivered, 1 pending");
         assert.equal(formatSteerShort(status, false), "steer: 2 delivered, 1 UNDELIVERED");
         assert.match(formatSteerLine(status, true), /2 delivered \(last 1970-01-01T00:00:07\.000Z\), 1 pending \(c\) — delivered at the child's next turn boundary/);
-        assert.match(formatSteerLine(status, false), /2 delivered \(last [^)]+\); 1 NOT delivered — the child ended before it was delivered \(c\)\./);
+        assert.match(formatSteerLine(status, false), /2 delivered \(last [^)]+\); 1 NOT delivered — no delivery receipt when the run ended \(c\)\./);
         assert.equal(formatSteerLine(steerQueueStatus(join(dir, "missing")), true), undefined, "never steered: no line");
     });
 });
@@ -222,7 +227,7 @@ describe("subagent_steer tool", () => {
 
     it("queues a framed amendment for its own running child and returns at once with the steer id", async () => {
         const id = writeRun({ log: [{ type: "agent_start" }] });
-        const result = await tool.execute("tc", { id, message: "MTP is now a hard requirement." });
+        const result = await tool.execute("tc", { id, message: "Treat the format requirement as mandatory; drop candidates that fail it." });
         const body = textOf(result);
         assert.equal(result.details.state, "queued");
         assert.match(result.details.steerId, /^st_/);
@@ -231,7 +236,7 @@ describe("subagent_steer tool", () => {
         assert.doesNotMatch(body, /may not be delivered/);
         const [request] = listSteerRequests(steerDirFor(id));
         assert.equal(request.id, result.details.steerId);
-        assert.equal(request.text, `${PARENT_STEER_PREFIX}\n\nMTP is now a hard requirement.`);
+        assert.equal(request.text, `${PARENT_STEER_PREFIX}\n\nTreat the format requirement as mandatory; drop candidates that fail it.`);
         assert.equal(request.kind, "parent");
     });
 
@@ -278,7 +283,7 @@ describe("steer surfaces", () => {
         ] });
         enqueueSteer(steerDirFor(id), { id: "st_late", text: "too late" });
         const result = textOf(await subagentResultTool(TypeStub, SESSION).execute("tc", { id, max_bytes: 8192 }));
-        assert.match(result, /Steer: 0 delivered; 1 NOT delivered — the child ended before it was delivered \(st_late\)\./);
+        assert.match(result, /Steer: 0 delivered; 1 NOT delivered — no delivery receipt when the run ended \(st_late\)\./);
         assert.match(result, /st_late/);
         const list = textOf(await subagentListTool(TypeStub, SESSION).execute("tc", { max_bytes: 4096 }));
         assert.match(list, new RegExp(`${id}.*steer: 0 delivered, 1 UNDELIVERED`));
@@ -289,5 +294,71 @@ describe("steer surfaces", () => {
         const output = textOf(await subagentOutputTool(TypeStub, SESSION).execute("tc", { id, max_bytes: 4096 }));
         assert.doesNotMatch(output, /Steer:/);
         assert.equal(readFileSync(logPathFor(id), "utf8").includes("agent_start"), true);
+    });
+});
+
+describe("steer status cursors", () => {
+    // A status cursor answers "unchanged" only when nothing the surface reports has changed;
+    // a newly queued steer and a pending -> delivered transition are both changes.
+    const surfaces = [
+        ["subagent_list", (id, cursor) => subagentListTool(TypeStub, SESSION).execute("tc", { cursor, max_bytes: 4096 })],
+        ["subagent_output", (id, cursor) => subagentOutputTool(TypeStub, SESSION).execute("tc", { id, cursor, max_bytes: 4096 })],
+        ["subagent_result", (id, cursor) => subagentResultTool(TypeStub, SESSION).execute("tc", { id, cursor, max_bytes: 8192 })],
+    ];
+    for (const [name, call] of surfaces) {
+        it(`${name}: queueing a steer and delivering it each change the status revision`, async () => {
+            const id = writeRun({ log: [{ type: "agent_start" }] });
+            const dir = steerDirFor(id);
+            const first = textOf(await call(id));
+            const cursor0 = statusCursorOf(first);
+            assert.ok(cursor0, first);
+            const same = textOf(await call(id, cursor0));
+            assert.match(same, /unchanged/, "control: no change answers unchanged");
+
+            const request = enqueueSteer(dir, { id: "st_new", text: "one" });
+            const queued = textOf(await call(id, cursor0));
+            assert.doesNotMatch(queued, /unchanged/, "a newly queued steer is a change");
+            const cursor1 = statusCursorOf(queued);
+            assert.ok(cursor1, queued);
+            assert.notEqual(cursor1, cursor0);
+            assert.match(textOf(await call(id, cursor1)), /unchanged/);
+
+            writeSteerReceipt(dir, request, Date.now());
+            const delivered = textOf(await call(id, cursor1));
+            assert.doesNotMatch(delivered, /unchanged/, "pending -> delivered is a change");
+            if (name === "subagent_list") assert.match(delivered, new RegExp(`${id}.*steer: 1 delivered`));
+            else assert.match(delivered, /Steer: 1 delivered/);
+        });
+    }
+
+    it("revision facts list each request with its receipt id and time, or null while pending", () => {
+        const dir = tempDir();
+        assert.deepEqual(steerRevisionFacts(join(dir, "missing")), []);
+        const a = enqueueSteer(dir, { id: "a", text: "one" });
+        enqueueSteer(dir, { id: "b", text: "two" });
+        writeSteerReceipt(dir, a, 4000);
+        assert.deepEqual(steerRevisionFacts(dir), [["a", "a", 4000], ["b", null, null]]);
+    });
+});
+
+describe("completion callback", () => {
+    const state = emptyFailureState();
+    it("names steers without a delivery receipt at run end", () => {
+        const id = writeRun({ status: "completed" });
+        const dir = steerDirFor(id);
+        const a = enqueueSteer(dir, { id: "st_ok", text: "one" });
+        enqueueSteer(dir, { id: "st_late", text: "two" });
+        writeSteerReceipt(dir, a, Date.now());
+        assert.equal(formatUndeliveredSteerNote(steerQueueStatus(dir)), "1 steer NOT delivered (no delivery receipt): st_late.");
+        const fields = completionCallbackFields({ id, status: "completed", startedAt: Date.now() - 1000, cwd: "/tmp" }, state);
+        assert.match(fields.decision ?? "", /1 steer NOT delivered \(no delivery receipt\): st_late\./);
+    });
+
+    it("adds nothing when every steer was delivered or none was sent", () => {
+        const id = writeRun({ status: "completed" });
+        assert.equal(completionCallbackFields({ id, status: "completed", startedAt: Date.now() - 1000, cwd: "/tmp" }, state).decision, undefined);
+        const dir = steerDirFor(id);
+        writeSteerReceipt(dir, enqueueSteer(dir, { id: "st_ok", text: "one" }), Date.now());
+        assert.equal(completionCallbackFields({ id, status: "completed", startedAt: Date.now() - 1000, cwd: "/tmp" }, state).decision, undefined);
     });
 });

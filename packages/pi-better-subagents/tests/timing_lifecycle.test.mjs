@@ -346,9 +346,10 @@ describe("harness timing: soft deadline", () => {
                 const completion = h.sent.filter((entry) => entry.message.customType === "background-completion-batch");
                 assert.equal(completion.length, 1);
                 assert.match(completion[0].message.content, /status=killed; stopped: deadline/);
+                assert.match(completion[0].message.content, /2 steers NOT delivered \(no delivery receipt\)/, "the completion callback names undelivered steers");
                 const result = (await h.tools.get("subagent_result").execute("x", { id: run.id }, undefined, undefined, h.ctx)).content[0].text;
                 assert.match(result, /Timing: stopped: deadline/);
-                assert.match(result, /Steer: 0 delivered; 2 NOT delivered — the child ended before they were delivered/, "undelivered steers are reported, not dropped");
+                assert.match(result, /Steer: 0 delivered; 2 NOT delivered — no delivery receipt when the run ended/, "undelivered steers are reported, not dropped");
                 const list = (await h.tools.get("subagent_list").execute("x", {}, undefined, undefined, h.ctx)).content[0].text;
                 assert.match(list, new RegExp(`${run.id}.*stopped: deadline`));
                 const output = (await h.tools.get("subagent_output").execute("x", { id: run.id }, undefined, undefined, h.ctx)).content[0].text;
