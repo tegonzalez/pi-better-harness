@@ -30,6 +30,7 @@ import {
     sandboxArgumentCompletions,
 } from "./commands.ts";
 import { createBackgroundAdmission, isBackgroundLaunch } from "./background-admission.ts";
+import { REMOTE_SPAWN_REFUSAL, spawnUsesRemote } from "./remote-spawn.ts";
 import { DenyRuleManager } from "./deny-rules.ts";
 import {
     FOREGROUND_SANDBOX_POLICY_REQUEST_CHANNEL,
@@ -99,6 +100,7 @@ export default function piBetterSandbox(pi: ExtensionAPI): void {
             (launch && Boolean((event.input as { ssh?: unknown }).ssh)))) {
             return block("Sandbox: Network access is Off.", "network-access");
         }
+        if (!permissions.network && spawnUsesRemote(name, event.input)) return block(REMOTE_SPAWN_REFUSAL, "network-access");
         if (name === "powershell" || name === "remote_bash") {
             return block(`Sandbox: ${name} is not a confined execution surface; use bash (including ssh through bash).`, "tool-admission");
         }

@@ -1,3 +1,4 @@
+import { nonTempBase } from "./support/fixture-base.ts";
 import assert from "node:assert/strict";
 import {
     existsSync,
@@ -1566,10 +1567,12 @@ test("completions cover activation defaults and deny actions", () => {
     );
 });
 
-test("the launch audit entry is appended through pi.appendEntry with {active, profile, policyHash, planHash}", async () => {
+test("the launch audit entry is appended through pi.appendEntry with {active, profile, policyHash, planHash}", async (t) => {
     forgetSandboxPreference();
-    // Outside the project and every temp directory, as the policy file must be.
-    const policyDir = mkdtempSync(join(packageRoot, "test", ".rc-policy-"));
+    // Outside the project and every temp directory, as the policy file must be: an explicit base, not the checkout.
+    const base = nonTempBase(packageRoot);
+    if (!base) { t.skip("no writable fixture base outside the temp directories (set PI_SANDBOX_TEST_NON_TEMP_BASE)"); return; }
+    const policyDir = mkdtempSync(join(base, ".pi-rc-policy-"));
     const policyFile = join(policyDir, "policy.json");
     writeFileSync(policyFile, JSON.stringify({ version: 1 }));
     const previous = process.env[READ_CONFINEMENT_POLICY_ENV];
@@ -1599,4 +1602,24 @@ test("the launch audit entry is appended through pi.appendEntry with {active, pr
         if (previous === undefined) delete process.env[READ_CONFINEMENT_POLICY_ENV]; else process.env[READ_CONFINEMENT_POLICY_ENV] = previous;
         rmSync(policyDir, { recursive: true, force: true });
     }
+});
+
+test("with Network access Off, a remote or resumed subagent spawn is refused and a local one is not", async () => {
+    forgetSandboxPreference();
+    const settings = defaultSandboxPermissions();
+    settings.main.enabled = true;
+    settings.main.commands = true;
+    settings.main.network = false;
+    writePermissionSettings(settings);
+    const recorded = record();
+    piBetterSandbox(recorded.pi);
+    const started = await startSession(recorded, project("remote-spawn-gate"), "startup", false, false);
+    const call = recorded.handlers.get("tool_call")!;
+    for (const [toolName, input] of [["subagent_spawn", { prompt: "x", remote: "any" }], ["subagent_spawn", { prompt: "x", resume: "run-1" }],
+        ["subagent_spawn_batch", { jobs: [{ prompt: "x", remote: "any" }] }]] as const) {
+        const result = call({ toolName, input }, started.ctx) as { block?: boolean; reason?: string } | undefined;
+        assert.equal(result?.block, true, `${toolName} ${JSON.stringify(input)}`);
+        assert.match(result?.reason ?? "", /Network access is Off.*remote/);
+    }
+    assert.equal(call({ toolName: "subagent_spawn", input: { prompt: "x" } }, started.ctx), undefined);
 });

@@ -30,8 +30,10 @@ import { parseSandboxPermissions, type SandboxPermissionSettings, type SandboxPe
 import {
     canonicalizePath,
     describeSandboxSupport,
+    hasProcessReadConfinement,
     publishProcessReadConfinement,
     READ_CONFINEMENT_POLICY_ENV,
+    type ReadConfinementMounts,
     type SandboxBackendId,
     type SandboxWritePolicy,
 } from "./shared-sandbox-core.ts";
@@ -102,6 +104,18 @@ export class ForegroundSandboxBlockedError extends Error {
         this.name = "ForegroundSandboxBlockedError";
         this.status = status;
     }
+}
+
+/** The part of a plan that launchers and in-process tools need (not the audit). */
+function confinementMounts(plan: ReadConfinementPlan): ReadConfinementMounts {
+    return {
+        args: plan.args, readRoots: plan.readRoots, writeRoots: plan.writeRoots,
+        ...(plan.project !== undefined && { project: plan.project }),
+        ...(plan.envAllow && { envAllow: plan.envAllow }),
+        ...(plan.pathValue !== undefined && { pathValue: plan.pathValue }),
+        ...(plan.denyWrite && { denyWrite: plan.denyWrite }),
+        ...(plan.overlayArgs && { overlayArgs: plan.overlayArgs }),
+    };
 }
 
 /** Seams for the Linux read-confinement mode (policy source, planning, clock). */
@@ -234,8 +248,12 @@ export class ForegroundSandboxController {
         const c = this.#confinement;
         if (c && "plan" in c && c.plan.syntheticDir) rmSync(c.plan.syntheticDir, { recursive: true, force: true });
         this.#confinement = undefined;
-        publishProcessReadConfinement(undefined);
-        if (this.#envMarker) { delete process.env[READ_CONFINEMENT_POLICY_ENV]; this.#envMarker = false; }
+        // Only this controller's slot: another live controller keeps its own plan in force.
+        publishProcessReadConfinement(undefined, this);
+        if (this.#envMarker) {
+            if (!hasProcessReadConfinement()) delete process.env[READ_CONFINEMENT_POLICY_ENV];
+            this.#envMarker = false;
+        }
     }
 
     /**
@@ -256,7 +274,7 @@ export class ForegroundSandboxController {
         } catch (error) {
             const failure = new Error(`Read confinement failed closed: ${error instanceof Error ? error.message : String(error)}`);
             this.#confinement = { project, failure };
-            publishProcessReadConfinement({ state: "failed", reason: failure.message });
+            publishProcessReadConfinement({ state: "failed", reason: failure.message }, this);
             return;
         }
         if (!loaded) { this.#confinement = { project, none: true }; return; }
@@ -266,16 +284,27 @@ export class ForegroundSandboxController {
             this.#envMarker = true;
         }
         try {
-            const plan = planReadConfinement(loaded, project, { home: (this.#seams.home ?? homedir)(), agentId: "main", ...rc.plan });
+            const plan = planReadConfinement(loaded, project, {
+                home: (this.#seams.home ?? homedir)(), agentId: "main",
+                extraWritableRoots: this.#otherWritableRoots(), ...rc.plan,
+            });
             this.#confinement = { project, loaded, plan };
-            publishProcessReadConfinement({ state: "active", mounts: plan });
+            publishProcessReadConfinement({ state: "active", mounts: confinementMounts(plan) }, this);
             this.#lastAuditHash = plan.hash;
             try { this.#onConfinementPlan?.(plan); } catch { /* an audit-write failure must not widen or block access */ }
         } catch (error) {
             const failure = error instanceof Error ? error : new Error(String(error));
             this.#confinement = { project, failure };
-            publishProcessReadConfinement({ state: "failed", reason: failure.message });
+            publishProcessReadConfinement({ state: "failed", reason: failure.message }, this);
         }
+    }
+
+    /** Writable locations of every active profile besides the project: the policy file must not live there. */
+    #otherWritableRoots(): string[] {
+        const roots = [...harnessRuntimeDirectories()];
+        const profiles = this.#permissions ? [this.#permissions.main, this.#permissions.subagents] : [];
+        if (profiles.some((p) => p.outsideProject === "write")) roots.push((this.#seams.home ?? homedir)());
+        return roots;
     }
 
     #readConfinement(project: string): ReadConfinementPlan | undefined {
@@ -507,7 +536,7 @@ export class ForegroundSandboxController {
         if (status.permissions?.outsideProject === "off" && status.backend === "linux-bubblewrap") {
             const confinement = this.#readConfinement(status.writableRoot);
             if (confinement) {
-                policy.readConfinement = { args: confinement.args, readRoots: confinement.readRoots, writeRoots: confinement.writeRoots };
+                policy.readConfinement = confinementMounts(confinement);
             }
         }
         return { confined: true, policy, profilePath: this.#profilePathFor(policy) };
