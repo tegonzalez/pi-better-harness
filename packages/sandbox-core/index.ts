@@ -82,7 +82,54 @@ export type ReadConfinementMounts = {
     args: readonly string[];
     readRoots: readonly string[];
     writeRoots: readonly string[];
+    /** Canonical project the plan was computed for; a policy for another project is refused. */
+    project?: string;
+    /** Environment variable names the confined child may inherit (everything else is cleared). */
+    envAllow?: readonly string[];
+    /** Value forced for PATH (the synthetic approved-tools directory). */
+    pathValue?: string;
 };
+
+/** Environment variable naming the read-confinement policy file. Its presence means a profile requires confinement. */
+export const READ_CONFINEMENT_POLICY_ENV = "PI_SANDBOX_READ_CONFINEMENT_POLICY";
+
+/**
+ * Process-wide read-confinement state. The plan is computed once at launch (see
+ * `pi-better-sandbox`) and published here so every actor in this process that
+ * launches sandboxed commands (foreground, background tasks, task runtime,
+ * subagent launches) applies the same frozen plan, or fails closed. The slot
+ * lives on `globalThis` because each package vendors its own copy of this module.
+ */
+export type ProcessReadConfinement =
+    | { readonly state: "active"; readonly mounts: ReadConfinementMounts }
+    | { readonly state: "failed"; readonly reason: string };
+const PROCESS_READ_CONFINEMENT = Symbol.for("pi-better-harness.sandbox-core.read-confinement");
+
+export function publishProcessReadConfinement(entry: ProcessReadConfinement | undefined): void {
+    (globalThis as Record<symbol, unknown>)[PROCESS_READ_CONFINEMENT] = entry && Object.freeze(entry);
+}
+
+export function processReadConfinement(): ProcessReadConfinement | undefined {
+    return (globalThis as Record<symbol, ProcessReadConfinement | undefined>)[PROCESS_READ_CONFINEMENT];
+}
+
+/**
+ * The child environment for a read-confined launch: only allowlisted names from
+ * `env`, with PATH forced to the synthetic approved-tools directory. Callers that
+ * pass an environment through the wrapped command (for example `env -i K=V`) must
+ * filter it with this, or the bubblewrap `--clearenv` is undone from inside.
+ */
+export function confinedEnvironment(
+    mounts: Pick<ReadConfinementMounts, "envAllow" | "pathValue"> | undefined,
+    env: Readonly<Record<string, string | undefined>>,
+): Record<string, string | undefined> {
+    if (!mounts) return { ...env };
+    const allowed = new Set(mounts.envAllow ?? []);
+    const out: Record<string, string | undefined> = {};
+    for (const [key, value] of Object.entries(env)) if (allowed.has(key) && value !== undefined) out[key] = value;
+    if (mounts.pathValue !== undefined) out.PATH = mounts.pathValue;
+    return out;
+}
 
 /** Whether a file access level allows creating and overwriting files. */
 export function canWrite(mode: SandboxFileAccess | undefined): boolean {
@@ -240,6 +287,8 @@ export type SandboxRequest = {
 export type SandboxSeams = {
     /** Defaults to `os.platform()`. */
     platform?: () => string;
+    /** Environment read for the read-confinement allowlist. Defaults to `process.env`. */
+    env?: NodeJS.ProcessEnv;
     /** Defaults to a PATH scan that stats and access-checks without executing. */
     lookupExecutable?: (name: string) => string | undefined;
     /**
@@ -482,6 +531,7 @@ function compile(
             ? [resolve(entry), ...symlinkHops(entry), canonicalizePath(entry, seams)] : [canonicalizePath(entry, seams)])),
     ].sort();
 
+    const readConfinement = effectiveReadConfinement(policy, writableRoot, seams);
     const broadMode = isBroadWritePermissions(policy.permissions);
     const compatibilityWrite = broadMode ? [] : compatibilityPaths(policy, seams);
     const runtimeWrite = [...new Set([
@@ -490,11 +540,14 @@ function compile(
     ])];
     return {
         writableRoot, denyWrite, home: policy.home,
-        ...(policy.readConfinement && policy.permissions?.outsideProject === "off" && {
+        ...(readConfinement && {
             readConfinement: {
-                args: [...policy.readConfinement.args],
-                readRoots: policy.readConfinement.readRoots.map((path) => canonicalizePath(path, seams)),
-                writeRoots: policy.readConfinement.writeRoots.map((path) => canonicalizePath(path, seams)),
+                args: [...readConfinement.args],
+                readRoots: readConfinement.readRoots.map((path) => canonicalizePath(path, seams)),
+                writeRoots: readConfinement.writeRoots.map((path) => canonicalizePath(path, seams)),
+                ...(readConfinement.project !== undefined && { project: readConfinement.project }),
+                ...(readConfinement.envAllow && { envAllow: [...readConfinement.envAllow] }),
+                ...(readConfinement.pathValue !== undefined && { pathValue: readConfinement.pathValue }),
             },
         }),
         ...(policy.permissions && {
@@ -507,6 +560,37 @@ function compile(
             broad: compileBroadWrite(policy, writableRoot, runtimeWrite, seams),
         }),
     };
+}
+
+/**
+ * The read-confinement mounts that apply to `policy`: its own, else the process
+ * plan published at launch. Required whenever `outsideProject` is `off` and a
+ * policy file is configured (`READ_CONFINEMENT_POLICY_ENV` or a published plan):
+ * when it cannot be applied (no plan, failed plan, other project, non-Linux
+ * backend) the launch is refused rather than run with host-wide reads.
+ */
+function effectiveReadConfinement(
+    policy: SandboxWritePolicy,
+    writableRoot: string,
+    seams: SandboxSeams,
+): ReadConfinementMounts | undefined {
+    if (policy.permissions?.outsideProject !== "off") return undefined;
+    const published = processReadConfinement();
+    const required = policy.readConfinement !== undefined || published !== undefined ||
+        Boolean(process.env[READ_CONFINEMENT_POLICY_ENV]);
+    if (!required) return undefined;
+    if (currentPlatform(seams) !== "linux") {
+        throw new Error("Read confinement is required by the configured policy but is only implemented for Linux bubblewrap; this launch was refused.");
+    }
+    if (policy.readConfinement) return policy.readConfinement;
+    if (published?.state === "failed") throw new Error(`Read confinement failed closed: ${published.reason}`);
+    if (!published) {
+        throw new Error("Read confinement is required by the configured policy but this process has no launch plan; this launch was refused.");
+    }
+    if (published.mounts.project !== undefined && published.mounts.project !== writableRoot) {
+        throw new Error(`Read confinement plan was computed for ${published.mounts.project}, not ${writableRoot}; this launch was refused.`);
+    }
+    return published.mounts;
 }
 
 /** True when a permission profile selects the broad-write profile. */
@@ -588,7 +672,7 @@ function unresolvable(path: string): boolean {
     try { statSync(path); return false; } catch { return true; }
 }
 
-function broadCredentialPaths(home: string, seams: SandboxSeams): string[] {
+export function broadCredentialPaths(home: string, seams: SandboxSeams): string[] {
     const configuredAgentDir = process.env.PI_CODING_AGENT_DIR;
     return [...new Set([
         ...credentialFilePaths(home, seams),
@@ -1290,8 +1374,14 @@ function buildLinuxPermissionCommand(
     if (permissions.outsideProject !== "off" && permissions.projectFiles === "off") {
         throw new Error("Linux bubblewrap cannot hide a project inside a visible outsideProject root.");
     }
-    const mounts: string[] = permissions.outsideProject === "off" ? ["--tmpfs", "/"]
-        : [permissions.outsideProject === "read" ? "--ro-bind" : "--bind", "/", "/"];
+    const confined = policy.readConfinement !== undefined && permissions.outsideProject === "off";
+    // Read confinement: no inherited environment (keys and tokens), a private PID
+    // namespace so same-uid host processes cannot be signalled, and a new session
+    // so the child cannot inject input into the controlling terminal. /proc is not
+    // mounted, so nothing needs it and none is exposed.
+    const mounts: string[] = confined ? ["--clearenv", "--unshare-pid", "--new-session"] : [];
+    mounts.push(...(permissions.outsideProject === "off" ? ["--tmpfs", "/"]
+        : [permissions.outsideProject === "read" ? "--ro-bind" : "--bind", "/", "/"]));
     if (permissions.outsideProject === "off") {
         // Bounded system executable/library roots only. /tmp is private, not a
         // host bind: otherwise outsideProject=off would expose user temp data.
@@ -1309,7 +1399,14 @@ function buildLinuxPermissionCommand(
         mounts.push(permissions.outsideProject === "read" && !policy.compatibilityWrite?.includes(canonicalizePath("/tmp", seams)) ? "--ro-bind" : "--bind", "/tmp", "/tmp");
     }
     mounts.push("--dev", "/dev");
-    if (policy.readConfinement && permissions.outsideProject === "off") mounts.push(...policy.readConfinement.args);
+    if (policy.readConfinement && permissions.outsideProject === "off") {
+        mounts.push(...policy.readConfinement.args);
+        // Only allowlisted names are copied into the cleared environment; PATH is the plan's.
+        const env = confinedEnvironment(policy.readConfinement, seams.env ?? process.env);
+        for (const [name, value] of Object.entries(env)) {
+            if (name !== "PATH" && value !== undefined && !value.includes("\0")) mounts.push("--setenv", name, value);
+        }
+    }
     const scopedMounts: { option: "--bind" | "--ro-bind"; path: string }[] = [];
     const writableAncestors = new Set<string>();
     const readOnlyGuards = new Set<string>();
