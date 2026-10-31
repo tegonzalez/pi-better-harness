@@ -693,7 +693,9 @@ export function planReadConfinement(
         return worktree !== undefined && realOrUndefined(resolve(gitdir, worktree)) === project;
     };
     /** Alternates are read grants: each target must be a git object dir and pass the deny rules, or the plan fails closed. */
-    const checkAlternates = (objectsDir: string): void => {
+    const readOnlyReal = (): string[] => (policy.readOnly ?? []).map((entry) => realOrUndefined(resolve(entry))).filter((entry): entry is string => entry !== undefined);
+    /** `within`: a git dir the agent did not own (nested modules): targets must lie inside it or a policy readOnly entry. */
+    const checkAlternates = (objectsDir: string, within?: string): void => {
         const file = join(objectsDir, "info", "alternates");
         for (const line of (readText(file) ?? "").split("\n")) {
             const alt = line.trim();
@@ -701,6 +703,11 @@ export function planReadConfinement(
             const target = resolve(objectsDir, alt);
             const realAlt = realOrUndefined(target);
             if (!realAlt) { skip(target, "alternates entry not found", file); continue; }
+            if (within !== undefined && !contains(within, realAlt) && !readOnlyReal().some((entry) => contains(entry, realAlt))) {
+                const reason = "refused: alternates entry of a nested git directory points outside it and outside policy readOnly";
+                deny(realAlt, reason, file);
+                throw new ReadConfinementError(`${file} lists ${realAlt}: ${reason.replace("refused: ", "")}. Remove the entry, or list the target in the policy readOnly paths.`);
+            }
             const why = denyMatch(realAlt, true);
             const objectDir = isDir(realAlt) && (isFile(join(dirname(realAlt), "HEAD")) || isDir(join(realAlt, "pack")));
             if (why || !objectDir) {
@@ -717,10 +724,19 @@ export function planReadConfinement(
      * (here for the sandbox, and in `denyWrite` for the in-process file tools).
      */
     const guardGitDir = (real: string, label: string, own: string | undefined, depth = 0): void => {
+        // Nothing is written into a git dir the agent can redirect: the boundary itself must not be a link.
+        if (depth > 0) {
+            let link = false;
+            try { link = lstatSync(real).isSymbolicLink(); } catch { /* checked by the caller */ }
+            if (link) {
+                deny(real, "refused: a symbolic link cannot be a nested git directory", label);
+                throw new ReadConfinementError(`${real} is a symbolic link (${label}). Remove it; the sandbox cannot protect a git directory behind a link.`);
+            }
+        }
         for (const g of GIT_GUARDED) {
             addRoOverlay(join(real, g.rel), `${g.rel} of ${label}, read-only`, g.create ? { dir: g.dir, ...(g.content !== undefined && { content: g.content }) } : undefined, real);
         }
-        checkAlternates(join(real, "objects"));
+        checkAlternates(join(real, "objects"), depth > 0 ? realOrUndefined(real) ?? real : undefined);
         // Other worktrees' admin dirs (HEAD, gitdir, commondir, config, hooks ...) belong to them.
         let siblings: string[] = [];
         try { siblings = readdirSync(join(real, "worktrees")); } catch { /* none */ }
@@ -734,6 +750,12 @@ export function planReadConfinement(
         try { modules = readdirSync(join(real, "modules")); } catch { /* none */ }
         for (const name of modules) {
             const module = join(real, "modules", name);
+            let link = false;
+            try { link = lstatSync(join(real, "modules")).isSymbolicLink() || lstatSync(module).isSymbolicLink(); } catch { /* gone */ }
+            if (link) {
+                deny(module, "refused: a symbolic link inside a git directory cannot be protected", `modules of ${label}`);
+                throw new ReadConfinementError(`${module} is (or lies below) a symbolic link inside the git directory ${real}. Remove it; the sandbox cannot protect or create paths below a link.`);
+            }
             if (!isDir(module)) continue;
             if (isFile(join(module, "HEAD"))) guardGitDir(module, `submodule ${name} of ${label}`, undefined, depth + 1);
             else if (isDir(join(module, "modules"))) guardGitDir(module, `submodule ${name} of ${label}`, undefined, depth + 1);

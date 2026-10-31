@@ -271,3 +271,55 @@ describe("planning does not follow symlinks and writes every placeholder", () =>
         }
     });
 });
+
+describe("nested git dirs the agent can create (modules/*)", () => {
+    const tree = (dir: string): string[] => readdirSync(dir, { recursive: true, withFileTypes: true }).map((e) => `${join(e.parentPath, e.name)}:${lstatSync(join(e.parentPath, e.name)).mtimeMs}`).sort();
+    const gitDirOf = (l: ReturnType<typeof layout>, which: "main" | "wt" | "sm") => which === "sm" ? l.smGit : l.common;
+    const projectOf = (l: ReturnType<typeof layout>, which: "main" | "wt" | "sm") => l[which];
+
+    it("a modules/<x> symlink to another repository's git dir is refused before anything is written, in every layout", () => {
+        for (const which of ["main", "wt", "sm"] as const) {
+            const l = layout(`modlink-${which}`);
+            const victim = join(l.base, "lib", ".git");
+            const before = tree(victim);
+            const link = join(gitDirOf(l, which), "modules", "evil");
+            mkdirSync(join(gitDirOf(l, which), "modules"), { recursive: true });
+            symlinkSync(victim, link);
+            assert.throws(() => plan(projectOf(l, which)), (e: Error) => e instanceof ReadConfinementError && /symbolic link/.test(e.message), which);
+            assert.deepEqual(tree(victim), before, `${which}: nothing was written into the other repository`);
+            rmSync(link);
+            // a symlinked modules directory itself is refused the same way
+            const modules = join(gitDirOf(l, which), "modules");
+            const aside = `${modules}.real`;
+            spawnSync("mv", [modules, aside]);
+            symlinkSync(join(l.base, "lib", ".git"), modules);
+            try {
+                assert.throws(() => plan(projectOf(l, which)), ReadConfinementError, `${which}: modules symlink`);
+                assert.deepEqual(tree(victim), before);
+            } finally { rmSync(modules); spawnSync("mv", [aside, modules]); }
+        }
+    });
+
+    it("alternates of a nested git dir: honoured only inside it or inside a policy readOnly entry; otherwise refused with a recorded reason", () => {
+        for (const which of ["main", "wt", "sm"] as const) {
+            const l = layout(`modalt-${which}`);
+            const victim = join(l.base, "lib", ".git", "objects");
+            const mod = join(gitDirOf(l, which), "modules", "evil");
+            mkdirSync(join(mod, "objects", "info"), { recursive: true });
+            mkdirSync(join(mod, "objects", "pack"));
+            mkdirSync(join(mod, "refs"));
+            writeFileSync(join(mod, "HEAD"), "ref: refs/heads/x\n");
+            writeFileSync(join(mod, "objects", "info", "alternates"), `${victim}\n`);
+            const project = projectOf(l, which);
+            assert.throws(() => plan(project), (e: Error) => e instanceof ReadConfinementError && /nested git directory/.test(e.message), which);
+            // Recorded reason: the plan's audit is unavailable on failure; the error names the refused entry. An opt-in lifts it.
+            const ok = plan(project, { readOnly: [join(l.base, "lib", ".git")] });
+            assert.ok(ok.audit.binds.some((b) => b.path === victim), `${which}: honoured through readOnly`);
+            // Inside the same git dir: honoured without any policy entry.
+            writeFileSync(join(mod, "objects", "info", "alternates"), `${join(mod, "objects")}\n`);
+            assert.doesNotThrow(() => plan(project), which);
+            // The victim's objects are not bound without the opt-in.
+            assert.ok(!plan(project).audit.binds.some((b) => b.path === victim));
+        }
+    });
+});
