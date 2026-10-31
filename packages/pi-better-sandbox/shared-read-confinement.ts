@@ -280,6 +280,8 @@ export type ReadConfinementSeams = {
     makeSyntheticDir?: () => string;
     /** Distinguishes persistent caches per agent. */
     agentId?: string;
+    /** Further directories some active profile can write; the policy file must not be inside any of them. */
+    extraWritableRoots?: readonly string[];
 };
 
 export type ReadConfinementAudit = {
@@ -296,6 +298,8 @@ export type ReadConfinementAudit = {
     symlinksFollowed: number;
     /** Environment names the confined child inherits; every other variable is cleared. */
     envAllow: string[];
+    /** Paths inside writable git dirs that stay write-denied (hooks, config, alternates, sibling worktrees, ...). */
+    denyWrite: string[];
 };
 
 export type ReadConfinementPlan = ReadConfinementMounts & {
@@ -394,7 +398,20 @@ function loaderListLibraries(executable: string): string[] {
     return [...libs];
 }
 
-type Bound = { path: string; mode: "ro" | "rw" | "tmpfs"; dir: boolean; reason: string; source?: string };
+type Bound = { path: string; mode: "ro" | "rw" | "tmpfs"; dir: boolean; reason: string; source?: string; late?: boolean };
+
+/** Per git dir: write-denied entries. `create` = an empty node is harmless, so absence is blocked too. */
+const GIT_GUARDED: readonly { rel: string; dir: boolean; create: boolean }[] = [
+    { rel: "hooks", dir: true, create: true },
+    { rel: "config", dir: false, create: true },
+    { rel: "config.worktree", dir: false, create: true },
+    { rel: join("info", "attributes"), dir: false, create: true },
+    { rel: join("objects", "info", "alternates"), dir: false, create: true },
+    { rel: join("objects", "info", "http-alternates"), dir: false, create: true },
+    // An empty node here would change the repository layout, so only an existing one is protected.
+    { rel: "commondir", dir: false, create: false },
+    { rel: "gitdir", dir: false, create: false },
+];
 type ToolSpec = { name: string; lexical: string; implicit: boolean; spec: ReadConfinementTool };
 
 /** Compute the mount plan. Throws `ReadConfinementError` when a cap is hit or the project cannot be confined. */
@@ -482,11 +499,20 @@ export function planReadConfinement(
     };
 
     /** A read-only mount laid over part of a writable bind (hooks, config): never skipped as "already covered". */
-    const addRoOverlay = (path: string, reason: string): void => {
+    const denyWriteSet = new Set<string>();
+    const addRoOverlay = (path: string, reason: string, absent?: { dir: boolean }): void => {
+        denyWriteSet.add(path);
         let info;
-        try { info = statSync(path); } catch { skip(path, "absent, cannot be protected read-only", reason); return; }
+        try { info = statSync(path); } catch {
+            if (!absent) { skip(path, "absent: write denied in-process, creation not blocked in the sandbox", reason); return; }
+            if (denyMatch(path, absent.dir)) return;
+            // Mounting over an absent path makes the sandbox unable to create it. An absent directory
+            // becomes an empty read-only file node (what the packaged deny templates already do).
+            bound.set(path, { path, mode: "ro", dir: false, reason: `${reason}; creation blocked`, source: "/dev/null", late: contains(project, path) });
+            return;
+        }
         if (denyMatch(path, info.isDirectory())) return;
-        bound.set(path, { path, mode: "ro", dir: info.isDirectory(), reason });
+        bound.set(path, { path, mode: "ro", dir: info.isDirectory(), reason, late: contains(project, path) });
     };
 
     const capSymlinks = (): ReadConfinementError => new ReadConfinementError(
@@ -584,25 +610,58 @@ export function planReadConfinement(
         const worktree = /^\s*worktree\s*=\s*(.+)$/m.exec(readText(join(gitdir, "config")) ?? "")?.[1]?.trim();
         return worktree !== undefined && realOrUndefined(resolve(gitdir, worktree)) === project;
     };
-    const bindGitDir = (real: string, via: string): boolean => {
+    /** Alternates are read grants: each target must be a git object dir and pass the deny rules, or the plan fails closed. */
+    const checkAlternates = (objectsDir: string): void => {
+        const file = join(objectsDir, "info", "alternates");
+        for (const line of (readText(file) ?? "").split("\n")) {
+            const alt = line.trim();
+            if (!alt || alt.startsWith("#")) continue;
+            const target = resolve(objectsDir, alt);
+            const realAlt = realOrUndefined(target);
+            if (!realAlt) { skip(target, "alternates entry not found", file); continue; }
+            const why = denyMatch(realAlt, true);
+            const objectDir = isDir(realAlt) && (isFile(join(dirname(realAlt), "HEAD")) || isDir(join(realAlt, "pack")));
+            if (why || !objectDir) {
+                const reason = why ? `refused: alternates entry ${why}` : "refused: alternates entry is not a git object directory";
+                deny(realAlt, reason, file);
+                throw new ReadConfinementError(`${file} lists ${realAlt}: ${reason.replace("refused: ", "")}. Remove the entry or move the repository.`);
+            }
+            bindResolved(target, file, 1, "git alternates (read-only)");
+        }
+    };
+    /**
+     * One write-deny set for a git dir the agent can write. Refs, objects, index, logs and
+     * packed-refs stay writable; everything that would later run code or redirect git is denied
+     * (here for the sandbox, and in `denyWrite` for the in-process file tools).
+     */
+    const guardGitDir = (real: string, label: string, own: string | undefined, depth = 0): void => {
+        for (const g of GIT_GUARDED) {
+            addRoOverlay(join(real, g.rel), `${g.rel} of ${label}, read-only`, g.create ? { dir: g.dir } : undefined);
+        }
+        checkAlternates(join(real, "objects"));
+        // Other worktrees' admin dirs (HEAD, gitdir, commondir, config, hooks ...) belong to them.
+        let siblings: string[] = [];
+        try { siblings = readdirSync(join(real, "worktrees")); } catch { /* none */ }
+        for (const name of siblings) {
+            const sibling = join(real, "worktrees", name);
+            if (own !== undefined && realOrUndefined(sibling) === own) continue;
+            if (isDir(sibling)) addRoOverlay(sibling, `worktree ${name} of ${label}, read-only`);
+        }
+        if (depth >= 4) return;
+        let modules: string[] = [];
+        try { modules = readdirSync(join(real, "modules")); } catch { /* none */ }
+        for (const name of modules) {
+            const module = join(real, "modules", name);
+            if (!isDir(module)) continue;
+            if (isFile(join(module, "HEAD"))) guardGitDir(module, `submodule ${name} of ${label}`, undefined, depth + 1);
+            else if (isDir(join(module, "modules"))) guardGitDir(module, `submodule ${name} of ${label}`, undefined, depth + 1);
+        }
+    };
+    const bindGitDir = (real: string, via: string, own?: string): boolean => {
         if (!addBind(real, "rw", via, dotGit)) return false;
         gitDirs.push(real);
         writeRoots.add(real);
-        // Writes here become host code execution later (hooks, config): keep them read-only.
-        for (const guarded of ["hooks", "config", "config.worktree"]) addRoOverlay(join(real, guarded), `${guarded} of ${via}, read-only`);
-        for (const objects of [join(real, "objects", "info", "alternates")]) {
-            for (const line of (readText(objects) ?? "").split("\n")) {
-                const alt = line.trim();
-                if (!alt || alt.startsWith("#")) continue;
-                const target = resolve(join(real, "objects"), alt);
-                const realAlt = realOrUndefined(target);
-                if (!realAlt || !isDir(realAlt) || !(isFile(join(dirname(realAlt), "HEAD")) || isDir(join(realAlt, "pack")))) {
-                    skip(target, "alternates entry is not a git object directory", objects);
-                    continue;
-                }
-                bindResolved(target, objects, 1, "git alternates (read-only)");
-            }
-        }
+        guardGitDir(real, via, own);
         walk(real, 1);
         return true;
     };
@@ -613,19 +672,23 @@ export function planReadConfinement(
             const real = candidate ? realOrUndefined(candidate) : undefined;
             if (!candidate) skip(dotGit, "no gitdir: line");
             else if (!real) skip(candidate, "git dir not found");
-            else if (contains(project, real)) gitDirs.push(real);
+            else if (contains(project, real)) { gitDirs.push(real); guardGitDir(real, "git dir of the project", undefined); }
             else if (!isFile(join(real, "HEAD"))) deny(real, "refused: .git redirect target is not a git dir (no HEAD)", dotGit);
             else if (!belongsToProject(real)) deny(real, "refused: .git redirect target does not point back to this worktree", dotGit);
-            else if (bindGitDir(real, "git dir of worktree")) {
+            else if (bindGitDir(real, "git dir of worktree", real)) {
                 const commonText = readText(join(real, "commondir"))?.trim();
                 const common = commonText ? realOrUndefined(resolve(real, commonText)) : undefined;
                 if (commonText && !common) skip(resolve(real, commonText), "git common dir not found", real);
                 else if (common && !contains(project, common)) {
                     if (!isFile(join(common, "HEAD")) || !isDir(join(common, "objects")) || !contains(join(common, "worktrees"), real)) {
                         deny(common, "refused: commondir is not the common git dir of this worktree", real);
-                    } else bindGitDir(common, "common git dir of worktree");
+                    } else bindGitDir(common, "common git dir of worktree", real);
                 }
             }
+        }
+        else if (lstatSync(dotGit).isDirectory()) {
+            gitDirs.push(realpathSync.native(dotGit));
+            guardGitDir(realpathSync.native(dotGit), "git dir of the project", undefined);
         }
     } catch (error) {
         if (error instanceof ReadConfinementError) throw error;
@@ -641,7 +704,8 @@ export function planReadConfinement(
     if (isAbsolute(loaded.source)) {
         const realSource = realOrUndefined(loaded.source) ?? loaded.source;
         const scratch = [tmpdir(), "/tmp", "/var/tmp", "/dev/shm"].map((root) => realOrUndefined(root) ?? root);
-        const exposed = [...writeRoots, ...(persistentReal ? [persistentReal] : []), ...scratch].find((root) => contains(root, realSource));
+        const extra = (seams.extraWritableRoots ?? []).map((root) => realOrUndefined(root) ?? root);
+        const exposed = [...writeRoots, ...(persistentReal ? [persistentReal] : []), ...scratch, ...extra].find((root) => contains(root, realSource));
         if (exposed) {
             throw new ReadConfinementError(`the policy file ${realSource} is inside ${exposed}, which the sandboxed agent can write or the project owns; move it outside the project, writable roots and temp directories.`);
         }
@@ -816,10 +880,13 @@ export function planReadConfinement(
     // ---- render ----------------------------------------------------------
     const entries = [...bound.values()].sort((a, b) => a.path.length - b.path.length);
     const args: string[] = [];
-    for (const b of entries) {
+    // Overlays inside the project must come after the project's own writable bind (added by the launcher).
+    const overlayArgs: string[] = [];
+    for (const b of entries.filter((e) => e.late)) overlayArgs.push("--ro-bind", b.source ?? b.path, b.path);
+    for (const b of entries.filter((e) => !e.late)) {
         if (b.mode === "tmpfs") args.push("--tmpfs", b.path);
         else if (b.mode === "rw") args.push("--bind", b.source ?? b.path, b.path);
-        else args.push("--ro-bind", b.path, b.path);
+        else args.push("--ro-bind", b.source ?? b.path, b.path);
     }
     for (const [path, text] of [...symlinkMounts].sort(([a], [b]) => a.length - b.length)) args.push("--symlink", text, path);
     if (syntheticDir) args.push("--ro-bind", syntheticDir, mount);
@@ -844,11 +911,14 @@ export function planReadConfinement(
         limits,
         symlinksFollowed,
         envAllow,
+        denyWrite: [...denyWriteSet].sort(),
     };
     return {
         args,
         readRoots,
         writeRoots: [...writeRoots].sort(),
+        denyWrite: audit.denyWrite,
+        overlayArgs,
         audit,
         project,
         envAllow,

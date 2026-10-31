@@ -79,6 +79,13 @@ export type ReadConfinementMounts = {
     envAllow?: readonly string[];
     /** Value forced for PATH (the synthetic approved-tools directory). */
     pathValue?: string;
+    /**
+     * Paths inside writable git dirs the in-process file tools must refuse to write (hooks, config,
+     * alternates, other worktrees ...): the same set the sandbox mounts read-only.
+     */
+    denyWrite?: readonly string[];
+    /** Read-only overlays inside the project; mounted after the project's own writable bind. */
+    overlayArgs?: readonly string[];
 };
 
 /** Environment variable naming the read-confinement policy file. Its presence means a profile requires confinement. */
@@ -94,14 +101,38 @@ export const READ_CONFINEMENT_POLICY_ENV = "PI_SANDBOX_READ_CONFINEMENT_POLICY";
 export type ProcessReadConfinement =
     | { readonly state: "active"; readonly mounts: ReadConfinementMounts }
     | { readonly state: "failed"; readonly reason: string };
-const PROCESS_READ_CONFINEMENT = Symbol.for("pi-better-harness.sandbox-core.read-confinement");
+const PROCESS_READ_CONFINEMENT = Symbol.for("pi-better-harness.sandbox-core.read-confinement.owners");
 
-export function publishProcessReadConfinement(entry: ProcessReadConfinement | undefined): void {
-    (globalThis as Record<symbol, unknown>)[PROCESS_READ_CONFINEMENT] = entry && Object.freeze(entry);
+const DEFAULT_OWNER = Symbol.for("pi-better-harness.sandbox-core.default-owner");
+
+function processSlots(): Map<unknown, ProcessReadConfinement> {
+    const holder = globalThis as Record<symbol, Map<unknown, ProcessReadConfinement> | undefined>;
+    return (holder[PROCESS_READ_CONFINEMENT] ??= new Map());
+}
+
+/**
+ * Publish (or, with `undefined`, withdraw) the plan owned by `owner`. Each controller passes
+ * itself, so disposing one never clears the plan another still owns; the most recently
+ * published live plan is the one in force. Without an owner, `undefined` clears every slot
+ * (test reset) and a value is owned by a shared default owner.
+ */
+export function publishProcessReadConfinement(entry: ProcessReadConfinement | undefined, owner: unknown = DEFAULT_OWNER): void {
+    const slots = processSlots();
+    if (entry === undefined) {
+        if (owner === DEFAULT_OWNER) slots.clear(); else slots.delete(owner);
+        return;
+    }
+    slots.delete(owner); // re-publishing moves the owner to the front
+    slots.set(owner, Object.freeze(entry));
 }
 
 export function processReadConfinement(): ProcessReadConfinement | undefined {
-    return (globalThis as Record<symbol, ProcessReadConfinement | undefined>)[PROCESS_READ_CONFINEMENT];
+    return [...processSlots().values()].at(-1);
+}
+
+/** Whether any owner still has a published plan. */
+export function hasProcessReadConfinement(): boolean {
+    return processSlots().size > 0;
 }
 
 /**
@@ -456,6 +487,8 @@ function compile(
                 ...(readConfinement.project !== undefined && { project: readConfinement.project }),
                 ...(readConfinement.envAllow && { envAllow: [...readConfinement.envAllow] }),
                 ...(readConfinement.pathValue !== undefined && { pathValue: readConfinement.pathValue }),
+                ...(readConfinement.denyWrite && { denyWrite: [...new Set(readConfinement.denyWrite.map((path) => canonicalizePath(path, seams)))].sort() }),
+                ...(readConfinement.overlayArgs && { overlayArgs: [...readConfinement.overlayArgs] }),
             },
         }),
         ...(policy.permissions && {
@@ -729,7 +762,7 @@ export function evaluateWriteAccess(
     if (!policy.permissions && !contains(policy.writableRoot, path)) {
         return { allowed: false, path, reason: "outside-writable-root" };
     }
-    for (const denied of policy.denyWrite) {
+    for (const denied of [...policy.denyWrite, ...(policy.readConfinement?.denyWrite ?? [])]) {
         if (contains(denied, path)) {
             return { allowed: false, path, reason: "write-denied", deniedBy: denied };
         }
@@ -1406,6 +1439,7 @@ function buildLinuxPermissionCommand(
     for (const path of [...readOnlyGuards].sort((a, b) => a.length - b.length)) {
         mounts.push("--ro-bind", path, path);
     }
+    if (policy.readConfinement?.overlayArgs && permissions.outsideProject === "off") mounts.push(...policy.readConfinement.overlayArgs);
     // Last, so every mount point above could still be created: the synthetic
     // root and the parents of bound paths become read-only; only the explicit
     // writable binds and the private /tmp stay writable.
