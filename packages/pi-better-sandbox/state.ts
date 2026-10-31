@@ -13,6 +13,14 @@
 import { getAgentDir, getPackageDir } from "@earendil-works/pi-coding-agent";
 import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
+import { loadConfiguredReadConfinementPolicy } from "./read-confinement-settings.ts";
+import {
+    formatReadConfinementAudit,
+    planReadConfinement,
+    type LoadedReadConfinementPolicy,
+    type ReadConfinementPlan,
+    type ReadConfinementSeams,
+} from "./shared-read-confinement.ts";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -94,7 +102,16 @@ export class ForegroundSandboxBlockedError extends Error {
     }
 }
 
+/** Seams for the Linux read-confinement mode (policy source, planning, clock). */
+export type ReadConfinementControllerSeams = {
+    /** Defaults to the configured policy file; return undefined when the mode is not configured. */
+    loadPolicy?: () => LoadedReadConfinementPolicy | undefined;
+    plan?: ReadConfinementSeams;
+    now?: () => number;
+};
+
 export type ForegroundSandboxSeams = PolicySeams & {
+    readConfinement?: ReadConfinementControllerSeams;
     /** Creates the directory generated sandbox profiles are written into. */
     createProfileDir?: () => string;
 };
@@ -124,6 +141,9 @@ export class ForegroundSandboxController {
     #policyProblem: string | undefined;
     #runtimePaths: readonly string[] = [];
     #taskScratch: ReturnType<typeof createTaskScratch> | undefined;
+    #confinement: { key: string; plan: ReadConfinementPlan; at: number } | undefined;
+    #lastAuditHash: string | undefined;
+    #onConfinementPlan: ((plan: ReadConfinementPlan) => void) | undefined;
 
     constructor(seams: ForegroundSandboxSeams = {}) {
         this.#seams = seams;
@@ -146,7 +166,50 @@ export class ForegroundSandboxController {
         this.#sessionOverride = undefined;
         this.#permissions = undefined;
         this.#policyProblem = undefined;
+        this.#dropConfinement();
         return this.status();
+    }
+
+    /** Called once per distinct computed read-confinement plan (the audit trail). */
+    onReadConfinementPlan(listener: (plan: ReadConfinementPlan) => void): void {
+        this.#onConfinementPlan = listener;
+    }
+
+    /** Human-readable audit of the latest read-confinement plan, for the diagnostics command. */
+    readConfinementReport(): string {
+        if (!this.#confinement) {
+            return "Read confinement: no plan computed in this session. It applies to Linux bubblewrap with Outside project = Off and a configured policy file (PI_SANDBOX_READ_CONFINEMENT_POLICY or the sandboxReadConfinement setting).";
+        }
+        return formatReadConfinementAudit(this.#confinement.plan.audit, this.#confinement.plan.hash);
+    }
+
+    #dropConfinement(): void {
+        if (this.#confinement?.plan.syntheticDir) rmSync(this.#confinement.plan.syntheticDir, { recursive: true, force: true });
+        this.#confinement = undefined;
+    }
+
+    #readConfinement(project: string): ReadConfinementPlan | undefined {
+        const rc = this.#seams.readConfinement ?? {};
+        let loaded: LoadedReadConfinementPolicy | undefined;
+        try {
+            loaded = (rc.loadPolicy ?? loadConfiguredReadConfinementPolicy)();
+        } catch (error) {
+            throw new Error(`Read confinement failed closed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        if (!loaded) return undefined;
+        const now = (rc.now ?? Date.now)();
+        const key = `${project}\0${loaded.sha256}`;
+        const ttl = loaded.policy.planTtlMs ?? 30_000;
+        const cached = this.#confinement;
+        if (cached && cached.key === key && now - cached.at < ttl) return cached.plan;
+        const plan = planReadConfinement(loaded, project, { home: (this.#seams.home ?? homedir)(), agentId: "main", ...rc.plan });
+        this.#dropConfinement();
+        this.#confinement = { key, plan, at: now };
+        if (plan.hash !== this.#lastAuditHash) {
+            this.#lastAuditHash = plan.hash;
+            try { this.#onConfinementPlan?.(plan); } catch { /* an audit-write failure must not widen or block access */ }
+        }
+        return plan;
     }
 
     /** Re-enable protection for operations launched from now on. */
@@ -367,11 +430,18 @@ export class ForegroundSandboxController {
             home: (this.#seams.home ?? homedir)(),
             ...(status.permissions ? { permissions: status.permissions } : {}),
         };
+        if (status.permissions?.outsideProject === "off" && status.backend === "linux-bubblewrap") {
+            const confinement = this.#readConfinement(status.writableRoot);
+            if (confinement) {
+                policy.readConfinement = { args: confinement.args, readRoots: confinement.readRoots, writeRoots: confinement.writeRoots };
+            }
+        }
         return { confined: true, policy, profilePath: this.#profilePathFor(policy) };
     }
 
     /** Drop the generated profiles this session created. */
     dispose(): void {
+        this.#dropConfinement();
         if (this.#taskScratch) {
             rmSync(this.#taskScratch.path, { recursive: true, force: true });
             this.#taskScratch = undefined;
