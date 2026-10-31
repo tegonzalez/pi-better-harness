@@ -91,6 +91,21 @@ export function readRemoteSandbox(id: string): RemoteSandboxVerification | undef
 }
 
 /**
+ * One line naming the remote run's workspace (working folder, agent dir) and the verified sandbox hashes, so the
+ * owner can compare them with `/sandbox workspace` in their own pi started in the same working folder.
+ */
+export function remoteWorkspaceLine(id: string, remote: RemoteRunMeta | undefined): string | undefined {
+    if (!remote) return undefined;
+    const verified = remote.sandbox ?? readRemoteSandbox(id);
+    const parts = [
+        `cwd ${remote.cwd ?? "(login directory)"}`,
+        ...(remote.agentDir ? [`agent dir ${remote.agentDir}`] : []),
+        verified ? `policyHash ${verified.policyHash} · planHash ${verified.planHash}` : "sandbox not verified yet",
+    ];
+    return `Remote workspace (${remote.target}): ${parts.join(" · ")}`;
+}
+
+/**
  * True when no remote process can be running for this run without asking the host: the remote
  * agent settled, or the bridge recorded a failure that happened before/instead of any remote work.
  * Such a run needs no ssh to be stopped or dismissed.

@@ -139,6 +139,7 @@ function classify(code) {
     if (code === 94) return { kind: "session-missing", summary: tail || "the session to resume was not found on the remote host", code };
     if (code === 96) return { kind: "sandbox-unavailable", summary: tail || "required remote sandbox could not be enabled", code };
     if (code === 97) return { kind: "cwd-missing", summary: tail || "remote working directory not found", code };
+    if (code === 99) return { kind: "cwd-denied", summary: tail || "the working folder is outside the target's allowed cwdRoots", code };
     if (code === 98) return { kind: "remote-dir", summary: tail || "remote run directory could not be created", code };
     return { kind: "remote-exit", summary: `remote pi exited with code ${code}${tail ? `: ${tail}` : ""}`, code };
 }

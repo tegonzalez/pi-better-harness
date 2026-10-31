@@ -25,7 +25,7 @@ function sandboxEntries() {
 }
 const log = (kind, value) => process.env.FAKE_PI_LOG && appendFileSync(process.env.FAKE_PI_LOG, `${JSON.stringify({ kind, value })}\n`);
 log("argv", process.argv.slice(2));
-log("env", { PROFILE: process.env.FAKE_SANDBOX_PROFILE, EXTRA: process.env.FAKE_EXTRA, cwd: process.cwd() });
+log("env", { PROFILE: process.env.FAKE_SANDBOX_PROFILE, EXTRA: process.env.FAKE_EXTRA, cwd: process.cwd(), AGENT_DIR: process.env.PI_CODING_AGENT_DIR });
 const out = (o) => process.stdout.write(`${JSON.stringify(o)}\n`);
 let mode = "";
 let running = false;

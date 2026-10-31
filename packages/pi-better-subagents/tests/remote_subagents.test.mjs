@@ -15,8 +15,10 @@ import { spawn, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { parseRemoteTarget, parseRemoteTargets, selectRemoteTarget, buildLaunchScript, buildEnvPayload, buildStopScript, wrapRemoteScript, stopRemoteProcess, assertRemoteOptionsSupported } from "../remote.ts";
-import { handleRemoteExit, launchRemoteRun, reconcileRemoteExit, readRemoteFailure } from "../remote-run.ts";
+import { parseRemoteTarget, parseRemoteTargets, selectRemoteTarget, buildLaunchScript, buildEnvPayload, buildStopScript, wrapRemoteScript, stopRemoteProcess, assertRemoteOptionsSupported, effectiveRemoteCwd } from "../remote.ts";
+import { handleRemoteExit, launchRemoteRun, reconcileRemoteExit, readRemoteFailure, remoteWorkspaceLine } from "../remote-run.ts";
+import { subagentResultTool } from "../tools.ts";
+import { nonTempFixtureBase } from "./fixture-base.mjs";
 import { finalizeRun } from "../finalization.ts";
 import { parseRun } from "../parse.ts";
 import { logPathFor, readMeta, runDir, writeMeta, effectiveStatus } from "../registry.ts";
@@ -560,5 +562,141 @@ describe("review 2: N6 ordering and prompt tracking, N7 policyHash pin", () => {
         assert.equal(await good.exit, 0);
         assert.equal((await reconcileRemoteExit(good.id, 0)).finalize, true);
         assert.equal(readMeta(good.id).remote.sandbox.policyHash, pin);
+    });
+});
+
+// ---- workspace binding: per-spawn working folder, agent dir, owner comparison ----------------------------
+
+describe("workspace binding: per-spawn working folder (cwdRoots)", () => {
+    // Roots live under an explicit non-temp base (absolute paths on the "remote"), not under the fake HOME.
+    const base = mkdtempSync(join(nonTempFixtureBase(here), "remote-cwd-roots-"));
+    const rootA = join(base, "allowed");
+    const rootEvil = join(base, "allowed-evil");
+    const outside = join(base, "elsewhere");
+    for (const dir of [join(rootA, "proj1"), join(rootA, "proj2"), join(rootEvil, "p"), outside]) mkdirSync(dir, { recursive: true });
+    symlinkSync(outside, join(rootA, "escape"));
+    after(() => rmSync(base, { recursive: true, force: true }));
+    const roots = { cwd: undefined, cwdRoots: [rootA] };
+    const argvCount = () => piCmds().filter((c) => c.kind === "argv").length;
+    const lastEnv = () => piCmds().filter((c) => c.kind === "env").pop().value;
+
+    it("validates cwdRoots and agentDir; a spawn cwd needs roots; the fixed form keeps working", () => {
+        assert.deepEqual(parseRemoteTarget(targetConfig(roots), "t").cwdRoots, [rootA]);
+        assert.throws(() => parseRemoteTarget(targetConfig({ cwdRoots: [] }), "t"), /at least one root/);
+        assert.throws(() => parseRemoteTarget(targetConfig({ cwdRoots: ["relative/x"] }), "t"), /absolute or start with/);
+        assert.throws(() => parseRemoteTarget(targetConfig({ cwdRoots: ["/"] }), "t"), /filesystem root/);
+        assert.throws(() => parseRemoteTarget(targetConfig({ cwdRoots: ["~"] }), "t"), /whole home/);
+        assert.throws(() => parseRemoteTarget(targetConfig({ agentDir: "rel" }), "t"), /absolute or start with/);
+        assert.throws(() => parseRemoteTarget(targetConfig({ agentDir: "/a", env: { PI_CODING_AGENT_DIR: "/b" } }), "t"), /set by agentDir/);
+        assert.throws(() => parseRemoteTarget(targetConfig({ agentDir: "/a", sandbox: { ...targetConfig().sandbox, env: { PI_CODING_AGENT_DIR: "{profile}" } } }), "t"), /set by agentDir/);
+        const fixed = parseRemoteTarget(targetConfig(), "t");
+        assert.equal(effectiveRemoteCwd(fixed, undefined), "~/work");
+        assert.throws(() => effectiveRemoteCwd(fixed, "/x"), /declares no cwdRoots/);
+        assert.throws(() => assertRemoteOptionsSupported({ cwd: "/x" }, fixed), /not supported with a remote target: cwd/);
+        assert.doesNotThrow(() => assertRemoteOptionsSupported({ cwd: "/x" }, parseRemoteTarget(targetConfig(roots), "t")));
+        assert.throws(() => effectiveRemoteCwd(parseRemoteTarget(targetConfig(roots), "t"), "relative"), /absolute or start with/);
+    });
+
+    it("the launch script resolves the cwd and the roots on the remote and fails closed", () => {
+        const target = parseRemoteTarget(targetConfig(roots), "t");
+        const script = buildLaunchScript(target, "sa_x_1", { cwd: join(rootA, "proj1") });
+        assert.match(script, /CWD_REAL=\$\(pwd -P\)/);
+        assert.match(script, /ROOT_REAL=\$\(cd .*&& pwd -P\) && case "\$CWD_REAL" in "\$ROOT_REAL"\|"\$ROOT_REAL"\/\*\)/);
+        assert.match(script, /exit 99/);
+        assert.doesNotMatch(buildLaunchScript(parseRemoteTarget(targetConfig(), "t"), "sa_x_1", {}), /cwd_ok/, "the fixed form has no roots check");
+    });
+
+    it("each spawn runs in its own folder and its own session", async () => {
+        const one = await start("say done", roots, { cwd: join(rootA, "proj1") });
+        assert.equal(await one.exit, 0);
+        const envOne = lastEnv();
+        const argvOne = piCmds().filter((c) => c.kind === "argv").pop().value;
+        const two = await start("say done", roots, { cwd: join(rootA, "proj2") });
+        assert.equal(await two.exit, 0);
+        const envTwo = lastEnv();
+        const argvTwo = piCmds().filter((c) => c.kind === "argv").pop().value;
+        assert.equal(envOne.cwd, join(rootA, "proj1"));
+        assert.equal(envTwo.cwd, join(rootA, "proj2"));
+        assert.notEqual(one.id, two.id);
+        const sessionOf = (argv) => argv[argv.indexOf("--session-id") + 1];
+        assert.equal(sessionOf(argvOne), one.id);
+        assert.equal(sessionOf(argvTwo), two.id);
+        assert.notEqual(argvOne[argvOne.indexOf("--session-dir") + 1], argvTwo[argvTwo.indexOf("--session-dir") + 1]);
+        assert.equal(readMeta(one.id).remote.cwd, join(rootA, "proj1"), "the run records the working folder it used");
+        assert.equal(one.remote.cwd, join(rootA, "proj1"));
+    });
+
+    for (const [label, cwd] of [
+        ["a sibling that only shares the prefix", join(rootEvil, "p")],
+        ["a symlink inside a root that escapes it", join(rootA, "escape")],
+        ["a dot-dot traversal out of the root", join(rootA, "..", "elsewhere")],
+        ["the root's parent", base],
+    ]) {
+        it(`refuses ${label} before pi starts`, async () => {
+            const before = argvCount();
+            const { id, exit } = await start("say done", roots, { cwd });
+            assert.equal(await exit, 99);
+            const handled = handleRemoteExit(id);
+            assert.equal(handled.failure.kind, "cwd-denied");
+            assert.equal(argvCount(), before, "pi was never started");
+        });
+    }
+
+    it("a missing folder is cwd-missing, and with roots the login directory is checked too", async () => {
+        const missing = await start("say done", roots, { cwd: join(rootA, "nope") });
+        assert.equal(await missing.exit, 97);
+        assert.equal(handleRemoteExit(missing.id).failure.kind, "cwd-missing");
+        const before = argvCount();
+        const login = await start("say done", { cwd: undefined, cwdRoots: [rootA] });
+        assert.equal(await login.exit, 99, "no cwd: the remote login directory is outside the roots");
+        assert.equal(argvCount(), before);
+    });
+
+    it("the target's fixed cwd is also held to the roots", async () => {
+        const inside = await start("say done", { cwd: join(rootA, "proj1"), cwdRoots: [rootA] });
+        assert.equal(await inside.exit, 0);
+        const outsideRun = await start("say done", { cwd: outside, cwdRoots: [rootA] });
+        assert.equal(await outsideRun.exit, 99);
+    });
+
+    it("a spawn cwd for a target without cwdRoots is rejected, never ignored", async () => {
+        await assert.rejects(start("say done", {}, { cwd: join(rootA, "proj1") }), /declares no cwdRoots/);
+    });
+});
+
+describe("workspace binding: agent dir and owner comparison", () => {
+    it("exports PI_CODING_AGENT_DIR for the remote pi (not on the command line), expanding ~/ remotely", async () => {
+        const target = parseRemoteTarget(targetConfig({ agentDir: "~/agents/ws one" }), "t");
+        assert.match(buildEnvPayload(target, "sa_x_1"), /export PI_CODING_AGENT_DIR="\$HOME"\/'agents\/ws one'\n/);
+        assert.doesNotMatch(buildLaunchScript(target, "sa_x_1", {}), /agents\/ws one/);
+        const run = await start("say done", { agentDir: "~/agents/ws1" });
+        assert.equal(await run.exit, 0);
+        const env = piCmds().filter((c) => c.kind === "env").pop().value;
+        assert.equal(env.AGENT_DIR, join(remoteHome, "agents", "ws1"));
+        assert.equal(run.remote.agentDir, "~/agents/ws1");
+        const absolute = await start("say done", { agentDir: "/absolute/agent-dir" });
+        await absolute.exit;
+        assert.equal(piCmds().filter((c) => c.kind === "env").pop().value.AGENT_DIR, "/absolute/agent-dir");
+    });
+
+    it("a target without agentDir leaves the remote's own agent dir alone", async () => {
+        const run = await start("say done");
+        await run.exit;
+        assert.equal(piCmds().filter((c) => c.kind === "env").pop().value.AGENT_DIR, process.env.PI_CODING_AGENT_DIR, "only what the remote login environment already had");
+    });
+
+    it("subagent_result names the workspace and the verified policyHash/planHash for comparison", async () => {
+        const { id, exit } = await start("say done", { agentDir: "~/agents/ws1", cwd: "~/work" });
+        const code = await exit;
+        assert.equal((await reconcileRemoteExit(id, code)).finalize, true);
+        finalizeRun(id, code);
+        const meta = readMeta(id);
+        const line = remoteWorkspaceLine(id, meta.remote);
+        assert.match(line, /^Remote workspace \(t\): cwd ~\/work · agent dir ~\/agents\/ws1 · policyHash policy-hash-1 · planHash plan-hash-1$/);
+        const TypeStub = { Object: (v) => v, String: (v) => v, Number: (v) => v, Boolean: (v) => v, Array: (v) => v, Optional: (v) => v };
+        const out = (await subagentResultTool(TypeStub).execute("tc", { id })).content[0].text.split("\n");
+        assert.match(out[0], /^\[/, "the head line stays first");
+        assert.equal(out[1], line);
+        assert.equal(remoteWorkspaceLine("none", undefined), undefined);
     });
 });
