@@ -318,6 +318,96 @@ schemas, prompt guidance, call rendering, write previews, edit diffs, result
 details, mutation queueing, and cancellation are Pi's own. Only the filesystem
 operations underneath them are replaced.
 
+## Linux read confinement
+
+On Linux bubblewrap, **Outside project = Off** already hides everything except the
+system runtime roots. *Read confinement* is an opt-in refinement of that mode: when a
+policy file is configured, the agent can additionally read only
+
+- its project/worktree (writable) and the git dir a worktree `.git` file points to (writable),
+- whatever the project reaches through symlinks (read-only, followed transitively),
+- the tools the policy approves, with their libraries and interpreters (read-only),
+- those tools' approved config paths (read-only) and cache paths (private tmpfs, or a persistent per-agent directory).
+
+Everything else — sibling projects, other users' homes, the stored-credential list —
+is not mounted, so it fails with "No such file or directory". `/tmp` stays a private
+tmpfs, the network stays `--unshare-net` while Network is Off, and the synthetic root
+is remounted read-only so stray writes fail instead of landing in ephemeral storage.
+Pi's in-process read/write/edit tools use the same computed allow set: a path is
+allowed only when its realpath is inside it. Without a configured policy nothing
+changes.
+
+### Configuring the policy
+
+The policy is a JSON file whose location is configuration, never code:
+
+1. `PI_SANDBOX_READ_CONFINEMENT_POLICY=/absolute/path/policy.json`, or
+2. the harness setting `sandboxReadConfinement: { "policyFile": "/absolute/path/policy.json" }`.
+
+Unknown keys, wrong types, relative paths and invalid regular expressions are refused
+at load time and block launches (fail closed). Path entries are absolute, `~/…`, or
+`${VAR}/…` (resolved from the launching environment; an unset variable skips the entry).
+
+| Key | Meaning | Default |
+| --- | --- | --- |
+| `version` | Must be `1`. | required |
+| `limits.maxSymlinks` / `maxDepth` / `maxWalkEntries` / `maxBinds` | Caps on the symlink closure. Exceeding one fails the launch with an error naming the cap. | 2000 / 8 / 200000 / 500 |
+| `walkSkipDirNames` | Directory names the symlink walk never enters (for example a large dependency tree). | `[]` |
+| `deny.paths` | Extra denied paths. A symlink target inside one, or a directory containing one, is skipped and recorded. | `[]` |
+| `deny.credentialList` | Include the built-in stored-credential locations in the deny list. | `true` |
+| `deny.otherHomes` | Deny every account home (passwd database) other than the current user's. | `true` |
+| `tools.approved[]` | A name (looked up on the launching `PATH`), or `{ name \| path, config[], cache[], cachePersistent, bind[], install }`. `install: "prefix"` binds the install prefix instead of just the executable; `bind` adds extra read-only paths. | `[]` |
+| `tools.approvedPathDirs[]` | Approve every executable in a directory that is on the launching `PATH`. | `[]` |
+| `tools.builtinDefaults` | Apply the generic built-in map (`git` → `~/.gitconfig`, `$XDG_CONFIG_HOME/git`, `~/.config/git`) to approved tools without their own `config`. Set `false` to remove it. | `true` |
+| `secretDetector.useDefaults` / `patterns[]` / `maxScanBytes` / `maxScanFiles` | Config entries whose files match a pattern (private-key headers, common token shapes, `_authToken=`, `password=…`) are refused, not bound. `(?i)` prefix = case-insensitive. | defaults on |
+| `caches.persistentDir` | Base for `cachePersistent` caches: `<dir>/<agent>/<tool>-<hash>`. | unset (persistent caches skipped) |
+| `syntheticPathMount` | Where the PATH directory appears in the sandbox. | `/run/pi-confined/bin` |
+| `planTtlMs` | How long a computed plan is reused before the closure is re-walked. | `30000` |
+
+At launch the planner resolves the launching `PATH`, takes the realpath of each approved
+tool, follows script shebangs (including `env`) and, for ELF binaries, asks the binary's own
+dynamic loader which libraries it needs (`DT_NEEDED`, `RPATH`, `RUNPATH`), and binds only those.
+A directory holding symlinks to other symlinks gets matching `--symlink` mounts so chains resolve
+exactly as on the host. The `PATH` inside the sandbox contains only the approved tools (plus
+interpreters they need, marked in the report); unapproved tools are absent.
+
+### Audit
+
+Each distinct computed plan is appended to the session as a custom entry
+(`pi-better-sandbox-read-confinement`: binds with reasons, denied and skipped entries with
+reasons, symlink mounts, the synthetic `PATH`, the policy source and its SHA-256).
+`/sandbox diagnostics confinement` prints the latest plan. Secret values are never recorded.
+
+### Example policy (illustrative; adapt to your environment)
+
+```json
+{
+  "version": 1,
+  "limits": { "maxSymlinks": 500, "maxDepth": 6 },
+  "walkSkipDirNames": ["node_modules"],
+  "deny": { "paths": ["~/private", "${XDG_DATA_HOME}/keyrings"] },
+  "tools": {
+    "approved": [
+      "sh", "cat", "ls", "grep", "git",
+      { "name": "mytool", "config": ["~/.config/mytool"], "cache": ["~/.cache/mytool"], "cachePersistent": true, "install": "prefix" }
+    ]
+  },
+  "secretDetector": { "patterns": ["(?i)client[_-]?secret"] },
+  "caches": { "persistentDir": "${XDG_STATE_HOME}/pi-agent-caches" }
+}
+```
+
+### Limits
+
+- The system runtime roots (`/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`) are bound **whole**, so
+  anything installed there is readable, not just approved tools. Approval controls `PATH`
+  and what is bound *outside* those roots.
+- A confined shell can still run any executable it can read by absolute path, for example one under `/usr`.
+- Libraries a tool loads with `dlopen` are not visible to the loader listing; add them with `bind`.
+- A symlink created after the plan was computed is not mounted until the plan is recomputed (`planTtlMs`).
+- Secret detection is pattern-based; it reduces, not eliminates, the chance that a bound config holds a secret.
+- The synthetic `PATH` only constrains lookups by name; this mode is a read boundary, not a command allowlist.
+
 ## Local Permission Diagnostics
 
 Opt in with `/sandbox diagnostics on`. Saved in global `settings.json`, this
