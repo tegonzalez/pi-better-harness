@@ -16,7 +16,7 @@ import { basename, delimiter, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import * as PiCodingAgent from "@earendil-works/pi-coding-agent";
 const { createLocalBashOperations, getShellConfig } = PiCodingAgent;
-import { directApplicationTarget, maybeBuildSandboxCommand, SHELL_EXECUTABLE_NAMES, type SandboxPermissions } from "./shared-sandbox-core.ts";
+import { compileWritePolicy, confinedEnvironment, directApplicationTarget, maybeBuildSandboxCommand, SHELL_EXECUTABLE_NAMES, type SandboxPermissions } from "./shared-sandbox-core.ts";
 import type { SandboxDiagnostics } from "./shared-sandbox-diagnostics.ts";
 import type { TaskFileController } from "./shared-task-files.ts";
 
@@ -260,15 +260,24 @@ export function createTaskExecutor(
         if (shell?.commandTransport === "stdin") throw new Error("Sandbox: this shell cannot be confined by the available backend.");
         const scratch = plan.policy.runtimeWrite?.[0];
         // Git inventory otherwise creates optional locks in an outside gitdir it cannot unlink (#419).
-        const taskEnv: NodeJS.ProcessEnv = { GIT_OPTIONAL_LOCKS: "0", ...process.env, ...options.env,
+        // Read confinement (Linux, Outside project = Off) clears the environment: only the
+        // policy allowlist reaches the child, so keys and tokens are never inherited. Compiling
+        // also applies the process-wide plan published at launch, or refuses the launch.
+        const hostEnv: NodeJS.ProcessEnv = { ...process.env, ...options.env };
+        const confinement = compileWritePolicy(plan.policy).readConfinement;
+        const inherited: NodeJS.ProcessEnv = confinement ? confinedEnvironment(confinement, hostEnv) : hostEnv;
+        const taskEnv: NodeJS.ProcessEnv = { GIT_OPTIONAL_LOCKS: "0", ...inherited,
             ...(scratch ? { TMPDIR: scratch, TMP: scratch, TEMP: scratch } : {}) };
-        // Resolve against the launch cwd, not the trusted Pi process cwd.
-        const executable = target.kind === "argv" ? findExecutable(target.execPath, taskEnv, cwd) : undefined;
+        // Resolve against the launch cwd and the host environment (the child's own PATH is the
+        // synthetic approved-tools directory under read confinement), not the trusted Pi process cwd.
+        const lookupEnv: NodeJS.ProcessEnv = { ...taskEnv, ...(hostEnv.PATH !== undefined ? { PATH: hostEnv.PATH } : {}),
+            ...(hostEnv.Path !== undefined ? { Path: hostEnv.Path } : {}) };
+        const executable = target.kind === "argv" ? findExecutable(target.execPath, lookupEnv, cwd) : undefined;
         if (target.kind === "argv" && !executable) {
             throw new Error(`Executable not found: ${target.execPath}`);
         }
         if (target.kind === "argv" && permissions?.shell === false) {
-            const interpreter = directShellInterpreter(executable!, taskEnv, cwd);
+            const interpreter = directShellInterpreter(executable!, lookupEnv, cwd);
             if (interpreter) {
                 observed("policy-refusal", "denied");
                 throw new Error(shellInterpreterOff(interpreter));
