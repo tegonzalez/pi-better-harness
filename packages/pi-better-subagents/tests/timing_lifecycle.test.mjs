@@ -25,7 +25,8 @@ process.env.TMPDIR = HERMETIC_TMPDIR;
 
 const { default: betterSubagents, progressCacheIdsForTests, isHealthTickerActive, forgetProgressCacheForTests } = await import("../index.ts");
 const { getCallbackBatcher } = await import("../shared-callback-batcher.ts");
-const { readMeta, writeMeta, runDir } = await import("../registry.ts");
+const { readMeta, writeMeta, runDir, steerDirFor } = await import("../registry.ts");
+const { listSteerRequests, writeSteerReceipt } = await import("../steer-queue.ts");
 const { killProcessTree } = await import("../spawn.ts");
 
 const HEALTH_TICK_MS = 15_000;
@@ -33,7 +34,7 @@ const HEALTH_TICK_MS = 15_000;
 // ---- fake pi binary: echo its launch facts into the log, then idle ---------
 const binDir = mkdtempSync(join(tmpdir(), "fake-pi-timing-"));
 const fakePiPath = join(binDir, "pi");
-const IDLE_SCRIPT = "#!/bin/sh\necho \"{\\\"type\\\":\\\"fake_launch\\\",\\\"steerFile\\\":\\\"$PI_SUBAGENT_STEER_FILE\\\"}\"\necho \"$@\"\nsleep 300\n";
+const IDLE_SCRIPT = "#!/bin/sh\necho \"{\\\"type\\\":\\\"fake_launch\\\",\\\"steerDir\\\":\\\"$PI_SUBAGENT_STEER_DIR\\\"}\"\necho \"$@\"\nsleep 300\n";
 function writeFakePi(script) {
     writeFileSync(fakePiPath, script);
     chmodSync(fakePiPath, 0o755);
@@ -132,7 +133,8 @@ async function withFakeClock(fn) {
 }
 
 const wakes = (h, kind) => h.sent.filter((entry) => entry.message.customType === `subagent-${kind}`);
-const steerPath = (id) => join(runDir(id), "steer.json");
+/** The deadline wrap-up request in the run's steer queue, if queued. */
+const deadlineRequest = (id) => listSteerRequests(steerDirFor(id)).find((request) => request.id === `deadline:${id}`);
 
 function appendEvents(id, events) {
     appendFileSync(join(runDir(id), "output.log"), events.map((e) => JSON.stringify(e)).join("\n") + "\n");
@@ -173,7 +175,7 @@ describe("harness timing: launch", () => {
             assert.ok(log, "the fake child recorded its arguments");
             assert.match(log, /--extension \S*child-steer\.ts/);
             assert.match(log, /--extension \S*child-ownership\.ts/, "single clean launches carry ownership enforcement");
-            assert.ok(log.includes(`"steerFile":"${steerPath(run.id)}"`), "the child learns where its steer requests appear");
+            assert.ok(log.includes(`"steerDir":"${steerDirFor(run.id)}"`), "the child learns where its steer requests appear");
             await reap(run);
         } finally { h.shutdown(); }
     });
@@ -217,7 +219,7 @@ describe("harness timing: launch", () => {
 });
 
 describe("shared supervision watcher", () => {
-    const WAIT_SCRIPT = "#!/bin/sh\nd=$(dirname \"$PI_SUBAGENT_STEER_FILE\")\necho launched --extension\nwhile [ ! -f \"$d/done\" ]; do sleep 0.05; done\necho '{\"type\":\"agent_end\"}'\nexit 0\n";
+    const WAIT_SCRIPT = "#!/bin/sh\nd=$(dirname \"$PI_SUBAGENT_STEER_DIR\")\necho launched --extension\nwhile [ ! -f \"$d/done\" ]; do sleep 0.05; done\necho '{\"type\":\"agent_end\"}'\nexit 0\n";
     const finish = async (run) => {
         writeFileSync(join(runDir(run.id), "done"), "");
         assert.equal(await waitFor(() => readMeta(run.id)?.status === "completed"), true);
@@ -310,10 +312,14 @@ describe("harness timing: soft deadline", () => {
             try {
                 const run = await spawnRun(h, { deadline_minutes: 0.001, grace_minutes: 10, max_minutes: 0, stuck_minutes: 0 });
                 await untilSteerRequested(run.id);
-                await waitFor(() => existsSync(steerPath(run.id)));
-                const steer = JSON.parse(readFileSync(steerPath(run.id), "utf8"));
+                const steer = await waitFor(() => deadlineRequest(run.id));
+                assert.equal(steer.kind, "deadline", "the wrap-up goes through the steer queue");
                 assert.match(steer.text, /soft deadline/);
                 assert.match(steer.text, /Do not start new work/);
+                // A parent steer queued after the deadline lands behind the wrap-up, in order.
+                const steered = await h.tools.get("subagent_steer").execute("x", { id: run.id, message: "also note X" }, undefined, undefined, h.ctx);
+                assert.equal(steered.details.state, "queued");
+                assert.deepEqual(listSteerRequests(steerDirFor(run.id)).map((r) => r.id), [`deadline:${run.id}`, steered.details.steerId]);
                 const steeredAt = readMeta(run.id).timing.steerRequestedAt;
                 assert.ok(steeredAt > 0);
                 await waitFor(() => wakes(h, "deadline").length === 1);
@@ -342,6 +348,7 @@ describe("harness timing: soft deadline", () => {
                 assert.match(completion[0].message.content, /status=killed; stopped: deadline/);
                 const result = (await h.tools.get("subagent_result").execute("x", { id: run.id }, undefined, undefined, h.ctx)).content[0].text;
                 assert.match(result, /Timing: stopped: deadline/);
+                assert.match(result, /Steer: 0 delivered; 2 NOT delivered — the child ended before they were delivered/, "undelivered steers are reported, not dropped");
                 const list = (await h.tools.get("subagent_list").execute("x", {}, undefined, undefined, h.ctx)).content[0].text;
                 assert.match(list, new RegExp(`${run.id}.*stopped: deadline`));
                 const output = (await h.tools.get("subagent_output").execute("x", { id: run.id }, undefined, undefined, h.ctx)).content[0].text;
@@ -361,7 +368,7 @@ describe("harness timing: soft deadline", () => {
                 const run = await spawnRun(h, { deadline_minutes: 0.001, grace_minutes: 10, max_minutes: 0, stuck_minutes: 0, noWaitForLaunch: true });
                 await sleep(80);
                 await tick();
-                assert.ok(existsSync(steerPath(run.id)));
+                assert.ok(deadlineRequest(run.id));
                 const done = await waitFor(() => {
                     const m = readMeta(run.id);
                     return m && m.status !== "running" ? m : undefined;
@@ -394,7 +401,7 @@ describe("harness timing: soft deadline", () => {
                 assert.equal(persisted.deadlineAt - readMeta(run.id).startedAt, 60);
                 await sleep(80);
                 await tick();
-                assert.ok(existsSync(steerPath(run.id)), "the reloaded session enforces the stored deadline");
+                assert.ok(deadlineRequest(run.id), "the reloaded session enforces the stored deadline");
                 await waitFor(() => wakes(second, "deadline").length === 1);
                 assert.equal(wakes(second, "deadline").length, 1);
                 const steeredAt = readMeta(run.id).timing.steerRequestedAt;
@@ -403,6 +410,7 @@ describe("harness timing: soft deadline", () => {
                 await third.handlers.get("session_start")({}, third.ctx);
                 await tick();
                 assert.equal(readMeta(run.id).timing.steerRequestedAt, steeredAt, "no second steer after another reload");
+                assert.equal(listSteerRequests(steerDirFor(run.id)).length, 1, "one wrap-up request in the queue");
                 assert.equal(wakes(third, "deadline").length, 0, "no second deadline wake after another reload");
                 await reap(run);
             } finally { second.shutdown(); first.shutdown(); }
@@ -411,8 +419,8 @@ describe("harness timing: soft deadline", () => {
 });
 
 describe("harness timing: a steer queued behind a long tool call", () => {
-    // Exits 0 with a coherent stream once the test creates `done` next to the steer file.
-    const WAIT_SCRIPT = "#!/bin/sh\nd=$(dirname \"$PI_SUBAGENT_STEER_FILE\")\necho launched --extension\nwhile [ ! -f \"$d/done\" ]; do sleep 0.05; done\necho '{\"type\":\"agent_end\"}'\nexit 0\n";
+    // Exits 0 with a coherent stream once the test creates `done` in the run directory (the steer queue's parent).
+    const WAIT_SCRIPT = "#!/bin/sh\nd=$(dirname \"$PI_SUBAGENT_STEER_DIR\")\necho launched --extension\nwhile [ ! -f \"$d/done\" ]; do sleep 0.05; done\necho '{\"type\":\"agent_end\"}'\nexit 0\n";
     const longCallStart = (id) => [
         { type: "message_end", message: { role: "assistant", timestamp: Date.now(), content: [] } },
         { type: "tool_execution_start", toolCallId: id, toolName: "bash", args: { command: "./gradlew test" } },
@@ -439,7 +447,7 @@ describe("harness timing: a steer queued behind a long tool call", () => {
 
                 appendEvents(run.id, longCallEnd("long"));
                 // The child's steer extension writes this receipt when the steer enters its conversation.
-                writeFileSync(`${steerPath(run.id)}.delivered`, JSON.stringify({ id: `deadline:${run.id}`, at: Date.now() }));
+                writeSteerReceipt(steerDirFor(run.id), deadlineRequest(run.id), Date.now());
                 await tick();
                 const deliveredAt = readMeta(run.id).timing.steerDeliveredAt;
                 assert.ok(deliveredAt > 0, "delivery time recorded durably");
@@ -493,7 +501,7 @@ describe("harness timing: ceiling", () => {
                 const meta = readMeta(run.id);
                 assert.equal(meta.status, "killed");
                 assert.equal(meta.timing.stopReason, "ceiling");
-                assert.equal(existsSync(steerPath(run.id)), false, "a ceiling stop does not steer");
+                assert.equal(deadlineRequest(run.id), undefined, "a ceiling stop does not steer");
                 assert.equal(await getCallbackBatcher(h.pi).flush(), true);
                 const completion = h.sent.filter((entry) => entry.message.customType === "background-completion-batch");
                 assert.match(completion.at(-1).message.content, /stopped: ceiling/);

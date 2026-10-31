@@ -20,6 +20,7 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { processExists } from "./spawn.ts";
+import { steerDirIn } from "./steer-queue.ts";
 import type { LifecycleClassification } from "./lifecycle.ts";
 import {
     archiveCompletedAttempt,
@@ -287,6 +288,10 @@ export function taskWorkspaceDir(id: string): string {
 
 export function runDir(id: string): string {
     return join(baseDir(), "runs", id);
+}
+/** The run's parent → child steer queue (steer-queue.ts). */
+export function steerDirFor(id: string): string {
+    return steerDirIn(runDir(id));
 }
 export function logPathFor(id: string): string {
     return join(runDir(id), "output.log");

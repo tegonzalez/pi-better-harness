@@ -12,7 +12,7 @@
  */
 
 import { execSync } from "node:child_process";
-import { writeFileSync, mkdirSync, renameSync, statSync } from "node:fs";
+import { writeFileSync, mkdirSync, statSync } from "node:fs";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import * as PiCodingAgent from "@earendil-works/pi-coding-agent";
 import * as PiTui from "@earendil-works/pi-tui";
@@ -40,7 +40,7 @@ import { loadConfig, writeDelegationMode, writeSubagentSettings, isConcurrencyCa
 import { createSubagentSettingsPage } from "./settings-page.ts";
 import { effectiveSubagentSettings, formatSubagentSettingsMessage, stableSubagentSettings, subagentDelegationSystemPrompt,
     subagentSettingsTool, SUBAGENT_SETTINGS_CONTEXT } from "./effective-settings.ts";
-import { STEER_FILE_ENV, readSteerReceipt } from "./child-steer.ts";
+import { STEER_DIR_ENV, enqueueSteer, receiptForId } from "./steer-queue.ts";
 import {
     decideTiming,
     describeTiming,
@@ -79,6 +79,7 @@ import {
     clearLaunchAttempt,
     logPathFor,
     promptPathFor,
+    steerDirFor,
     nextRunId,
     writeMeta,
     readMeta,
@@ -134,6 +135,7 @@ import {
     subagentOutputTool,
     subagentResultTool,
     subagentStopTool,
+    subagentSteerTool,
 } from "./tools.ts";
 import { stopRun } from "./stop.ts";
 import {
@@ -208,6 +210,7 @@ const SUBAGENT_TOOLS = [
     "subagent_settings",
     "subagent_output",
     "subagent_stop",
+    "subagent_steer",
     "subagent_result",
     "agents_catalog",
 ];
@@ -776,10 +779,6 @@ function deliverHealthCallback(pi: ExtensionAPI | undefined, meta: RunMeta, stat
 /** Incremental progress read per run (rebuilt from the log after /reload). */
 const progressCache = new Map<string, { cursor?: LogCursor; state: ProgressState }>();
 
-function steerPathFor(id: string): string {
-    return join(runDir(id), "steer.json");
-}
-
 function childSteerExtensionPath(): string {
     return join(selfDir(), "child-steer.ts");
 }
@@ -813,11 +812,9 @@ function patchTiming(id: string, patch: Partial<NonNullable<RunMeta["timing"]>>)
     return current;
 }
 
+/** Queue the deadline wrap-up through the run's steer queue (the same path as subagent_steer). */
 function requestSteer(meta: RunMeta, now: number): void {
-    const path = steerPathFor(meta.id);
-    const tmp = `${path}.${process.pid}.tmp`;
-    writeFileSync(tmp, JSON.stringify({ id: `deadline:${meta.id}`, text: steerText(meta.timing!, meta.startedAt), at: now }));
-    renameSync(tmp, path);
+    enqueueSteer(steerDirFor(meta.id), { id: `deadline:${meta.id}`, text: steerText(meta.timing!, meta.startedAt), kind: "deadline", at: now });
 }
 
 function timingLabel(meta: RunMeta): string {
@@ -924,8 +921,8 @@ function enforceTiming(pi: ExtensionAPI | undefined, meta: RunMeta, now: number)
     }
     if (timing.steerRequestedAt !== undefined && timing.steerDeliveredAt === undefined) {
         // The child's receipt for this run's steer; clamped so a skewed clock cannot move grace earlier than the request.
-        const receipt = readSteerReceipt(steerPathFor(meta.id));
-        if (receipt?.id === `deadline:${meta.id}`) patch.steerDeliveredAt = Math.min(now, Math.max(receipt.at, timing.steerRequestedAt));
+        const receipt = receiptForId(steerDirFor(meta.id), `deadline:${meta.id}`);
+        if (receipt) patch.steerDeliveredAt = Math.min(now, Math.max(receipt.at, timing.steerRequestedAt));
     }
     if (Object.keys(patch).length) meta = patchTiming(meta.id, patch) ?? meta;
     const actions = decideTiming(meta.timing, progress, now);
@@ -2430,7 +2427,7 @@ export default function (pi: ExtensionAPI) {
             // removed as an empty replacement.
             if (resume) revalidateContinuationUnderLease(resume, callbackOrigin);
             spawned = spawnDetached({ file: cmd.file, fileArgs: cmd.fileArgs, cwd, logPath: logPathFor(id),
-                env: { [STEER_FILE_ENV]: steerPathFor(id) } });
+                env: { [STEER_DIR_ENV]: steerDirFor(id) } });
             // Record process identity (pgid, start-time token) so health
             // reconciliation can tell a supervised child from a recycled pid
             // or an orphaned process group (#63). Best-effort: when the OS
@@ -3002,6 +2999,7 @@ export default function (pi: ExtensionAPI) {
     const acceptanceResultTool = subagentResultTool(Type, toolSession);
     pi.registerTool(acceptanceResultTool);
     publishAcceptanceHooks(acceptanceResultTool);
+    pi.registerTool(subagentSteerTool(Type, toolSession));
     const acceptanceStopTool = subagentStopTool(Type, { onStopped: (id) => {
         renderWidget();
         syncHealthTicker();

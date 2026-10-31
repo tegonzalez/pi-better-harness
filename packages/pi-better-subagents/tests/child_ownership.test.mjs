@@ -5,11 +5,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import childOwnership, { workerMonitoringRefusal } from "../child-ownership.ts";
-import { STEER_FILE_ENV } from "../child-steer.ts";
+import { STEER_DIR_ENV } from "../child-steer.ts";
 
 function harness(worker = true) {
     const handlers = new Map();
-    childOwnership({ on: (name, fn) => handlers.set(name, fn) }, worker ? { [STEER_FILE_ENV]: "/parent-owned/steer.json" } : {});
+    childOwnership({ on: (name, fn) => handlers.set(name, fn) }, worker ? { [STEER_DIR_ENV]: "/parent-owned/steer" } : {});
     return handlers;
 }
 

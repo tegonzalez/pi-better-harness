@@ -15,7 +15,8 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { readMeta, listRunRecords, effectiveStatus, isFinalResultStatus, type RunCallbackOrigin, type RunMeta, type RunStatus } from "./registry.ts";
+import { readMeta, listRunRecords, effectiveStatus, isFinalResultStatus, steerDirFor, type RunCallbackOrigin, type RunMeta, type RunStatus } from "./registry.ts";
+import { enqueueSteer, formatParentSteer, formatSteerLine, formatSteerShort, newSteerId, steerQueueStatus } from "./steer-queue.ts";
 import { buildSubagentResultPayload } from "./finalization.ts";
 import { stopRun } from "./stop.ts";
 import {
@@ -75,10 +76,15 @@ function observeMetaHealth(meta: RunMeta, now: number = Date.now()): HealthObser
     });
 }
 
-/** Health diagnostics plus the harness timing reason (deadline / ceiling / stuck), one line each. */
+/** Steer queue line (pending / delivered / undelivered at the end), or undefined when never steered. */
+function steerLine(meta: RunMeta): string | undefined {
+    return formatSteerLine(steerQueueStatus(steerDirFor(meta.id)), effectiveStatus(meta) === "running");
+}
+
+/** Health diagnostics, the harness timing reason (deadline / ceiling / stuck), and steer delivery, one line each. */
 function diagnosticLines(meta: RunMeta): string {
     const status = String(effectiveStatus(meta));
-    return [formatHealthDiagnosticLine(observeMetaHealth(meta)), describeTiming({ ...meta, status: status === "exited" ? meta.status : status })?.line]
+    return [formatHealthDiagnosticLine(observeMetaHealth(meta)), describeTiming({ ...meta, status: status === "exited" ? meta.status : status })?.line, steerLine(meta)]
         .filter(Boolean).join("\n");
 }
 
@@ -376,6 +382,7 @@ export function subagentListTool(Type: TypeModule, baseSession: SubagentToolSess
                         now,
                         health: healthById(row.meta.id),
                         failure: formatIncidentLabel(incident?.count ?? 0, incident?.actionRequired ?? 0),
+                        steer: formatSteerShort(steerQueueStatus(steerDirFor(row.meta.id)), effectiveStatus(row.meta) === "running"),
                     });
                 },
                 limit: Math.max(1, collected.limit),
@@ -439,6 +446,11 @@ export function subagentOutputTool(Type: TypeModule, baseSession: SubagentToolSe
     } as ToolDefinition;
 }
 
+/** Timing and steer lines for a run that has no result yet. */
+function runningLines(meta: RunMeta): string | undefined {
+    return [describeTiming({ ...meta, status: "running" })?.line, steerLine(meta)].filter(Boolean).join("\n") || undefined;
+}
+
 // ---- subagent_result ------------------------------------------------------
 export function subagentResultTool(Type: TypeModule, baseSession: SubagentToolSession = {}): ToolDefinition {
     return {
@@ -488,11 +500,11 @@ export function subagentResultTool(Type: TypeModule, baseSession: SubagentToolSe
                 if (st === "orphaned") {
                     return resultText(assembleOrphanedResult(p.id, meta, healthLine, p, scopeKey));
                 }
-                return resultText(assembleRunningResult(p.id, meta, p, scopeKey, describeTiming({ ...meta, status: "running" })?.line));
+                return resultText(assembleRunningResult(p.id, meta, p, scopeKey, runningLines(meta)));
             }
             const body = buildSubagentResultPayload(p.id, p, healthLine, scopeKey);
             if (body === null) {
-                return resultText(assembleRunningResult(p.id, meta, p, scopeKey, describeTiming({ ...meta, status: "running" })?.line));
+                return resultText(assembleRunningResult(p.id, meta, p, scopeKey, runningLines(meta)));
             }
             return resultText(body);
         },
@@ -550,6 +562,73 @@ export function subagentStopTool(
                 return text(`Resolved orphaned subagent ${p.id} → ${outcome.status}.`);
             }
             return text(`Stopped subagent ${p.id}.`);
+        },
+    } as ToolDefinition;
+}
+
+// ---- subagent_steer -------------------------------------------------------
+/**
+ * Amend a running child's instructions. The request goes into the run's steer
+ * queue (steer-queue.ts); the child's harness extension (child-steer.ts) hands
+ * it to Pi's steering queue, which delivers it as an ordinary user message at
+ * the child's next turn boundary. The tool returns at once with the request id;
+ * delivery shows up on subagent_list / subagent_output / subagent_result.
+ */
+export function subagentSteerTool(Type: TypeModule, baseSession: SubagentToolSession = {}): ToolDefinition {
+    return {
+        name: "subagent_steer",
+        label: "Steer Subagent",
+        description:
+            "Amend the instructions of one of your own running subagents (current session only). " +
+            "The message is queued at once and delivered to the child as a user message at its next turn boundary, " +
+            "after its current tool call finishes; it never interrupts a running tool call. It works for any provider or model " +
+            "because it is an ordinary user message, framed as an instruction amendment from its parent. " +
+            "Returns the steer id; subagent_list, subagent_output, and subagent_result show pending and delivered steers. " +
+            "Finished, foreign-session, and unknown runs are refused.",
+        promptSnippet: "Amend a running subagent's instructions (delivered at its next turn boundary)",
+        promptGuidelines: [
+            "Use subagent_steer to change or add requirements for one of your running subagents instead of stopping and respawning it. Do not poll for delivery.",
+        ],
+        parameters: Type.Object({
+            id: Type.String({ description: "Run id from subagent_spawn." }),
+            message: Type.String({ description: "The amendment, e.g. \"MTP is now a hard requirement.\"" }),
+        }),
+        async execute(_toolCallId: string, params: unknown, _signal?: unknown, _onUpdate?: unknown, ctx?: unknown) {
+            const session = forCall(baseSession, ctx);
+            const p = (params ?? {}) as { id?: unknown; message?: unknown };
+            const id = typeof p.id === "string" ? p.id.trim() : "";
+            const message = typeof p.message === "string" ? p.message.trim() : "";
+            if (!id) throw new Error("subagent_steer needs a run id.");
+            if (!message) throw new Error("subagent_steer needs a non-empty message.");
+            const access = resolveRunAccess(id, {}, session);
+            if (access.kind === "missing") throw unknownRunError(id);
+            if (access.kind === "unreadable") throw new Error(`Cannot steer ${id}: its run metadata is unreadable (${access.detail}).`);
+            if (access.kind === "denied") {
+                throw new Error(`Cannot steer ${id}: it is not a run of this session (foreign or unverifiable ownership). subagent_steer only steers your own running subagents.`);
+            }
+            const meta = access.meta;
+            const status = String(effectiveStatus(meta));
+            if (status !== "running") {
+                const why = status === "orphaned" ? "its child process is gone" : "it has finished";
+                throw new Error(`Cannot steer ${id}: run is ${status} (${why}); only a running subagent can be steered.`);
+            }
+            const dir = steerDirFor(id);
+            const request = enqueueSteer(dir, { id: newSteerId(), text: formatParentSteer(message), kind: "parent" });
+            const queue = steerQueueStatus(dir);
+            // A print-mode child exits once its agent loop settles; a steer then has no turn to enter.
+            let idle = false;
+            try { idle = extractChildEventFactsFromLog(id).facts.sawAgentSettled; } catch { /* unknown: no warning */ }
+            const lines = [
+                `Queued steer ${request.id} for ${id}. It is delivered at the child's next turn boundary (after its current tool call); delivery is not confirmed yet.`,
+                `Steer queue: ${queue.pending.length} pending, ${queue.delivered} delivered.`,
+                idle
+                    ? "Warning: the child's agent loop has already settled and the run is about to exit, so this steer may not be delivered. If the run ends first, subagent_result reports it as not delivered."
+                    : "Delivery shows on subagent_list / subagent_output / subagent_result; do not poll for it.",
+            ];
+            return {
+                ...text(lines.join("\n")),
+                details: { state: "queued", steerId: request.id, runId: id, pending: queue.pending.length, delivered: queue.delivered, ...(idle ? { mayNotDeliver: true } : {}) },
+            };
         },
     } as ToolDefinition;
 }

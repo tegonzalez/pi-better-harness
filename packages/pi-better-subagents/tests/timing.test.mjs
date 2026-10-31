@@ -1,14 +1,11 @@
 /**
- * Harness timing policy (timing.ts) and the child-side steer delivery (child-steer.ts).
+ * Harness timing policy (timing.ts). Child-side steer delivery is in steer_queue.test.mjs.
  *
  * // @covers subagent.timing
  * // @level unit
  */
-import { describe, it, mock } from "node:test";
+import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import {
@@ -24,7 +21,6 @@ import {
     callKey,
     isMutatingTool,
 } from "../timing.ts";
-import childSteer, { STEER_FILE_ENV, readSteerReceipt } from "../child-steer.ts";
 import { mergeJobOptions } from "../batch.mjs";
 import { findProviderRejectedKeywords } from "../../../scripts/provider-schema-compat.mjs";
 
@@ -246,46 +242,5 @@ describe("timing decisions", () => {
         assert.equal(describeTiming({ startedAt: 0, status: "killed", timing: { ceilingAt: 90 * MIN, graceMs: 0, stopReason: "ceiling" } }).short, "stopped: ceiling");
         assert.equal(describeTiming({ startedAt: 0, timing: { graceMs: 0, stuckMs: MIN, stuckWakeSentAt: 5, stuckAnchorAt: 3 } }).reason, "stuck");
         assert.equal(describeTiming({ startedAt: 0, timing: { graceMs: 0, stuckMs: MIN, stuckWakeSentAt: 5, stuckAnchorAt: 3, lastProgressAt: 9 } }), undefined, "progress since the wake clears it");
-    });
-});
-
-describe("child steer delivery", () => {
-    it("delivers a steer request once, as a steer, only while the agent is working", async () => {
-        const dir = mkdtempSync(join(tmpdir(), "child-steer-"));
-        const path = join(dir, "steer.json");
-        const previous = process.env[STEER_FILE_ENV];
-        process.env[STEER_FILE_ENV] = path;
-        const handlers = new Map();
-        const sent = [];
-        mock.timers.enable({ apis: ["setInterval"] });
-        let idle = true;
-        try {
-            childSteer({ on: (event, fn) => handlers.set(event, fn), sendUserMessage: (text, options) => sent.push({ text, options }) });
-            handlers.get("session_start")({}, { isIdle: () => idle });
-            mock.timers.tick(2_000);
-            assert.equal(sent.length, 0, "no request yet");
-            writeFileSync(path, JSON.stringify({ id: "deadline:sa_x_1", text: "wrap up" }));
-            mock.timers.tick(2_000);
-            assert.equal(sent.length, 0, "an idle child is not prompted");
-            idle = false;
-            mock.timers.tick(2_000);
-            mock.timers.tick(2_000);
-            assert.deepEqual(sent, [{ text: "wrap up", options: { deliverAs: "steer" } }]);
-            assert.equal(readSteerReceipt(path), undefined, "queued behind the current tool call is not delivered yet");
-            handlers.get("message_end")({ message: { role: "user", content: [{ type: "text", text: "other" }] } }, {});
-            handlers.get("message_end")({ message: { role: "assistant", content: [{ type: "text", text: "wrap up" }] } }, {});
-            assert.equal(readSteerReceipt(path), undefined);
-            const before = Date.now();
-            handlers.get("message_end")({ message: { role: "user", content: [{ type: "text", text: "wrap up" }] } }, {});
-            const receipt = readSteerReceipt(path);
-            assert.equal(receipt.id, "deadline:sa_x_1", "a receipt when the steer enters the conversation");
-            assert.ok(receipt.at >= before);
-            handlers.get("session_shutdown")({}, {});
-        } finally {
-            mock.timers.reset();
-            if (previous === undefined) delete process.env[STEER_FILE_ENV];
-            else process.env[STEER_FILE_ENV] = previous;
-            rmSync(dir, { recursive: true, force: true });
-        }
     });
 });
