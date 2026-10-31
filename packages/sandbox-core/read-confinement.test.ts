@@ -267,6 +267,30 @@ describe("symlink closure", () => {
         assert.ok(!withAlt.writeRoots.includes(join(store, "objects")));
     });
 
+    it("fails closed on an existing alternates entry that is denied or not an object directory", () => {
+        const { common, wt } = linkedWorktree("alt-bad");
+        const alternates = join(common, "objects", "info", "alternates");
+        write(alternates, `${join(home, ".ssh")}\n`);
+        assert.throws(() => plan({ version: 1 }, {}, wt), (e: unknown) => e instanceof ReadConfinementError && /alternates/.test(e.message));
+        const notObjects = join(root, "alt-not-objects");
+        mkdirSync(notObjects, { recursive: true });
+        write(alternates, `${notObjects}\n`);
+        assert.throws(() => plan({ version: 1 }, {}, wt), /not a git object directory/);
+        const stored = join(root, "alt-denied-store");
+        mkdirSync(join(stored, "objects", "pack"), { recursive: true });
+        write(join(stored, "HEAD"), "x\n");
+        write(alternates, `${join(stored, "objects")}\n`);
+        assert.throws(() => plan({ version: 1, deny: { paths: [stored] } }, {}, wt), /alternates entry inside denied path/);
+    });
+
+    it("refuses a policy file inside any other active profile's writable root", () => {
+        const source = "/pi-test-nonexistent-writable-root/sub/policy.json";
+        const attempt = (extra?: string[]) => planReadConfinement({ policy: parseReadConfinementPolicy({ version: 1 }), source, sha256: "x" }, project,
+            { home, env: { PATH: "/usr/bin" }, passwdHomes: () => [], ...(extra && { extraWritableRoots: extra }) });
+        assert.doesNotThrow(() => attempt());
+        assert.throws(() => attempt(["/pi-test-nonexistent-writable-root"]), /policy file .* is inside \/pi-test-nonexistent-writable-root/);
+    });
+
     it("computes the plan from a snapshot: later project changes are not in an already-built plan", () => {
         const proj = join(root, "work", "frozen");
         mkdirSync(proj, { recursive: true });
@@ -586,6 +610,79 @@ describe("real bubblewrap", { skip: !bwrapUsable && "usable bubblewrap is not av
         assert.notEqual(run(result, `echo '#!/bin/sh' > '${join(common, "hooks", "pre-commit")}'`, wt).status, 0);
         assert.notEqual(run(result, `echo '[core]' >> '${join(common, "config")}'`, wt).status, 0);
         assert.equal(existsSync(join(common, "hooks", "pre-commit")), false);
+    });
+
+    /** Same write-deny set in the kernel boundary and in the in-process tools, for every writable git dir. */
+    function parityCheck(result: ReturnType<typeof plan>, at: string, denied: string[], allowed: string[]) {
+        const permissions = { projectFiles: "read-write", outsideProject: "off", storedCredentials: "off", commands: true, network: false } as const;
+        const compiled = compileWritePolicy({ writableRoot: at, home, denyWrite: [], permissions, readConfinement: result });
+        for (const path of allowed) mkdirSync(join(path, ".."), { recursive: true });
+        const expectDenied = new Set(denied);
+        for (const path of [...denied, ...allowed]) {
+            const kernel = run(result, `echo x > '${path}'`, at).status === 0;
+            const inProcess = evaluateWriteAccess(path, compiled).allowed;
+            assert.equal(kernel, !expectDenied.has(path), `bwrap ${expectDenied.has(path) ? "must deny" : "must allow"} ${path}`);
+            assert.equal(inProcess, !expectDenied.has(path), `in-process ${expectDenied.has(path) ? "must deny" : "must allow"} ${path}`);
+        }
+    }
+
+    it("one write-deny set for a linked worktree's git dirs, identical in bwrap and in-process", () => {
+        const main = join(root, "par-main");
+        const common = join(main, ".git");
+        const gitdir = join(common, "worktrees", "wt");
+        const sibling = join(common, "worktrees", "sib");
+        write(join(common, "HEAD"), "ref: x\n");
+        write(join(common, "config"), "[core]\n");
+        mkdirSync(join(common, "objects", "info"), { recursive: true });
+        mkdirSync(join(common, "objects", "ab"), { recursive: true });
+        mkdirSync(join(common, "refs", "heads"), { recursive: true });
+        mkdirSync(join(common, "hooks"), { recursive: true });
+        mkdirSync(join(common, "info"), { recursive: true });
+        write(join(common, "modules", "sub", "HEAD"), "ref: x\n");
+        write(join(common, "modules", "sub", "config"), "[core]\n");
+        mkdirSync(join(common, "modules", "sub", "hooks"), { recursive: true });
+        for (const dir of [gitdir, sibling]) {
+            write(join(dir, "HEAD"), "ref: y\n");
+            write(join(dir, "commondir"), "../..\n");
+        }
+        const wt = join(root, "work", "par-wt");
+        write(join(wt, ".git"), `gitdir: ${gitdir}\n`);
+        write(join(gitdir, "gitdir"), `${join(wt, ".git")}\n`);
+        write(join(sibling, "gitdir"), `${join(root, "work", "elsewhere", ".git")}\n`);
+        mkdirSync(join(gitdir, "logs"), { recursive: true });
+        const result = plan({ version: 1 }, {}, wt);
+        for (const expected of [join(common, "hooks"), join(common, "config"), join(gitdir, "config.worktree"), join(common, "info", "attributes"),
+            join(common, "objects", "info", "alternates"), join(common, "objects", "info", "http-alternates"), join(gitdir, "commondir"), join(gitdir, "gitdir"),
+            join(common, "modules", "sub", "hooks"), join(common, "modules", "sub", "config"), sibling]) {
+            assert.ok(result.denyWrite?.includes(expected), `plan.denyWrite lists ${expected}`);
+        }
+        parityCheck(result, wt, [
+            join(common, "hooks", "pre-commit"), join(common, "config"), join(gitdir, "config.worktree"), join(gitdir, "config"),
+            join(common, "info", "attributes"), join(gitdir, "info", "attributes"), join(common, "objects", "info", "alternates"),
+            join(common, "objects", "info", "http-alternates"), join(gitdir, "commondir"), join(gitdir, "gitdir"),
+            join(common, "modules", "sub", "hooks", "post-commit"), join(common, "modules", "sub", "config"),
+            join(sibling, "HEAD"), join(sibling, "gitdir"), join(sibling, "new-file"), join(gitdir, "hooks", "pre-push"),
+        ], [
+            join(gitdir, "HEAD"), join(gitdir, "index"), join(gitdir, "ORIG_HEAD"), join(gitdir, "logs", "HEAD"),
+            join(common, "refs", "heads", "topic"), join(common, "packed-refs"), join(common, "objects", "ab", "cdef"),
+        ]);
+    });
+
+    it("the same set guards an in-project .git, in bwrap and in-process", () => {
+        const proj = join(root, "work", "par-inproject");
+        write(join(proj, ".git", "HEAD"), "ref: x\n");
+        write(join(proj, ".git", "config"), "[core]\n");
+        mkdirSync(join(proj, ".git", "objects", "info"), { recursive: true });
+        mkdirSync(join(proj, ".git", "refs", "heads"), { recursive: true });
+        write(join(proj, ".git", "worktrees", "other", "HEAD"), "ref: y\n");
+        write(join(proj, ".git", "modules", "m", "HEAD"), "ref: y\n");
+        write(join(proj, ".git", "modules", "m", "config"), "[core]\n");
+        const result = plan({ version: 1 }, {}, proj);
+        parityCheck(result, proj, [
+            join(proj, ".git", "hooks", "pre-commit"), join(proj, ".git", "config"), join(proj, ".git", "config.worktree"),
+            join(proj, ".git", "info", "attributes"), join(proj, ".git", "objects", "info", "alternates"),
+            join(proj, ".git", "worktrees", "other", "HEAD"), join(proj, ".git", "modules", "m", "config"),
+        ], [join(proj, ".git", "HEAD"), join(proj, ".git", "index"), join(proj, ".git", "refs", "heads", "x"), join(proj, "file.txt")]);
     });
 
     it("a .git redirect to another project does not make that project writable", () => {
