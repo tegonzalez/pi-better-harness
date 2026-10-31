@@ -22,6 +22,7 @@ import {
 } from "./deny-rules.ts";
 import { openSandboxRulesPage } from "./rules-page.ts";
 import { formatSandboxReport } from "./status.ts";
+import { formatPathCheck, formatWorkspace } from "./workspace.ts";
 import type { ForegroundSandboxController, ForegroundSandboxStatus } from "./state.ts";
 import { DIAGNOSTICS_ACTIONS, handleDiagnosticsCommand } from "./diagnostics-command.ts";
 
@@ -42,6 +43,8 @@ const USAGE = [
     "  /sandbox deny remove <path>",
     "  /sandbox deny reset",
     "  /sandbox rules",
+    "  /sandbox workspace",
+    "  /sandbox check <path>",
     "  /sandbox diagnostics [status|on|off|summary|export|confinement]",
 ].join("\n");
 
@@ -112,12 +115,27 @@ export function createSandboxCommandHandler({
             return;
         }
 
+        if (subcommand === "workspace") {
+            ctx.ui.notify(formatWorkspace(controller.workspaceInfo()), "info");
+            return;
+        }
+
+        if (subcommand === "check") {
+            if (rest === "") {
+                ctx.ui.notify("/sandbox check needs a path.\n\n" + USAGE, "error");
+                return;
+            }
+            try { ctx.ui.notify(formatPathCheck(controller.checkPath(rest)), "info"); }
+            catch (error) { ctx.ui.notify(`Could not check ${rest}: ${error instanceof Error ? error.message : String(error)}`, "error"); }
+            return;
+        }
+
         if (subcommand === "") {
             if (openPermissions && ctx.mode === "tui") {
                 await openPermissions(ctx);
                 return;
             }
-            ctx.ui.notify(formatSandboxReport(controller.status()), "info");
+            ctx.ui.notify(`${formatSandboxReport(controller.status())}\n\n${formatWorkspace(controller.workspaceInfo())}`, "info");
             return;
         }
 
@@ -280,7 +298,7 @@ function announce(ctx: ExtensionCommandContext, change: () => DenyRuleReport): v
     }
 }
 
-const SUBCOMMANDS = ["on", "off", "default", "deny", "rules", "diagnostics"] as const;
+const SUBCOMMANDS = ["on", "off", "default", "deny", "rules", "workspace", "check", "diagnostics"] as const;
 const DENY_ACTIONS = ["list", "add", "remove", "reset"] as const;
 
 const COMPLETION_DESCRIPTIONS: Readonly<Record<string, string>> = {
@@ -295,6 +313,8 @@ const COMPLETION_DESCRIPTIONS: Readonly<Record<string, string>> = {
     "deny remove": "Remove a write-denied path",
     "deny reset": "Restore packaged write-deny defaults",
     rules: "Open the write-deny rule manager",
+    workspace: "Show the active workspace: working folder, agent dir, policy and hashes",
+    check: "Report the read, write and exec decision and reason for a path",
     diagnostics: "Collect and analyze local redacted permission observations",
 };
 
