@@ -120,6 +120,7 @@ function confinementMounts(plan: ReadConfinementPlan): ReadConfinementMounts {
         ...(plan.denyWrite && { denyWrite: plan.denyWrite }),
         ...(plan.denyRemove && { denyRemove: plan.denyRemove }),
         ...(plan.overlayArgs && { overlayArgs: plan.overlayArgs }),
+        ...(plan.gitFile && { gitFile: plan.gitFile }),
     };
 }
 
@@ -295,17 +296,24 @@ export class ForegroundSandboxController {
             .sort((a, b) => b.path.length - a.path.length)[0];
         const root = status.writableRoot;
         const inProject = root !== undefined && (path === root || path.startsWith(root + sep));
-        const readVerdict: AccessVerdict = read.allowed
+        // /tmp is a private, empty tmpfs: writable and readable inside the sandbox, never the host's /tmp.
+        const tmp = canonicalizePath("/tmp", this.#seams);
+        const privateTmp = mounts !== undefined && !inProject && !bind && (path === tmp || path.startsWith(tmp + sep));
+        const readVerdict: AccessVerdict = privateTmp
+            ? { allowed: true, reason: "private tmpfs /tmp (empty at start, discarded with the command; host /tmp files are not visible)" }
+            : read.allowed
             ? { allowed: true, reason: bind ? `${bind.mode === "rw" ? "read-write" : "read-only"} mount: ${bind.reason} (${bind.path})`
                 : inProject ? "inside the working folder" : mounts ? "system runtime root" : "allowed by the Outside project permission" }
             : { allowed: false, reason: mounts ? "not mounted: outside the working folder, runtime roots and approved or bound locations (the kernel reports No such file or directory)" : `${read.reason} (permission)` };
-        const writeVerdict: AccessVerdict = write.allowed
+        const writeVerdict: AccessVerdict = privateTmp && (write.allowed || write.reason !== "write-denied")
+            ? { allowed: true, reason: "private tmpfs /tmp (writable scratch, not shared with the host)" }
+            : write.allowed
             ? { allowed: true, reason: inProject ? "inside the writable working folder" : bind ? `writable mount: ${bind.reason}` : "allowed by the file permissions (private scratch or a writable location)" }
             : { allowed: false, reason: `${write.reason}${"deniedBy" in write && write.deniedBy ? ` by ${write.deniedBy}` : ""}${read.allowed ? " (readable but not writable)" : ""}` };
         const commands = status.permissions?.commands !== false;
         const tool = audit?.syntheticPath?.tools.find((t) => t.target === path);
         const exec: AccessVerdict = !commands ? { allowed: false, reason: "Run commands & applications is Off" }
-            : !read.allowed ? { allowed: false, reason: "not mounted, so it cannot be executed" }
+            : !readVerdict.allowed ? { allowed: false, reason: "not mounted, so it cannot be executed" }
             : tool ? { allowed: true, reason: `approved tool ${tool.name} on the synthetic PATH` }
             : { allowed: true, reason: "readable, so runnable by absolute path (approval only controls PATH lookups)" };
         return { input: target, path, read: readVerdict, write: writeVerdict, exec };
