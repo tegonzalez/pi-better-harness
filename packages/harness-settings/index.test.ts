@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { closeSync, lstatSync, mkdtempSync, openSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { closeSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { SettingsManager } from "@earendil-works/pi-coding-agent";
-import { harnessSettingsPath, readHarnessSetting, updateHarnessSetting } from "./index.ts";
+import { bundledConfigPath, harnessSettingsPath, readHarnessSetting, updateHarnessSetting } from "./index.ts";
 
 function fixture(t: { after(fn: () => void): void }) {
   const root = mkdtempSync(join(tmpdir(), "harness-settings-"));
@@ -96,4 +96,18 @@ test("independent Pi and Harness processes update settings without losing siblin
       goal: { saved: true }, callbacks: { saved: true }, sandbox: { saved: true }, subagents: { saved: true },
     },
   });
+});
+test("one bundled-config resolver: a package's own dir, or a guard's sibling checkout then the agent dir install", t => {
+  const f = fixture(t);
+  assert.equal(bundledConfigPath("pkg-x", { selfDir: "/opt/pkg-x" }), "/opt/pkg-x/config.json");
+  const here = join(f.root, "pkgs", "caller");
+  const sibling = join(f.root, "pkgs", "pkg-x", "config.json");
+  const installed = join(f.root, "npm", "node_modules", "pkg-x", "config.json");
+  assert.equal(bundledConfigPath("pkg-x", { fromDir: here, seams: f.seams }), sibling, "nothing exists: the sibling path");
+  mkdirSync(join(f.root, "npm", "node_modules", "pkg-x"), { recursive: true });
+  writeFileSync(installed, "{}");
+  assert.equal(bundledConfigPath("pkg-x", { fromDir: here, seams: f.seams }), installed);
+  mkdirSync(join(f.root, "pkgs", "pkg-x"), { recursive: true });
+  writeFileSync(sibling, "{}");
+  assert.equal(bundledConfigPath("pkg-x", { fromDir: here, seams: f.seams }), sibling, "the sibling checkout wins");
 });

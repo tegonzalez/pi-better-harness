@@ -4,21 +4,13 @@
  * the target. While the parent's Network access is Off that is network use, so
  * the guard refuses it like any other network-capable tool.
  */
-import { dirname, join } from "node:path";
+import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { bundledConfigPath, legacyExtensionConfigPath, resolveHarnessSection, type HarnessSettingsSeams } from "./shared-harness-settings.ts";
 
-import { legacyExtensionConfigPath, resolveHarnessSection, type HarnessSettingsSeams } from "./shared-harness-settings.ts";
 
 const SUBAGENTS_PACKAGE = "pi-better-subagents";
-
-/** Where the subagents package's bundled config.json can be: a sibling checkout, or the agent dir's npm install. */
-function bundledSubagentsConfigs(seams: HarnessSettingsSeams): string[] {
-    const here = dirname(fileURLToPath(import.meta.url));
-    const agentDir = (seams.agentDir ?? getAgentDir)();
-    return [join(here, "..", SUBAGENTS_PACKAGE, "config.json"), join(agentDir, "npm", "node_modules", SUBAGENTS_PACKAGE, "config.json")];
-}
 
 export const REMOTE_SPAWN_TOOLS: readonly string[] = ["subagent_spawn", "subagent_spawn_batch"];
 
@@ -38,7 +30,7 @@ export function readRemoteAgents(
     try {
         const section = resolveHarnessSection<{ remoteAgents?: unknown }>("subagents", {
             seams,
-            bundledPaths: seams.bundledPaths ?? bundledSubagentsConfigs(seams),
+            bundledPaths: seams.bundledPaths ?? [bundledConfigPath(SUBAGENTS_PACKAGE, { fromDir: dirname(fileURLToPath(import.meta.url)), seams })],
             legacy: {
                 path: legacyExtensionConfigPath(`${SUBAGENTS_PACKAGE}`, seams),
                 parse: (value) => {

@@ -12,6 +12,22 @@ const lockfile = createRequire(import.meta.url)("proper-lockfile") as {
 const NAMESPACE = "piBetterHarness";
 export interface HarnessSettingsSeams { agentDir?: () => string }
 
+/**
+ * The one resolver for a package's bundled `config.json`, used by the package itself (`selfDir`: its own
+ * directory) and by guards in other packages (`fromDir`: the calling package's directory). A guard looks
+ * for a sibling checkout, then the agent dir's npm install, and takes the first that exists; with none it
+ * names the sibling path, which then simply contributes no defaults.
+ */
+export function bundledConfigPath(
+  packageName: string,
+  where: { selfDir: string } | { fromDir: string; seams?: HarnessSettingsSeams },
+): string {
+  if ("selfDir" in where) return join(where.selfDir, "config.json");
+  const agentDir = (where.seams?.agentDir ?? getAgentDir)();
+  const candidates = [join(where.fromDir, "..", packageName, "config.json"), join(agentDir, "npm", "node_modules", packageName, "config.json")];
+  return candidates.find((path) => existsSync(path)) ?? candidates[0]!;
+}
+
 export function harnessSettingsPath(seams: HarnessSettingsSeams = {}): string {
   return join((seams.agentDir ?? getAgentDir)(), "settings.json");
 }

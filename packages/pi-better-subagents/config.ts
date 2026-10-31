@@ -15,7 +15,7 @@ import { homedir } from "node:os";
 import { SELF_SPEC } from "./extensions.ts";
 import { isDelegationMode, type DelegationMode } from "./delegation.ts";
 import type { TimingSettings } from "./timing.ts";
-import { harnessSettingsPath, legacyExtensionConfigPath, readHarnessSetting, resolveHarnessSection, updateHarnessSetting } from "./shared-harness-settings.ts";
+import { bundledConfigPath as sharedBundledConfigPath, harnessSettingsPath, legacyExtensionConfigPath, readHarnessSetting, resolveHarnessSection, updateHarnessSetting } from "./shared-harness-settings.ts";
 
 export interface SubagentConfig extends TimingSettings {
     /** Foreground delegation policy; /subagents mode overrides this for the current session. */
@@ -137,7 +137,7 @@ function savedConfig(): SubagentConfig {
 }
 
 function bundledConfigPath(): string | undefined {
-    return bundledConfigPathForTests ?? (configPathForTests ? undefined : join(selfDir(), "config.json"));
+    return bundledConfigPathForTests ?? (configPathForTests ? undefined : sharedBundledConfigPath("pi-better-subagents", { selfDir: selfDir() }));
 }
 
 function bundledConfig(): SubagentConfig {
