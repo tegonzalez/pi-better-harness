@@ -34,7 +34,7 @@ import {
     statSync,
     writeFileSync,
 } from "node:fs";
-import { basename, delimiter, dirname, isAbsolute, join, parse, resolve, sep } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 
 /** Identifies which kernel mechanism a plan will use. */
 export type SandboxBackendId = "macos-seatbelt" | "linux-bubblewrap";
@@ -92,6 +92,11 @@ export type ReadConfinementMounts = {
     denyRemove?: readonly string[];
     /** Read-only overlays inside the project; mounted after the project's own writable bind. */
     overlayArgs?: readonly string[];
+    /**
+     * Set when the project's `.git` is a file (linked worktree, submodule): the git dirs it resolves to. A deny entry
+     * below that file (`.git/hooks`) names the same thing in each of those dirs, so it is mapped there when compiled.
+     */
+    gitFile?: { readonly path: string; readonly dirs: readonly string[] };
 };
 
 /** Environment variable naming the read-confinement policy file. Its presence means a profile requires confinement. */
@@ -277,6 +282,8 @@ export type CompiledSandboxWritePolicy = {
     /** Present only for the broad-write profile (Outside project = `write`). */
     readonly broad?: CompiledBroadWrite;
     readonly readConfinement?: ReadConfinementMounts;
+    /** Deny entries mapped out of a `.git` file into the git dirs it redirects to (see `ReadConfinementMounts.gitFile`). */
+    readonly redirectedDeny?: readonly string[];
 };
 
 /** The canonical inputs of a broad-write profile. */
@@ -471,12 +478,22 @@ function compile(
     // The broad profile also keeps each literal entry: its removal grants would
     // otherwise let a task replace a symlinked control path.
     const lexicalDeny = isBroadWritePermissions(policy.permissions);
-    const denyWrite = [
+    const rawDeny = [
         ...new Set((policy.denyWrite ?? []).flatMap((entry) => lexicalDeny
             ? [resolve(entry), ...symlinkHops(entry), canonicalizePath(entry, seams)] : [canonicalizePath(entry, seams)])),
-    ].sort();
+    ];
 
     const readConfinement = effectiveReadConfinement(policy, writableRoot, seams);
+    // Nothing can be created below a `.git` file: an entry under it stands for the same relative path in the git
+    // dir(s) it redirects to (hooks live there), which is where the sandbox and the file tools must protect it.
+    const gitFile = readConfinement?.gitFile;
+    const redirected = new Set<string>();
+    const denyWrite = [...new Set(rawDeny.flatMap((entry) => {
+        if (!gitFile || entry === gitFile.path || !contains(gitFile.path, entry)) return [entry];
+        const mapped = gitFile.dirs.map((dir) => join(dir, relative(gitFile.path, entry)));
+        for (const path of mapped) redirected.add(path);
+        return mapped;
+    }))].sort();
     const broadMode = isBroadWritePermissions(policy.permissions);
     const compatibilityWrite = broadMode ? [] : compatibilityPaths(policy, seams);
     const runtimeWrite = [...new Set([
@@ -485,6 +502,7 @@ function compile(
     ])];
     return {
         writableRoot, denyWrite, home: policy.home,
+        ...(redirected.size && { redirectedDeny: [...redirected].sort() }),
         ...(readConfinement && {
             readConfinement: {
                 args: [...readConfinement.args],
@@ -496,6 +514,7 @@ function compile(
                 ...(readConfinement.denyWrite && { denyWrite: [...new Set(readConfinement.denyWrite.map((path) => canonicalizePath(path, seams)))].sort() }),
                 ...(readConfinement.denyRemove && { denyRemove: [...new Set(readConfinement.denyRemove.map((path) => canonicalizePath(path, seams)))].sort() }),
                 ...(readConfinement.overlayArgs && { overlayArgs: [...readConfinement.overlayArgs] }),
+                ...(readConfinement.gitFile && { gitFile: { path: readConfinement.gitFile.path, dirs: [...readConfinement.gitFile.dirs] } }),
             },
         }),
         ...(policy.permissions && {
@@ -1419,10 +1438,14 @@ function buildLinuxPermissionCommand(
     }
     const protectedPaths = [...policy.denyWrite,
         ...(permissions.storedCredentials !== "read-write" ? overlappingCredentials : [])];
+    // Deny entries mapped into a redirected git dir are enforced there, in the plan's writable git dirs.
+    const redirectedRoots = (policy.readConfinement?.writeRoots ?? []).filter((root) => root !== project &&
+        policy.redirectedDeny?.some((path) => contains(root, path)));
     for (const writableRoot of [...(writableProject ? [project] : []),
-        ...(policy.runtimeWrite ?? []).filter((path) => !compatibility.includes(path))]) {
+        ...(policy.runtimeWrite ?? []).filter((path) => !compatibility.includes(path)), ...redirectedRoots]) {
         const materialize = seams.materializeDenyPath ?? materializeDenyPath;
-        const leaves = protectedPaths.filter((path) => contains(writableRoot, path));
+        const mappedOnly = redirectedRoots.includes(writableRoot);
+        const leaves = protectedPaths.filter((path) => contains(writableRoot, path) && (!mappedOnly || policy.redirectedDeny?.includes(path)));
         for (const path of leaves) {
             if (!materialize(path)) throw new Error(`Cannot protect denied path: ${path}`);
         }
