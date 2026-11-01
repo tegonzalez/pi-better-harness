@@ -704,8 +704,25 @@ describe("subagent_spawn_batch end-to-end", () => {
         assert.equal(res.structuredContent.status, "not-launched");
         assert.deepEqual(res.structuredContent.launched, []);
         assert.deepEqual(res.structuredContent.failed, []);
-        assert.deepEqual(res.structuredContent.skipped, [{ job: 1, name: "waiting" }]);
+        assert.deepEqual(res.structuredContent.skipped, [{ job: 1, name: "waiting", reason: "capacity full" }]);
         assert.deepEqual(registry.listMetas().map(({ id }) => id).sort(), before);
+    });
+
+    it("reports a launched job's tool warning in text and details", async () => {
+        const { tools } = loadExtension(mod);
+        const res = await tools.subagent_spawn_batch.execute("tc-warn", {
+            shared: { sandbox: false },
+            jobs: [
+                { prompt: "plain", name: "plain", tools: "read,bash" },
+                { prompt: "missing tool", name: "unmapped", tools: "read,no_such_tool_xyz" },
+            ],
+        }, null, null, makeCtx());
+        const text = res.content[0].text;
+        assert.equal(res.details.status, "launched");
+        assert.match(text, /^• #1 plain → sa_[a-z0-9_]+$/m);
+        assert.match(text, /^• #2 unmapped → sa_[a-z0-9_]+ · NOTE: no extension mapped for no_such_tool_xyz/m);
+        assert.equal(res.details.launched[0].warning, undefined);
+        assert.match(res.details.launched[1].warning, /no_such_tool_xyz.*will NOT exist in the child/);
     });
 
     it("launch-available partial launch reports skipped jobs", async () => {
@@ -731,9 +748,9 @@ describe("subagent_spawn_batch end-to-end", () => {
 
         const text = res.content[0].text;
         assert.match(text, /launched 1 subagent\(s\):/i);
-        assert.match(text, /Skipped \(capacity\): job-2/);
+        assert.match(text, /^• #2 job-2: capacity full$/m);
         assert.equal(res.structuredContent.status, "partial");
-        assert.deepEqual(res.structuredContent.skipped, [{ job: 2, name: "job-2" }]);
+        assert.deepEqual(res.structuredContent.skipped, [{ job: 2, name: "job-2", reason: "capacity full" }]);
         assert.equal(registry.readMeta(res.structuredContent.launched[0].id).batchId, res.structuredContent.batchId);
     });
 
@@ -765,7 +782,7 @@ describe("subagent_spawn_batch end-to-end", () => {
 
             const text = res.content[0].text;
             assert.match(text, /launched 1 subagent\(s\):/i);
-            assert.match(text, /Failed \(1\): job-2: .*@juicesharp\/rpiv-web-tools/);
+            assert.match(text, /^Failed \(1\):\n• #2 job-2: .*@juicesharp\/rpiv-web-tools/m);
             const launchedId = text.match(/→ (sa_[a-z0-9_]+)/)?.[1];
             assert.ok(launchedId);
             const meta = registry.readMeta(launchedId);
@@ -808,12 +825,16 @@ describe("subagent_spawn_batch end-to-end", () => {
 
             const text = res.content[0].text;
             assert.match(text, /launched 1 subagent\(s\):/i);
-            assert.match(text, /• ok → sa_/);
-            assert.match(text, /Failed \(2\):/);
-            assert.match(text, /bad: .*@juicesharp\/rpiv-web-tools/);
-            assert.match(text, /later: not launched due to earlier job failure in reject mode/);
+            assert.match(text, /^• #1 ok → sa_/m);
+            assert.match(text, /^Failed \(2\):$/m);
+            assert.match(text, /^• #2 bad: .*@juicesharp\/rpiv-web-tools/m);
+            assert.match(text, /^• #3 later: not launched due to earlier job failure in reject mode$/m);
+            assert.equal(res.details.status, "partial");
+            assert.deepEqual(res.details.launched.map(({ job, name }) => [job, name]), [[1, "ok"]]);
+            assert.deepEqual(res.details.failed.map(({ job, name }) => [job, name]), [[2, "bad"], [3, "later"]]);
+            assert.match(res.details.failed[0].reason, /@juicesharp\/rpiv-web-tools/);
             // The already-launched run must still be running (no auto-stop).
-            const launchedId = text.match(/• ok → (sa_[a-z0-9_]+)/)?.[1];
+            const launchedId = text.match(/• #1 ok → (sa_[a-z0-9_]+)/)?.[1];
             assert.ok(launchedId);
             assert.equal(registry.readMeta(launchedId).status, "running");
             // Released unused reservations so later spawns are not blocked.
@@ -872,10 +893,10 @@ describe("subagent_spawn_batch end-to-end", () => {
 
             const text = res.content[0].text;
             assert.match(text, /launched 1 subagent\(s\):/i);
-            assert.match(text, /• good → sa_/);
-            assert.match(text, /Failed \(1\): bad: .*@juicesharp\/rpiv-web-tools/);
-            assert.match(text, /Skipped \(capacity\): third/);
-            const launchedId = text.match(/• good → (sa_[a-z0-9_]+)/)?.[1];
+            assert.match(text, /^• #2 good → sa_/m);
+            assert.match(text, /^Failed \(1\):\n• #1 bad: .*@juicesharp\/rpiv-web-tools/m);
+            assert.match(text, /^Skipped \(1\):\n• #3 third: capacity full$/m);
+            const launchedId = text.match(/• #2 good → (sa_[a-z0-9_]+)/)?.[1];
             assert.ok(launchedId);
             assert.equal(registry.readMeta(launchedId).status, "running");
         } finally {

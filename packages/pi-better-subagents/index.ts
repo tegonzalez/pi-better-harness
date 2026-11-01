@@ -3012,9 +3012,9 @@ export default function (pi: ExtensionAPI) {
 
             const names = assignBatchJobNames(p.jobs);
             const batchId = nextBatchId();
-            const launched: { job: number; name: string; id: string; sessionId: string; continuedFrom?: string; modelNote?: string }[] = [];
+            const launched: { job: number; name: string; id: string; sessionId: string; continuedFrom?: string; modelNote?: string; warning?: string }[] = [];
             const failed: { job: number; name: string; reason: string }[] = [];
-            const skipped: { job: number; name: string }[] = [];
+            const skipped: { job: number; name: string; reason: string }[] = [];
             // How many reject-mode reserved slots are still held (not yet committed/released).
             let reservedRemaining = launchAvailable ? 0 : p.jobs.length;
 
@@ -3035,7 +3035,7 @@ export default function (pi: ExtensionAPI) {
                 if (launchAvailable) {
                     if (!gate.tryReserve(1, activeConcurrencyCap())) {
                         for (let j = i; j < p.jobs.length; j++) {
-                            skipped.push({ job: j + 1, name: names[j] });
+                            skipped.push({ job: j + 1, name: names[j], reason: "capacity full" });
                         }
                         break;
                     }
@@ -3066,13 +3066,16 @@ export default function (pi: ExtensionAPI) {
                             launch as unknown as Record<string, unknown>, plan.recipe, `Job ${i + 1}: `, { includeName: false },
                         );
                     }
-                    const { id, meta, modelNote } = await spawnSubagentRun(ctx, { ...launch, name }, { batchId, batchName: p.batchName }, plan);
+                    const { id, meta, modelNote, warn } = await spawnSubagentRun(ctx, { ...launch, name }, { batchId, batchName: p.batchName }, plan);
                     gate.commit(1);
                     if (!launchAvailable) reservedRemaining -= 1;
+                    // The same disabled/unmapped-tool warning a single spawn prints; a batch must not drop it.
+                    const warning = warn.trim().replace(/\s*\n\s*/g, " ");
                     launched.push({
                         job: i + 1, name, id, sessionId: meta.sessionId,
                         ...(plan ? { continuedFrom: plan.prior.id } : {}),
                         ...(modelNote ? { modelNote } : {}),
+                        ...(warning ? { warning } : {}),
                     });
                 } catch (err) {
                     gate.release(1);
