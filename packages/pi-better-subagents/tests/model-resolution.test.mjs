@@ -77,6 +77,7 @@ function openFixture(files = []) {
     });
     return {
         snapshot,
+        root,
         cleanup() {
             rmSync(root, { recursive: true, force: true });
         },
@@ -483,7 +484,8 @@ describe("T09 T10 T17 fallback", () => {
                 assert.match(message, unavailable);
                 assert.match(message, /pass model explicitly/i);
                 assert.match(message, /set an available (model override for agent\.pay, or an available )?defaults\.model for role\.architect/);
-                assert.match(message, /personal role file ~\/\.pi\/agent\/agents\/roles\/role\.architect\.md or with \/agents/);
+                // The role comes from the personal catalog: the fix names the file it was loaded from.
+                assert.ok(message.includes(`personal role file ${join(fixture.root, "user", "agents", "roles", "role.architect.md")} or with /agents`), message);
                 assert.match(message, /tierPolicy/);
                 assert.match(message, /listed in that tier's members/);
                 assert.match(message, /provider other than openai needs crossProvider: true/);
@@ -494,6 +496,52 @@ describe("T09 T10 T17 fallback", () => {
             }
         } finally {
             fixture.cleanup();
+        }
+    });
+
+    it("names the role file to fix by where the role came from: the project file, or the personal path for a shipped role", () => {
+        const root = mkdtempSync(join(tmpdir(), "pi-model-resolution-hint-"));
+        const cwd = join(root, "project");
+        const projectRoles = join(cwd, ".pi", "agents", "roles");
+        const agentDir = join(root, "agent-dir");
+        mkdirSync(projectRoles, { recursive: true });
+        writeFileSync(join(projectRoles, "role.architect.md"), roleMarkdown("role.architect", { model: "openai/gpt-6-astra" }));
+        const projectAgents = join(cwd, ".pi", "agents", "agents");
+        mkdirSync(projectAgents, { recursive: true });
+        writeFileSync(join(projectAgents, "agent.plan.md"), agentMarkdown("agent.plan", "role.architect"));
+        const saved = process.env.PI_CODING_AGENT_DIR;
+        const fixMessage = (snapshot, selector, extra = {}) => {
+            const decision = resolveModel({
+                effective: select(snapshot, selector),
+                registry: registryOf([model("github-copilot", "claude-opus-5.5")]),
+                foregroundModel: "github-copilot/claude-opus-5.5",
+                ...extra,
+            });
+            assert.equal(decision.status, "blocked");
+            return decision.diagnostics.find((item) => item.code === ModelResolutionCodes.unavailableDefaultModel).message;
+        };
+        try {
+            const snapshot = loadCatalog({ cwd, userRoot: join(root, "user"), bundledRoot: bundledRolesRoot(), projectTrusted: true });
+            const projectFile = join(projectRoles, "role.architect.md");
+            for (const selector of [{ roleId: "role.architect" }, { agentId: "agent.plan" }]) {
+                const message = fixMessage(snapshot, selector);
+                assert.ok(message.includes(`in the project role file ${projectFile} or with /agents`), message);
+                assert.doesNotMatch(message, /personal role file/);
+            }
+
+            // A shipped role names the personal file that would replace it, under PI_CODING_AGENT_DIR.
+            process.env.PI_CODING_AGENT_DIR = agentDir;
+            const shipped = fixMessage(snapshot, { roleId: "role.reviewer" });
+            assert.ok(shipped.includes(`in the personal role file ${join(agentDir, "agents", "roles", "role.reviewer.md")} or with /agents`), shipped);
+            // A caller-supplied personal root wins over the environment.
+            const supplied = fixMessage(snapshot, { roleId: "role.reviewer" }, { userRoot: join(root, "user") });
+            assert.ok(supplied.includes(`personal role file ${join(root, "user", "agents", "roles", "role.reviewer.md")} or`), supplied);
+            delete process.env.PI_CODING_AGENT_DIR;
+            assert.match(fixMessage(snapshot, { roleId: "role.reviewer" }), /personal role file ~\/\.pi\/agent\/agents\/roles\/role\.reviewer\.md or with \/agents/);
+        } finally {
+            if (saved === undefined) delete process.env.PI_CODING_AGENT_DIR;
+            else process.env.PI_CODING_AGENT_DIR = saved;
+            rmSync(root, { recursive: true, force: true });
         }
     });
 
