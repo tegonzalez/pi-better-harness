@@ -36,12 +36,18 @@ import {
     bubblewrapExecutable,
     hardeningStates,
     HARDENING_MEASURES,
+    parseResourcesPolicy,
     resolveHardening,
+    resourceStates,
+    sizeToBytes,
     RUNTIME_ROOTS,
     type HardeningState,
     type HardeningSwitches,
     type ReadConfinementMounts,
     type ResolvedHardening,
+    type ResolvedResources,
+    type ResourcesPolicy,
+    type ResourceState,
     type SandboxSeams,
 } from "./index.ts";
 
@@ -95,6 +101,13 @@ export type ReadConfinementPolicy = {
      * filter. `fds`: only descriptors 0-2 (and the filter's own) survive into the child.
      */
     hardening?: HardeningSwitches;
+    /**
+     * Resource limits. `command`: each confined launch runs in its own systemd user scope with these limits
+     * (`memoryMax`, `memorySwapMax`: sizes such as "512M"; `tasksMax`: processes and threads; `cpuQuota`: percent
+     * of one CPU, 200 = two; `runtimeMaxSec`: seconds). `tmpSize`: size of the private /tmp, such as "64M".
+     * Every key is optional; a limit that is set but cannot be applied fails the launch closed.
+     */
+    resources?: ResourcesPolicy;
 };
 
 const DEFAULT_LIMITS = { maxSymlinks: 2000, maxDepth: 8, maxWalkEntries: 200_000, maxBinds: 500, maxWalkMs: 15_000, minPrefixDepth: 3 };
@@ -180,7 +193,7 @@ function compilePattern(pattern: string, path: string): RegExp {
 
 /** Strictly validate a policy document; unknown keys and malformed values fail closed. */
 export function parseReadConfinementPolicy(value: unknown): ReadConfinementPolicy {
-    const root = checkKeys(value, "$", ["version", "limits", "walkSkipDirNames", "deny", "tools", "secretDetector", "caches", "syntheticPathMount", "env", "readOnly", "hardening"]);
+    const root = checkKeys(value, "$", ["version", "limits", "walkSkipDirNames", "deny", "tools", "secretDetector", "caches", "syntheticPathMount", "env", "readOnly", "hardening", "resources"]);
     if (root.version !== 1) fail("$.version", "must be 1");
     const policy: ReadConfinementPolicy = { version: 1 };
     if (root.limits !== undefined) {
@@ -297,6 +310,7 @@ export function parseReadConfinementPolicy(value: unknown): ReadConfinementPolic
             policy.hardening.hostname = h.hostname;
         }
     }
+    if (root.resources !== undefined) policy.resources = parseResourcesPolicy(root.resources, "$.resources", fail);
     return policy;
 }
 
@@ -343,11 +357,19 @@ export type ReadConfinementSeams = {
     /** Further directories some active profile can write; the policy file must not be inside any of them. */
     extraWritableRoots?: readonly string[];
     /** Where the hardening measures are checked against bubblewrap (executable lookup, `--help` text, architecture). */
-    hardening?: Pick<SandboxSeams, "lookupExecutable" | "bwrapHelp" | "arch">;
+    hardening?: Pick<SandboxSeams, "lookupExecutable" | "bwrapHelp" | "arch" | "commandScopeProbe" | "userManagerPathExists">;
 };
 
 /** The state of each confined-launch hardening measure, as recorded in the audit. */
 export type ReadConfinementHardeningAudit = { readonly [measure in (typeof HARDENING_MEASURES)[number]]: HardeningState } & { readonly hostname: string };
+
+/** The state of each configured resource limit, as recorded in the audit. Only configured limits appear. */
+export type ReadConfinementResourcesAudit = {
+    /** The command limits as written, and whether each launch can run in a scope that carries them. */
+    command?: { readonly limits: NonNullable<ResourcesPolicy["command"]>; readonly state: ResourceState };
+    /** The private /tmp size as written, in bytes, and whether bubblewrap can apply it. */
+    tmpSize?: { readonly size: string; readonly bytes: number; readonly state: ResourceState };
+};
 
 export type ReadConfinementAudit = {
     version: 1;
@@ -369,10 +391,13 @@ export type ReadConfinementAudit = {
     denyWrite: string[];
     /** Per measure: `on`, `off` (by policy) or `unavailable` with its reason (the launch then fails closed). */
     hardening: ReadConfinementHardeningAudit;
+    /** Only when the policy sets `resources`: each configured limit with its state (`unavailable` fails the launch closed). */
+    resources?: ReadConfinementResourcesAudit;
 };
 
 export type ReadConfinementPlan = ReadConfinementMounts & {
     hardening: ResolvedHardening;
+    resources?: ResolvedResources;
     audit: ReadConfinementAudit;
     /** Stable digest of the audit. */
     hash: string;
@@ -1163,6 +1188,8 @@ export function planReadConfinement(
     const hardening = resolveHardening(policy.hardening);
     const hardeningSeams: SandboxSeams = { ...(seams.hardening ?? {}), env };
     const hardeningBwrap = bubblewrapExecutable(hardeningSeams);
+    const resources = resolveResources(policy.resources);
+    const resourceAudit = resources ? resourcesAudit(resources, resourceStates(resources, hardeningBwrap, hardeningSeams)) : undefined;
     const readRoots = [...new Set([project, ...cacheSources, ...entries.filter((b) => b.mode !== "tmpfs" && !b.source).map((b) => b.path)])].sort();
     const audit: ReadConfinementAudit = {
         version: 1,
@@ -1181,6 +1208,7 @@ export function planReadConfinement(
         envAllow,
         denyWrite: [...denyWriteSet].sort(),
         hardening: { ...hardeningStates(hardening, hardeningBwrap, hardeningSeams), hostname: hardening.hostname },
+        ...(resourceAudit && { resources: resourceAudit }),
     };
     return {
         args,
@@ -1195,6 +1223,7 @@ export function planReadConfinement(
         envAllow,
         pathValue,
         hardening,
+        ...(resources && { resources }),
         hash: createHash("sha256").update(JSON.stringify(audit)).digest("hex"),
         syntheticDir,
     };
@@ -1212,6 +1241,7 @@ export function formatReadConfinementAudit(audit: ReadConfinementAudit, hash?: s
     if (audit.denied.length) lines.push(`  denied (${audit.denied.length}):`, ...audit.denied.map((d) => `    ${d.path} — ${d.reason}${d.via ? ` (via ${d.via})` : ""}`));
     if (audit.skipped.length) lines.push(`  skipped (${audit.skipped.length}):`, ...audit.skipped.map((d) => `    ${d.path} — ${d.reason}${d.via ? ` (via ${d.via})` : ""}`));
     lines.push(...formatHardening(audit.hardening).map((line) => `  ${line}`));
+    if (audit.resources) lines.push(...formatResources(audit.resources).map((line) => `  ${line}`));
     lines.push(audit.syntheticPath
         ? `  PATH ${audit.syntheticPath.mount}: ${audit.syntheticPath.tools.map((t) => t.name + (t.implicit ? "*" : "")).join(" ")} (* = needed interpreter)`
         : "  PATH: empty (no approved tools)");
@@ -1225,4 +1255,30 @@ export function formatHardening(hardening: ReadConfinementHardeningAudit): strin
         const text = state.state === "on" ? "on" : state.state === "off" ? "off by policy" : `unavailable (inactive, launches fail closed) — ${state.reason}`;
         return `  ${measure}: ${text}${measure === "uts" && state.state === "on" ? ` (hostname ${hardening.hostname})` : ""}`;
     })];
+}
+
+/** The policy's `resources` as the launch builder takes it; undefined when nothing is limited (an empty `command` counts as none). */
+function resolveResources(resources: ResourcesPolicy | undefined): ResolvedResources | undefined {
+    const command = resources?.command && Object.keys(resources.command).length ? { ...resources.command } : undefined;
+    const tmpSize = resources?.tmpSize;
+    return command || tmpSize !== undefined ? { ...(command && { command }), ...(tmpSize !== undefined && { tmpSize }) } : undefined;
+}
+
+function resourcesAudit(resources: ResolvedResources, states: ReturnType<typeof resourceStates>): ReadConfinementResourcesAudit {
+    return {
+        ...(resources.command && states.command && { command: { limits: { ...resources.command }, state: states.command } }),
+        ...(resources.tmpSize !== undefined && states.tmpSize && { tmpSize: { size: resources.tmpSize, bytes: sizeToBytes(resources.tmpSize)!, state: states.tmpSize } }),
+    };
+}
+
+/** One line per configured resource limit: its values and whether it is on or unavailable with its reason. */
+export function formatResources(resources: ReadConfinementResourcesAudit): string[] {
+    const state = (value: ResourceState): string => value.state === "on" ? "on" : `unavailable (inactive, launches fail closed) — ${value.reason}`;
+    const lines = ["resources:"];
+    if (resources.command) {
+        const limits = Object.entries(resources.command.limits).map(([key, value]) => `${key}=${value}`).join(" ");
+        lines.push(`  command: ${limits} — ${state(resources.command.state)}${resources.command.state.state === "on" ? " (each launch runs in its own systemd user scope)" : ""}`);
+    }
+    if (resources.tmpSize) lines.push(`  tmpSize: ${resources.tmpSize.size} (${resources.tmpSize.bytes} bytes) — ${state(resources.tmpSize.state)}`);
+    return lines;
 }

@@ -106,6 +106,11 @@ export type ReadConfinementMounts = {
      * hostname, so a plan that predates the switches is hardened rather than silently weaker.
      */
     hardening?: ResolvedHardening;
+    /**
+     * Resource limits (see `parseResourcesPolicy`): `command` limits run every confined launch in its own
+     * systemd user scope; `tmpSize` sizes the private /tmp. Absent means no limit and an unchanged launch.
+     */
+    resources?: ResolvedResources;
 };
 
 /** The hardening measures a confined launch applies, each with its own policy switch. */
@@ -312,6 +317,10 @@ export type SandboxSeams = {
     bwrapHelp?: (bwrap: string) => string | undefined;
     /** Confined-launch hardening: the CPU architecture (defaults to `process.arch`). */
     arch?: string;
+    /** Resource limits: decides whether a resource scope with these command limits can be started (a reason when not). Defaults to starting one. */
+    commandScopeProbe?: (limits: CommandLimits) => string | undefined;
+    /** Resource limits: lets a test fake which user-manager sockets exist. */
+    userManagerPathExists?: (path: string) => boolean;
 };
 
 /** A policy with every path canonicalized, deduplicated, and ordered. */
@@ -560,6 +569,10 @@ function compile(
                 ...(readConfinement.overlayArgs && { overlayArgs: [...readConfinement.overlayArgs] }),
                 ...(readConfinement.gitFile && { gitFile: { path: readConfinement.gitFile.path, dirs: [...readConfinement.gitFile.dirs] } }),
                 ...(readConfinement.hardening && { hardening: { ...readConfinement.hardening } }),
+                ...(readConfinement.resources && { resources: {
+                    ...(readConfinement.resources.command && { command: { ...readConfinement.resources.command } }),
+                    ...(readConfinement.resources.tmpSize !== undefined && { tmpSize: readConfinement.resources.tmpSize }),
+                } }),
             },
         }),
         ...(policy.permissions && {
@@ -1492,6 +1505,274 @@ export function keyringSeccompProgram(): Buffer {
     return out;
 }
 
+// ---- resource limits ---------------------------------------------------------
+//
+// `resources` in the read-confinement policy bounds what a confined launch can consume:
+//
+//   resources.command   one transient systemd user scope per launch   systemd-run --user --scope -p ...
+//   resources.tmpSize   size of the private /tmp tmpfs                 bwrap --size BYTES before --tmpfs /tmp
+//
+// Both are optional, and an unset limit changes nothing (no scope, the argument vector is the historical
+// one). A limit that is set but cannot be applied (no reachable user manager, a controller the manager does
+// not delegate, a bubblewrap without `--size`) fails the launch closed with the reason.
+//
+// The parser, the property mapping and the scope arguments are exported so that other launchers (the remote
+// subagent launch script) apply the same keys the same way.
+
+/** The keys of `resources.command` (and of a remote target's `resources.session`). */
+export const COMMAND_LIMIT_KEYS = ["memoryMax", "memorySwapMax", "tasksMax", "cpuQuota", "runtimeMaxSec"] as const;
+export type CommandLimitKey = (typeof COMMAND_LIMIT_KEYS)[number];
+
+/**
+ * Command limits as written. Sizes are strings (a decimal integer with an optional K, M, G or T suffix,
+ * powers of 1024); `tasksMax`, `cpuQuota` (percent of one CPU) and `runtimeMaxSec` are positive integers.
+ */
+export type CommandLimits = {
+    memoryMax?: string;
+    memorySwapMax?: string;
+    tasksMax?: number;
+    cpuQuota?: number;
+    runtimeMaxSec?: number;
+};
+
+/** The policy's `resources` object as written. */
+export type ResourcesPolicy = { command?: CommandLimits; tmpSize?: string };
+
+/** Whether one resource limit is applied, or could not be applied (the launch then fails closed). */
+export type ResourceState =
+    | { readonly state: "on" }
+    | { readonly state: "unavailable"; readonly reason: string };
+
+/** What the policy's `resources` object resolved to for the checks and the launch builder. */
+export type ResolvedResources = { readonly command?: CommandLimits; readonly tmpSize?: string };
+
+const SIZE_PATTERN = /^(0|[1-9][0-9]*)([KMGT])?$/;
+const SIZE_UNITS: Readonly<Record<string, bigint>> = { "": 1n, K: 1024n, M: 1024n ** 2n, G: 1024n ** 3n, T: 1024n ** 4n };
+const MAX_LIMIT_INTEGER = 1_000_000_000_000;
+
+/** Bytes in a size string, or undefined when it is malformed or does not fit a safe integer. */
+export function sizeToBytes(text: unknown): number | undefined {
+    if (typeof text !== "string") return undefined;
+    const match = SIZE_PATTERN.exec(text);
+    if (!match) return undefined;
+    const bytes = BigInt(match[1]!) * SIZE_UNITS[match[2] ?? ""]!;
+    return bytes <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(bytes) : undefined;
+}
+
+/** Reports a malformed policy value; must throw. */
+export type ResourceFail = (path: string, message: string) => never;
+
+function resourceObject(value: unknown, path: string, allowed: readonly string[], fail: ResourceFail): Record<string, unknown> {
+    if (!value || typeof value !== "object" || Array.isArray(value)) fail(path, "expected an object");
+    for (const key of Object.keys(value)) if (!allowed.includes(key)) fail(`${path}.${key}`, "unknown key");
+    return value as Record<string, unknown>;
+}
+
+function resourceSize(value: unknown, path: string, fail: ResourceFail, zero: boolean): string {
+    const bytes = sizeToBytes(value);
+    if (bytes === undefined) fail(path, 'expected a size string: a decimal integer with an optional K, M, G or T suffix (powers of 1024), for example "512M"');
+    if (bytes === 0 && !zero) fail(path, "must be greater than zero");
+    return value as string;
+}
+
+function resourceCount(value: unknown, path: string, fail: ResourceFail, unit: string): number {
+    if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > MAX_LIMIT_INTEGER) {
+        fail(path, `expected a positive integer (${unit})`);
+    }
+    return value;
+}
+
+/**
+ * Strictly validate a set of command limits (`resources.command`, a remote target's `resources.session`).
+ * Unknown keys and every value that is not exactly the documented form are refused.
+ */
+export function parseCommandLimits(value: unknown, path: string, fail: ResourceFail): CommandLimits {
+    const raw = resourceObject(value, path, COMMAND_LIMIT_KEYS, fail);
+    const limits: CommandLimits = {};
+    if (raw.memoryMax !== undefined) limits.memoryMax = resourceSize(raw.memoryMax, `${path}.memoryMax`, fail, false);
+    if (raw.memorySwapMax !== undefined) limits.memorySwapMax = resourceSize(raw.memorySwapMax, `${path}.memorySwapMax`, fail, true);
+    if (raw.tasksMax !== undefined) limits.tasksMax = resourceCount(raw.tasksMax, `${path}.tasksMax`, fail, "processes and threads");
+    if (raw.cpuQuota !== undefined) limits.cpuQuota = resourceCount(raw.cpuQuota, `${path}.cpuQuota`, fail, "percent of one CPU; 200 is two CPUs");
+    if (raw.runtimeMaxSec !== undefined) limits.runtimeMaxSec = resourceCount(raw.runtimeMaxSec, `${path}.runtimeMaxSec`, fail, "seconds");
+    return limits;
+}
+
+/** Strictly validate the read-confinement policy's `resources` object. */
+export function parseResourcesPolicy(value: unknown, path: string, fail: ResourceFail): ResourcesPolicy {
+    const raw = resourceObject(value, path, ["command", "tmpSize"], fail);
+    const resources: ResourcesPolicy = {};
+    if (raw.command !== undefined) resources.command = parseCommandLimits(raw.command, `${path}.command`, fail);
+    if (raw.tmpSize !== undefined) resources.tmpSize = resourceSize(raw.tmpSize, `${path}.tmpSize`, fail, false);
+    return resources;
+}
+
+/** Whether any command limit is set (an empty object is the same as none). */
+export function hasCommandLimits(limits: CommandLimits | undefined): limits is CommandLimits {
+    return limits !== undefined && COMMAND_LIMIT_KEYS.some((key) => limits[key] !== undefined);
+}
+
+/** The systemd unit properties (`NAME=value`) for a set of command limits, in a fixed order. Sizes become bytes. */
+export function commandLimitProperties(limits: CommandLimits): string[] {
+    const properties: string[] = [];
+    const bytes = (key: "memoryMax" | "memorySwapMax"): string => String(sizeToBytes(limits[key]));
+    if (limits.memoryMax !== undefined) properties.push(`MemoryMax=${bytes("memoryMax")}`);
+    if (limits.memorySwapMax !== undefined) properties.push(`MemorySwapMax=${bytes("memorySwapMax")}`);
+    if (limits.tasksMax !== undefined) properties.push(`TasksMax=${limits.tasksMax}`);
+    if (limits.cpuQuota !== undefined) properties.push(`CPUQuota=${limits.cpuQuota}%`);
+    if (limits.runtimeMaxSec !== undefined) properties.push(`RuntimeMaxSec=${limits.runtimeMaxSec}`);
+    return properties;
+}
+
+/**
+ * The cgroup control file each limit needs, and the controller that provides it. A scope only has the file
+ * when the user manager delegates the controller, so its absence is the proof that the limit is not applied.
+ * `runtimeMaxSec` is enforced by the manager's own timer and needs no controller.
+ */
+export const COMMAND_LIMIT_CONTROLLERS: Readonly<Partial<Record<CommandLimitKey, { controller: string; file: string }>>> = Object.freeze({
+    memoryMax: { controller: "memory", file: "memory.max" },
+    memorySwapMax: { controller: "memory", file: "memory.swap.max" },
+    tasksMax: { controller: "pids", file: "pids.max" },
+    cpuQuota: { controller: "cpu", file: "cpu.max" },
+});
+
+/** Seconds a scope gets between SIGTERM and SIGKILL when its time limit ends it, so a command that ignores SIGTERM cannot outlive the bound. */
+const SCOPE_STOP_TIMEOUT_SEC = 5;
+
+/**
+ * The `systemd-run` arguments (everything after the executable, up to and excluding `--`) that start a
+ * transient user scope with `limits`. `--quiet` keeps the scope notice off stderr and `--collect` unloads
+ * the scope even when the kernel killed it.
+ */
+export function resourceScopeArguments(limits: CommandLimits): string[] {
+    const args = ["--user", "--scope", "--quiet", "--collect", "--no-ask-password"];
+    for (const property of commandLimitProperties(limits)) args.push("-p", property);
+    // Only a time limit ends a scope by itself; the grace period bounds how long the end takes.
+    if (limits.runtimeMaxSec !== undefined) args.push("-p", `TimeoutStopSec=${SCOPE_STOP_TIMEOUT_SEC}`);
+    return args;
+}
+
+/**
+ * POSIX sh text that runs inside a scope and exits 126 unless the scope really carries the controllers its
+ * limits need (the cgroup control files exist). It ends with `exec "$@"`, so the scoped command follows as
+ * the script's arguments. Used for the launch itself and for the availability probe.
+ */
+export function resourceScopeCheckScript(limits: CommandLimits, finalStep: 'exec "$@"' | "exit 0" = 'exec "$@"'): string {
+    const lines = [
+        "cg=",
+        'while IFS= read -r line; do case $line in 0::*) cg=${line#0::} ;; esac; done < /proc/self/cgroup',
+        '[ -n "$cg" ] || { echo "confined launch refused: the scope\'s cgroup is unknown, so the resource limits cannot be confirmed" >&2; exit 126; }',
+    ];
+    const seen = new Set<string>();
+    for (const key of COMMAND_LIMIT_KEYS) {
+        const needs = COMMAND_LIMIT_CONTROLLERS[key];
+        if (limits[key] === undefined || !needs || seen.has(needs.file)) continue;
+        seen.add(needs.file);
+        lines.push(`[ -e "/sys/fs/cgroup$cg/${needs.file}" ] || { echo "confined launch refused: the ${needs.controller} controller is not delegated to the scope, so ${key} cannot be applied" >&2; exit 126; }`);
+    }
+    lines.push(finalStep);
+    return lines.join("\n");
+}
+
+/**
+ * How to reach the current user's systemd user manager from a process that may have lost its environment:
+ * `XDG_RUNTIME_DIR` (default `/run/user/<uid>`) and, when set, `DBUS_SESSION_BUS_ADDRESS`. A reason when the
+ * manager cannot be reached.
+ */
+export function userManagerEnvironment(
+    env: NodeJS.ProcessEnv,
+    seams: { uid?: number; userManagerPathExists?: (path: string) => boolean } = {},
+): { env: Record<string, string> } | { reason: string } {
+    const uid = seams.uid ?? process.getuid?.();
+    const exists = seams.userManagerPathExists ?? existsSync;
+    const clean = (value: string | undefined): string | undefined =>
+        value && !value.includes("\0") && !value.includes("\n") ? value : undefined;
+    const configured = clean(env.XDG_RUNTIME_DIR);
+    const runtime = configured && isAbsolute(configured) ? configured : uid !== undefined ? `/run/user/${uid}` : undefined;
+    if (!runtime) return { reason: "XDG_RUNTIME_DIR is not set and the user id is unknown: no systemd user manager is reachable" };
+    const bus = clean(env.DBUS_SESSION_BUS_ADDRESS);
+    if (!bus && !exists(join(runtime, "bus")) && !exists(join(runtime, "systemd", "private"))) {
+        return { reason: `no systemd user manager is reachable: neither ${join(runtime, "bus")} nor ${join(runtime, "systemd", "private")} exists and DBUS_SESSION_BUS_ADDRESS is not set (no active login session or lingering user)` };
+    }
+    return { env: { XDG_RUNTIME_DIR: runtime, ...(bus && { DBUS_SESSION_BUS_ADDRESS: bus }) } };
+}
+
+type ScopeEnvironment = { env: Record<string, string>; systemdRun: string; envTool: string; sh: string };
+
+const scopeProbeCache = new Map<string, number>();
+const SCOPE_PROBE_TTL_MS = 30_000;
+
+/**
+ * Whether a resource scope with `limits` can be started from here: the user manager is reachable and every
+ * controller the limits need is delegated. It starts one real scope with the configured properties and
+ * inspects its cgroup, so a configured limit that the host cannot enforce is found before any command runs.
+ * A positive answer is cached for a short while per limits and user manager.
+ */
+export function commandScopeAvailability(limits: CommandLimits, seams: SandboxSeams = {}): { scope: ScopeEnvironment } | { reason: string } {
+    const systemdRun = systemSandboxExecutable("systemd-run");
+    if (!systemdRun) return { reason: "systemd-run was not found in /usr/bin or /bin" };
+    const envTool = systemSandboxExecutable("env");
+    const sh = systemSandboxExecutable("sh");
+    if (!envTool || !sh) return { reason: "env and sh were not found in /usr/bin or /bin" };
+    // The user manager is the launching process's: a seam environment that names none (a plan computed with
+    // an allowlist-only environment) must not hide the one the launches will really see.
+    const reach = userManagerEnvironment({
+        XDG_RUNTIME_DIR: seams.env?.XDG_RUNTIME_DIR ?? process.env.XDG_RUNTIME_DIR,
+        DBUS_SESSION_BUS_ADDRESS: seams.env?.DBUS_SESSION_BUS_ADDRESS ?? process.env.DBUS_SESSION_BUS_ADDRESS,
+    }, seams);
+    if (seams.commandScopeProbe) {
+        // A test seam decides availability; the scope arguments are still built from what the host offers.
+        const reason = seams.commandScopeProbe(limits);
+        return reason !== undefined ? { reason } : { scope: { env: "env" in reach ? reach.env : {}, systemdRun, envTool, sh } };
+    }
+    if ("reason" in reach) return reach;
+    const scope: ScopeEnvironment = { env: reach.env, systemdRun, envTool, sh };
+    const key = JSON.stringify([limits, reach.env]);
+    const checked = scopeProbeCache.get(key);
+    if (checked !== undefined && Date.now() - checked < SCOPE_PROBE_TTL_MS) return { scope };
+    const probe = spawnSync(envTool, [...Object.entries(reach.env).map(([name, value]) => `${name}=${value}`),
+        systemdRun, ...resourceScopeArguments(limits), "--", sh, "-c", resourceScopeCheckScript(limits, "exit 0"), "pi-resource-scope-probe"], {
+        encoding: "utf8", env: {}, timeout: 15_000, stdio: ["ignore", "pipe", "pipe"],
+    });
+    if (probe.status === 0) {
+        scopeProbeCache.set(key, Date.now());
+        return { scope };
+    }
+    const detail = `${probe.stderr ?? ""}`.trim().split("\n").filter(Boolean).slice(-1)[0];
+    return { reason: probe.error
+        ? `cannot start systemd-run: ${probe.error.message}`
+        : `a systemd user scope with the configured limits cannot be started${detail ? `: ${detail}` : ` (exit ${probe.status ?? probe.signal})`}` };
+}
+
+/** The state of the configured resource limits for one bubblewrap executable. Only configured limits appear. */
+export function resourceStates(
+    resources: ResolvedResources | undefined,
+    bwrap: string | undefined,
+    seams: SandboxSeams = {},
+): { command?: ResourceState; tmpSize?: ResourceState } {
+    const states: { command?: ResourceState; tmpSize?: ResourceState } = {};
+    if (hasCommandLimits(resources?.command)) {
+        const availability = commandScopeAvailability(resources.command, seams);
+        states.command = "reason" in availability ? { state: "unavailable", reason: availability.reason } : { state: "on" };
+    }
+    if (resources?.tmpSize !== undefined) {
+        const help = bwrap ? bwrapHelpText(bwrap, seams) : undefined;
+        states.tmpSize = !bwrap ? { state: "unavailable", reason: "bubblewrap was not found" }
+            : help === undefined ? { state: "unavailable", reason: `cannot read the option list of ${bwrap} (--help)` }
+            : !/(^|\s)--size(\s|$)/m.test(help) ? { state: "unavailable", reason: `bubblewrap --size is not supported by ${bwrap}; use a newer bubblewrap` }
+            : { state: "on" };
+    }
+    return states;
+}
+
+/** Why a configured resource limit is unavailable, one entry per limit, empty when all hold. */
+export function resourceUnavailability(states: { command?: ResourceState; tmpSize?: ResourceState }): string[] {
+    const out: string[] = [];
+    for (const [name, state] of Object.entries(states) as [string, ResourceState][]) {
+        if (state.state === "unavailable") out.push(`resources.${name} unavailable: ${state.reason}`);
+    }
+    return out;
+}
+
 // ---- the launcher ----------------------------------------------------------
 
 function shellQuote(value: string): string {
@@ -1622,10 +1903,14 @@ export function ensureConfinedLauncher(spec: ConfinedLauncherSpec, avoid: readon
     throw new Error(`no usable directory for the confined launcher (${problems.join("; ")})`);
 }
 
-/** The launch flags and executable that apply `hardening`; `file` is bubblewrap itself when nothing needs the launcher. */
+/**
+ * The launch flags and executable that apply `hardening` and the command limits of `resources`; `file` is
+ * bubblewrap itself when nothing needs the launcher. A configured limit that cannot be applied throws.
+ */
 function hardenLaunch(
     bwrap: string,
     hardening: ResolvedHardening,
+    resources: ResolvedResources | undefined,
     avoid: readonly string[],
     seams: SandboxSeams,
 ): { file: string; flags: string[] } {
@@ -1642,17 +1927,44 @@ function hardenLaunch(
     if (hardening.uts) flags.push("--unshare-uts", "--hostname", hardening.hostname);
     if (hardening.userns) flags.push("--unshare-user", "--uid", String(process.getuid!()), "--gid", String(process.getgid!()), "--disable-userns");
     if (hardening.keyring) flags.push("--seccomp", String(SECCOMP_FD));
-    if (!hardening.fds && !hardening.keyring) return { file: bwrap, flags };
+    let prefix: string[] | undefined;
+    if (hasCommandLimits(resources?.command)) {
+        const availability = commandScopeAvailability(resources.command, seams);
+        if ("reason" in availability) {
+            throw new Error(`Confined launch refused (fails closed): resources.command is set but unavailable: ${availability.reason}. ` +
+                'Fix the cause, or remove "resources.command" from the read-confinement policy.');
+        }
+        const { scope } = availability;
+        // The scope is started by the launcher, outside bubblewrap, so the bus location comes from here and
+        // not from the (often minimal) environment the launch is spawned with. The check inside the scope
+        // re-confirms the controllers for this very launch before bubblewrap starts.
+        prefix = [scope.envTool, ...Object.entries(scope.env).map(([name, value]) => `${name}=${value}`),
+            scope.systemdRun, ...resourceScopeArguments(resources.command), "--",
+            scope.sh, "-c", resourceScopeCheckScript(resources.command), "pi-resource-scope"];
+    }
+    if (!hardening.fds && !hardening.keyring && !prefix) return { file: bwrap, flags };
     try {
         const file = ensureConfinedLauncher({
             bwrap, closeDescriptors: hardening.fds,
             ...(hardening.keyring && { seccompProgram: keyringSeccompProgram() }),
+            ...(prefix && { prefix }),
         }, avoid, seams);
         return { file, flags };
     } catch (error) {
-        throw new Error(`Confined launch refused (fails closed): the launcher that applies hardening.${hardening.keyring ? "keyring" : "fds"} ` +
+        throw new Error(`Confined launch refused (fails closed): the launcher that applies ${prefix ? "resources.command" : `hardening.${hardening.keyring ? "keyring" : "fds"}`} ` +
             `could not be prepared: ${error instanceof Error ? error.message : String(error)}.`);
     }
+}
+
+/** `--size BYTES` for the private /tmp, or nothing when the policy sets no `tmpSize`. Throws when bubblewrap cannot apply it. */
+function tmpSizeFlags(bwrap: string, resources: ResolvedResources | undefined, seams: SandboxSeams): string[] {
+    if (resources?.tmpSize === undefined) return [];
+    const state = resourceStates({ tmpSize: resources.tmpSize }, bwrap, seams).tmpSize;
+    if (state?.state === "unavailable") {
+        throw new Error(`Confined launch refused (fails closed): resources.tmpSize is set but unavailable: ${state.reason}. ` +
+            'Fix the cause, or remove "resources.tmpSize" from the read-confinement policy.');
+    }
+    return ["--size", String(sizeToBytes(resources.tmpSize))];
 }
 
 function buildLinuxPermissionCommand(
@@ -1735,6 +2047,8 @@ function buildLinuxPermissionCommand(
         for (const root of RUNTIME_ROOTS) {
             if (existsSync(root)) mounts.push("--ro-bind", root, root);
         }
+        // --size applies to the next tmpfs only, so it sits directly in front of the private /tmp.
+        if (confined) mounts.push(...tmpSizeFlags(bwrap, policy.readConfinement?.resources, seams));
         mounts.push("--tmpfs", "/tmp");
         if (args.internalHelperExecutable) {
             const executable = canonicalizePath(args.execPath, seams);
@@ -1859,7 +2173,7 @@ function buildLinuxPermissionCommand(
     // Hardening goes last so the flags above keep their historical order. It cannot sit under a root the
     // confined command can write, which is where the launcher is kept.
     const hardened = confined
-        ? hardenLaunch(bwrap, resolveHardening(policy.readConfinement?.hardening), [project, ...(policy.runtimeWrite ?? []), ...(policy.readConfinement?.writeRoots ?? [])], seams)
+        ? hardenLaunch(bwrap, resolveHardening(policy.readConfinement?.hardening), policy.readConfinement?.resources, [project, ...(policy.runtimeWrite ?? []), ...(policy.readConfinement?.writeRoots ?? [])], seams)
         : undefined;
     return {
         file: hardened?.file ?? bwrap,
