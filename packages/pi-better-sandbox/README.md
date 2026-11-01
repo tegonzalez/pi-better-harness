@@ -574,8 +574,11 @@ planner and argv builder (Main profile, Outside project = Off, Network Off, comm
 extra launches with Network On and with a policy that adds a `readOnly` folder and an approved tool with `config`) and
 asserts each *Limited* row. *Not limited* rows are asserted as documented expectations so this table cannot go stale.
 Tested with bubblewrap 0.12 using unprivileged user namespaces. "Limited" means the kernel refuses the operation
-inside the sandbox; the table lists what remains and what to add **outside** bubblewrap. The mitigations are
-recommendations only; none is implemented by this package.
+inside the sandbox; the table lists what remains and what to add **outside** bubblewrap. The mitigations for rows
+still marked *Not limited* are recommendations only; none is implemented by this package. The IPC, hostname, nested
+user namespace, kernel keyring and inherited descriptor rows are *Limited* by the confined-launch hardening of the
+read-confinement policy (`hardening`, every measure on by default, each with its own switch); the tests are
+`test/bubblewrap-limits.test.ts` and `test/hardening*.test.ts`.
 
 | Area | Result | Mechanism / observed | Recommended mitigation outside bubblewrap |
 | --- | --- | --- | --- |
@@ -592,14 +595,15 @@ recommendations only; none is implemented by this package.
 | Devices | **Limited** | `--dev`: minimal set (`null`, `zero`, `full`, `random`, `urandom`, `tty`, `ptmx`, `pts`, `shm`, std fds). GPU (`kfd`, `dri`), DRM, disks, `fuse`, `kvm`, `mem` are absent. | None needed. |
 | Controlling tty | **Limited** | `--new-session`: `/dev/tty` open fails `ENXIO`. | None needed. |
 | setuid, capabilities | **Limited** | Same uid, `no_new_privs` set, effective capabilities empty. | None needed. |
-| New user namespaces inside | **Not limited** | `unshare(CLONE_NEWUSER)` succeeds; it grants nothing on the host but exposes kernel attack surface. | seccomp denying `unshare`/`clone` namespace flags, or the host sysctl that disables unprivileged user namespaces for the launcher's descendants. |
-| IPC (SysV shm, POSIX mq) | **Not limited** | No `--unshare-ipc`: host segments and queues are attachable by id/name subject to normal permissions. | Launch with an IPC namespace (`unshare --ipc`, systemd `PrivateIPC=`). |
-| Kernel keyring (`keyctl`) | **Not limited** | Keys of the calling user are readable by id as permissions allow. | seccomp denying `keyctl`/`add_key`/`request_key`; or a separate uid or session keyring per launch. |
+| New user namespaces inside | **Limited** | `--unshare-user` (same uid and gid, so file ownership seen inside is unchanged) with `--disable-userns`: `unshare(CLONE_NEWUSER)` fails inside (`ENOSPC`), and so does `unshare -U`. Switch: `hardening.userns`. A bubblewrap without `--disable-userns` fails the launch closed. | None needed. Turn the switch off only for a tool that must create user namespaces. |
+| IPC (SysV shm, POSIX mq) | **Limited** | `--unshare-ipc`: a private IPC namespace; host segments and queues are not visible, so attaching by id or opening by name fails. Switch: `hardening.ipc`. | None needed. |
+| Kernel keyring (`keyctl`) | **Limited** | A seccomp filter passed to bubblewrap makes `keyctl`, `add_key` and `request_key` fail with `EPERM` or `ENOSYS`, so host keys are not readable by id. x86_64 and aarch64; any other architecture, or a bubblewrap that cannot take the filter, fails the launch closed. Switch: `hardening.keyring`. | None needed. |
 | Resources: CPU, memory, processes, wall time | **Not limited** | No cgroups, no rlimits set: limits are inherited from the launcher unchanged. A fork bomb or busy loop affects the host; the pid namespace does not cap counts. | `systemd-run --user -p MemoryMax= -p CPUQuota= -p TasksMax=` (cgroups), `ulimit`/`prlimit`, and a timeout on every launch. |
 | Resources: disk | **Not limited** | Writable roots are the host filesystem (project, git dirs, caches); private `/tmp` is a tmpfs with the kernel default size. | Filesystem quotas or a size-capped scratch mount; a `tmpfs` size option for private `/tmp`; `RLIMIT_FSIZE`. |
-| Time, hostname, uid | **Not limited** | No time/UTS namespace; uid is the caller's. | Observable only; `unshare --uts` hides the hostname if wanted. |
+| Hostname | **Limited** | `--unshare-uts` with a fixed generic hostname, or the `hardening.hostname` the policy names: the host's name is not visible. Switches: `hardening.uts`, `hardening.hostname`. | None needed. |
+| Time, uid | **Not limited** | No time namespace; uid is the caller's. | Observable only. |
 | Environment | **Limited** | `--clearenv`: only `PATH`, `HOME`, `LANG`, `LC_ALL`, `TERM`, `TMPDIR`, `TZ` and `env.allow` names. Anything in `env.allow` is deliberately visible. | Keep `env.allow` minimal. |
-| Inherited file descriptors | **Not limited** | bubblewrap does not close descriptors above 2: an fd the launcher leaves open is usable (even a file outside the allow set). | Launcher must open children with close-on-exec and an explicit fd table (`stdio` only). |
+| Inherited file descriptors | **Limited** | A confined child sees only descriptors 0, 1 and 2 plus any the launch passes on purpose (such as the seccomp program); an fd the spawner or an outer shell left open, even one on a file outside the allow set, is not usable inside. Switch: `hardening.fds`. | Launchers should still open children with close-on-exec and an explicit `stdio` table. |
 | Clipboard, X11, Wayland | **Limited** | Filesystem sockets are not mounted, the host `/tmp` is hidden, abstract sockets (X11) need Network On, and the display variables are cleared. With Network On an abstract X11 socket is reachable. | Keep Network Off for untrusted work; use a separate display/session for sandboxed GUI work. |
 | Approved tool's config | **Partially** | Every file in an approved config path is readable by the whole sandbox, not just by the tool. The secret detector refuses a config entry whose files match a pattern (the entry is not bound). | List single files rather than directories; keep secrets out of approved config. |
 

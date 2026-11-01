@@ -12,6 +12,10 @@
  *  - NOT LIMITED rows assert the *current, documented* behaviour so the README table
  *    cannot silently go stale; if one starts failing, the boundary got tighter (update
  *    the README) or the probe broke. They are not endorsements.
+ * The IPC, hostname, nested-user-namespace, kernel-keyring and inherited-descriptor rows are LIMITED by the
+ * confined-launch hardening (decision D4; policy `hardening` switches, all on by default). Their detailed
+ * proof, including that each switch set to `false` brings the old behaviour back, is in hardening.test.ts and
+ * hardening-fds.test.ts; the rows here assert the default refusal.
  * No resource-exhaustion is exercised: CPU, memory, disk fill, fork bombs and wall
  * time are documented from the mechanism (nothing in the argv sets them), plus a cheap
  * check that resource limits are inherited from the launcher unchanged.
@@ -23,18 +27,19 @@
  */
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer as createUnixServer, type Server } from "node:net";
 import { createSocket } from "node:dgram";
 import { hostname, networkInterfaces, userInfo } from "node:os";
 import { join } from "node:path";
-import test, { after, before } from "node:test";
+import test, { after, before, type TestContext } from "node:test";
 
 import { defaultSandboxPermissions } from "../permissions.ts";
 import { buildSandboxCommand } from "../shared-sandbox-core.ts";
 import { hashPolicy, parseReadConfinementPolicy } from "../shared-read-confinement.ts";
 import { ForegroundSandboxController } from "../state.ts";
 import { nonTempBase } from "./support/fixture-base.ts";
+import { leakProbeViaBuilder, leakProbeViaOuterShell, makeFixture, type Fixture } from "./support/hardening-support.ts";
 import { realBackendSkip } from "./support/resolvable-backend.ts";
 
 const PYTHON = "/usr/bin/python3";
@@ -146,7 +151,6 @@ def key_read():
     n = errno_call(lambda: libc.syscall(P["sysKeyctl"], 11, P["keyId"], buf, 64))
     return buf.raw[:n].decode()
 probe("keyctl_read_host_key", key_read)
-probe("inherited_fd3", lambda: os.read(3, 40).decode() if P["fd3"] else "n/a")
 probe("hostname", lambda: os.uname().nodename)
 probe("uid", lambda: os.getuid())
 probe("clock_skew_seconds", lambda: abs(time.time() - P["hostTime"]) < 30)
@@ -266,20 +270,15 @@ print(json.dumps({"shmId": shm, "mqName": name if mq >= 0 else "", "keyId": key}
                     private_tmp: "/tmp/pbs-probe", via_project_symlink: join(project, "link-out", "new"), readonly_folder: join(shared, "new") },
                 project, outsideBinary: join(outside, "tool.sh"), linkedBinary: join(project, "link-out", "tool.sh"), hostPid: process.pid, hostPpid: process.ppid, hostTmpMarker,
                 shmId: sysv.shmId, mqName: sysv.mqName, keyId: sysv.keyId, sysKeyctl, sysCapget,
-                hostTime: Date.now() / 1000, fd3: true,
+                hostTime: Date.now() / 1000,
             };
-            const fd = openSync(join(outside, "secret.txt"), "r");
-            try {
-                const command = buildSandboxCommand({ profilePath: join(profiles, "unused.sb"), execPath: PYTHON, execArgs: ["-c", PROBE, JSON.stringify(params)], policy: plan.policy }, { env: {} });
-                const out = spawnSync(command.file, command.fileArgs, {
-                    encoding: "utf8", cwd: project, timeout: 60_000, stdio: ["ignore", "pipe", "pipe", fd],
-                    env: { PBS_PROBE_SECRET: "leak", HOME: home },
-                });
-                assert.equal(out.status, 0, out.stderr);
-                return JSON.parse(out.stdout.trim().split("\n").pop()!);
-            } finally {
-                closeSync(fd);
-            }
+            const command = buildSandboxCommand({ profilePath: join(profiles, "unused.sb"), execPath: PYTHON, execArgs: ["-c", PROBE, JSON.stringify(params)], policy: plan.policy }, { env: {} });
+            const out = spawnSync(command.file, command.fileArgs, {
+                encoding: "utf8", cwd: project, timeout: 60_000, stdio: ["ignore", "pipe", "pipe"],
+                env: { PBS_PROBE_SECRET: "leak", HOME: home },
+            });
+            assert.equal(out.status, 0, out.stderr);
+            return JSON.parse(out.stdout.trim().split("\n").pop()!);
         } finally {
             controller.dispose();
         }
@@ -310,7 +309,7 @@ const observed = (variant: string, name: string): string => runs[variant]?.[name
 const A = (name: string) => observed("A", name);
 const B = (name: string) => observed("B", name);
 const C = (name: string) => observed("C", name);
-const t = (name: string, body: () => void | Promise<void>) => test(name, { skip: baseSkip }, body);
+const t = (name: string, body: (context: TestContext) => void | Promise<void>) => test(name, { skip: baseSkip }, body);
 
 // ---- LIMITED ---------------------------------------------------------------------
 t("LIMITED: a file outside the allow set is not mounted; its absence is ENOENT, not EACCES", () => {
@@ -425,30 +424,48 @@ t("PARTIAL: with Network On names still do not resolve: the resolver configurati
     assert.equal(B("tcp_loopback"), "ok:connected");
 });
 
-t("NOT LIMITED: SysV shared memory and POSIX message queues are the host's IPC namespace", () => {
+t("LIMITED: SysV shared memory and POSIX message queues are a private IPC namespace (--unshare-ipc; switch hardening.ipc)", () => {
     if (sysv.shmId < 0) return;
-    assert.equal(A("sysv_shm_attach_host_segment"), "ok:attached");
-    if (sysv.mqName) assert.equal(A("posix_mq_open_host_queue"), "ok:opened");
+    for (const run of [A, B, C]) {
+        assert.match(run("sysv_shm_attach_host_segment"), /^err:/, "the host's segment is not attachable by id");
+        if (sysv.mqName) assert.match(run("posix_mq_open_host_queue"), /^err:/, "the host's queue is not openable by name");
+    }
 });
 
-t("NOT LIMITED: the kernel keyring is the caller's (a host user key is readable by id)", () => {
+t("LIMITED: the kernel keyring is unusable: keyctl, add_key and request_key fail (seccomp filter; switch hardening.keyring)", () => {
     if (sysv.keyId <= 0) return;
-    assert.equal(A("keyctl_read_host_key"), "ok:key-payload");
+    for (const run of [A, B, C]) assert.match(run("keyctl_read_host_key"), /^err:(EPERM|ENOSYS)$/, "a host user key is not readable by id");
 });
 
-t("NOT LIMITED: inherited file descriptors above 2 stay open and readable", () => {
-    assert.equal(A("inherited_fd3"), "ok:outside-secret\n");
+t("LIMITED: inherited file descriptors above 2 are closed (spawner or outer shell leaks included; switch hardening.fds)", async (context) => {
+    if (!base) return context.skip("no fixture base");
+    const fx: Fixture = makeFixture("pbs-bwrap-limits-fds-");
+    try {
+        const viaBuilder = leakProbeViaBuilder(fx, undefined, "limits");
+        assert.equal(viaBuilder.exitCode, 0, viaBuilder.output);
+        assert.deepEqual([viaBuilder.leaked3, viaBuilder.leaked7], [false, false], "descriptors left open by the spawner are not usable inside");
+        const viaShell = await leakProbeViaOuterShell(fx, undefined, "limits");
+        assert.equal(viaShell.exitCode, 0, viaShell.output);
+        assert.deepEqual([viaShell.leaked3, viaShell.leaked7], [false, false], "descriptors held by the foreground launcher's outer shell are not usable inside");
+    } finally { rmSync(fx.root, { recursive: true, force: true }); }
 });
 
-t("NOT LIMITED: hostname, uid and clock are the host's; resource limits are inherited unchanged", () => {
-    assert.equal(A("hostname"), `ok:${hostname()}`);
+t("LIMITED: the hostname is private: a fixed generic name (or the policy's), never the host's (--unshare-uts; switches hardening.uts, hardening.hostname)", () => {
+    for (const run of [A, B, C]) {
+        assert.match(run("hostname"), /^ok:.+/);
+        assert.notEqual(run("hostname"), `ok:${hostname()}`);
+    }
+});
+
+t("NOT LIMITED: uid and clock are the host's; resource limits are inherited unchanged", () => {
     assert.equal(A("clock_skew_seconds"), "ok:True");
     const probeLimits = hostLibc(`import resource,sys;print(resource.getrlimit(resource.RLIMIT_NPROC),resource.getrlimit(resource.RLIMIT_AS),resource.getrlimit(resource.RLIMIT_FSIZE),resource.getrlimit(resource.RLIMIT_NOFILE),sep="|")`).stdout.trim().split("|");
     assert.deepEqual([A("rlimit_nproc"), A("rlimit_as"), A("rlimit_fsize"), A("rlimit_nofile")].map((v) => v.replace(/^ok:/, "")), probeLimits);
 });
 
-t("NOT LIMITED: a user namespace can be created inside (it grants nothing on the host, but widens kernel attack surface)", () => {
-    assert.equal(A("nested_user_namespace"), "ok:True");
+t("LIMITED: a nested user namespace cannot be created inside (--unshare-user with the same ids and --disable-userns; switch hardening.userns)", () => {
+    for (const run of [A, B, C]) assert.equal(run("nested_user_namespace"), "ok:False");
+    assert.equal(A("effective_uid"), `ok:${userInfo().uid}`, "the user id seen inside is unchanged");
 });
 
 t("PARTIAL: an approved tool's config folder is readable whole; files matching the secret detector are refused", () => {
