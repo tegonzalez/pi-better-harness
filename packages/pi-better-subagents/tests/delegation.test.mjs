@@ -471,6 +471,37 @@ test("compaction inside a run that drops the settings message adds the current o
     }
 });
 
+test("a settings change between two compactions of one run is sent once, and the second compaction sends nothing", async () => {
+    setConfigForTests({ delegationMode: "adaptive", maxConcurrent: 4 });
+    try {
+        const s = compactingSession();
+        await s.handlers.get("session_start")({}, s.ctx);
+        s.run("First prompt");
+        s.setStreaming(true);
+        await s.compact(isSettings);
+        assert.equal(s.sent.length, 1, "the first compaction re-sends the dropped settings message");
+
+        // Mid-run change: held with the compaction re-send until the turn ends.
+        await s.commands.get("subagents").handler("cap 2", s.ctx);
+        assert.equal(s.sent.length, 2, "the settings change is sent once");
+        const changed = s.sent[1].message;
+        assert.match(changed.content, /concurrency limit 2 \(session\)/);
+
+        await s.compact(() => false);
+        assert.equal(s.sent.length, 2, "a second compaction before the turn ends does not send the newer message again");
+        assert.equal(s.run("During").message, undefined, "the next run does not send it either");
+
+        s.flush();
+        s.setStreaming(false);
+        const revisions = s.settingsEntries().map((item) => item.details.revision);
+        assert.equal(revisions.filter((revision) => revision === changed.details.revision).length, 1, "the newer message lands once");
+        assert.equal(revisions.at(-1), changed.details.revision, "the newer message is the latest in context");
+        assert.equal(s.run("After").message, undefined);
+    } finally {
+        setConfigForTests(undefined);
+    }
+});
+
 test("compaction that keeps the settings message sends nothing", async () => {
     setConfigForTests({ delegationMode: "adaptive", maxConcurrent: 4 });
     try {

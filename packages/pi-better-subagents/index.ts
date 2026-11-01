@@ -1949,28 +1949,38 @@ export default function (pi: ExtensionAPI) {
     };
     // A settings message sent with triggerTurn: false while a run streams is held until the turn
     // ends. Until it lands in the branch, count it as the latest settings message so a second
-    // compaction (or the next run) does not send it twice.
-    let queuedSettings: { revision: string; afterEntryId: string } | undefined;
+    // compaction (or the next run) does not send it twice. Every send records here, so the
+    // latest send (a compaction re-send or a settings change) is the one tracked.
+    let settingsSession: ExtensionContext["sessionManager"] | undefined;
+    let queuedSettings: { revision: string; afterEntryId: string | undefined } | undefined;
     const queuedSettingsRevision = (ctx: ExtensionContext): string | undefined => {
         if (!queuedSettings) return undefined;
+        const queued = queuedSettings;
         const branch = ctx.sessionManager?.getBranch?.() ?? [];
-        const start = branch.findIndex((entry) => entry.id === queuedSettings!.afterEntryId);
-        const landed = start < 0 || branch.slice(start + 1)
-            .some((entry) => entry.type === "custom_message" && entry.customType === SUBAGENT_SETTINGS_CONTEXT);
+        const start = queued.afterEntryId === undefined ? -1 : branch.findIndex((entry) => entry.id === queued.afterEntryId);
+        const landed = (queued.afterEntryId !== undefined && start < 0) || branch.slice(start + 1)
+            .some((entry) => entry.type === "custom_message" && entry.customType === SUBAGENT_SETTINGS_CONTEXT
+                && (entry.details as { revision?: unknown } | undefined)?.revision === queued.revision);
         if (landed) queuedSettings = undefined;
         return queuedSettings?.revision;
     };
     /** Revision of the latest settings message the model context holds or will receive. */
     const currentSettingsRevision = (ctx: ExtensionContext): string | undefined =>
         queuedSettingsRevision(ctx) ?? contextSettingsRevision(ctx);
+    /** Sends one settings message without starting a turn and tracks it until it lands. */
+    const sendSettings = (message: ReturnType<typeof settingsMessage>, afterEntryId?: string): void => {
+        const anchor = afterEntryId ?? settingsSession?.getBranch?.()?.at(-1)?.id;
+        queuedSettings = { revision: message.details.revision, afterEntryId: anchor };
+        announcedSettingsRevision = message.details.revision;
+        pi.sendMessage(message, { triggerTurn: false });
+    };
     // Persist one settings message at the point of change. Without triggerTurn, pi appends it
     // immediately when idle, or after the current turn's tool results while streaming; it
     // starts no turn and reaches the next model request of the same run.
     const announceSettingsChange = (): void => {
         const message = settingsMessage();
         if (message.details.revision === announcedSettingsRevision) return;
-        announcedSettingsRevision = message.details.revision;
-        pi.sendMessage(message, { triggerTurn: false });
+        sendSettings(message);
     };
     const changeCap = (cap: number): void => {
         if (!isConcurrencyCap(cap)) throw new Error("Concurrent subagents must be a positive whole number.");
@@ -2031,6 +2041,7 @@ export default function (pi: ExtensionAPI) {
         capOverride = undefined;
         // A reloaded session or another branch holds its own settings history.
         queuedSettings = undefined;
+        settingsSession = ctx.sessionManager;
         announcedSettingsRevision = contextSettingsRevision(ctx);
         const branch = ctx.sessionManager?.getBranch?.();
         if (!Array.isArray(branch)) return;
@@ -3268,6 +3279,7 @@ export default function (pi: ExtensionAPI) {
     pi.on("before_agent_start", (event, ctx) => {
         const systemPrompt = `${appendExecutionPolicy(event.systemPrompt)}\n\n${subagentDelegationSystemPrompt()}`;
         const message = settingsMessage();
+        settingsSession = ctx.sessionManager;
         announcedSettingsRevision = currentSettingsRevision(ctx);
         if (message.details.revision === announcedSettingsRevision) return { systemPrompt };
         announcedSettingsRevision = message.details.revision;
@@ -3278,10 +3290,9 @@ export default function (pi: ExtensionAPI) {
     // current one back once; it starts no turn and lands after the current turn ends.
     pi.on("session_compact", (event, ctx) => {
         const message = settingsMessage();
+        settingsSession = ctx.sessionManager;
         if (message.details.revision === currentSettingsRevision(ctx)) return;
-        queuedSettings = { revision: message.details.revision, afterEntryId: event.compactionEntry.id };
-        announcedSettingsRevision = message.details.revision;
-        pi.sendMessage(message, { triggerTurn: false });
+        sendSettings(message, event.compactionEntry.id);
     });
 
     // ---- live-status lifecycle -----------------------------------------
