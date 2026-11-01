@@ -366,8 +366,13 @@ export async function prepareCatalogJob(snapshot: CatalogSnapshot, job: CatalogJ
     }
     const selector = agent ? { agentId: agent } : { roleId: roles[0]! };
     const resolved = resolveSelection(snapshot, selector);
-    const loadFailures = catalogLoadFailures(snapshot, [resolved.effective?.source?.scope, resolved.effective?.roleSource?.scope]);
-    const loadMessage = loadFailures.length === 0 ? "" : `The agent catalog failed to load: ${loadFailures.map((item) => item.path && !item.message.includes(item.path) ? `${item.path}: ${item.message.trim()}` : item.message.trim()).join(" ")} A definition in that file could replace ${agent ?? roles[0]}, so the launch was refused instead of using another definition. Repair or remove the file, then retry. No child was started.`;
+    // An agent whose role did not resolve could get it from a broken file in any source, including
+    // one ranked below the agent, so every load failure is named.
+    const effective = resolved.effective;
+    const missingRole = effective?.kind === "agent" && effective.roleId && !effective.roleSource ? effective.roleId : undefined;
+    const loadFailures = catalogLoadFailures(snapshot, missingRole ? [] : [effective?.source?.scope, effective?.roleSource?.scope]);
+    const couldChange = missingRole ? `could define ${missingRole}, which ${agent} needs,` : `could replace ${agent ?? roles[0]},`;
+    const loadMessage = loadFailures.length === 0 ? "" : `The agent catalog failed to load: ${loadFailures.map((item) => item.path && !item.message.includes(item.path) ? `${item.path}: ${item.message.trim()}` : item.message.trim()).join(" ")} A definition in that file ${couldChange} so the launch was refused instead of using another definition. Repair or remove the file, then retry. No child was started.`;
     if (!resolved.effective || resolved.status === "clarification-needed" || resolved.status === "not-found" || !resolved.launchable) {
         const message = [resolved.diagnostics.map((item) => item.message).join(" ") || "Catalog selection is not launchable. No child was started.", loadMessage].filter(Boolean).join(" ");
         return { status: "blocked", message, diagnostics: [...resolved.diagnostics, ...loadFailures] };
