@@ -21,6 +21,14 @@ import {
     type CommandSpec,
     type RemoteRunner,
 } from "./shared-ssh-core/index.ts";
+import {
+    hasCommandLimits,
+    parseCommandLimits,
+    resourceScopeArguments,
+    resourceScopeCheckScript,
+    COMMAND_LIMIT_KEYS,
+    type CommandLimits,
+} from "./shared-sandbox-core.ts";
 
 export interface RemoteSandboxPolicy {
     /** Remote sandbox profile the remote pi must apply. Required: a remote run is never unconfined by omission. */
@@ -48,6 +56,16 @@ export interface RemoteSandboxPolicy {
      * audit entry fails closed; when omitted the hash is only recorded.
      */
     policyHash?: string;
+}
+
+/** Resource bounds a target applies (see docs/remote-subagents.md#session-limits). */
+export interface RemoteResources {
+    /**
+     * Limits for the whole remote pi process and every child: the launch script starts pi inside ONE
+     * `systemd-run --user --scope`. Same keys and forms as the sandbox policy's `resources.command`.
+     * A limit that cannot be applied fails the launch closed; pi never runs unbounded instead.
+     */
+    session?: CommandLimits;
 }
 
 export interface RemoteTarget {
@@ -82,6 +100,8 @@ export interface RemoteTarget {
     };
     env?: Record<string, string>;
     sandbox: RemoteSandboxPolicy;
+    /** Optional resource bounds for the remote pi (`resources.session`). */
+    resources?: RemoteResources;
     /** How long stop waits for the RPC abort to be acknowledged. Default 3000. */
     abortWaitMs?: number;
     /** Seconds between remote TERM and KILL during stop. Default 5. */
@@ -143,7 +163,7 @@ export function parseRemoteTarget(value: unknown, name: string): RemoteTarget {
     const where = `"${name}"`;
     if (!TARGET_NAME.test(name)) fail(where, "target names use letters, digits, '.', '_' and '-'");
     const obj = plainObject(value, where);
-    noUnknown(obj, ["host", "user", "port", "cwd", "cwdRoots", "agentDir", "root", "pi", "env", "sandbox", "abortWaitMs", "termGraceSeconds"], where);
+    noUnknown(obj, ["host", "user", "port", "cwd", "cwdRoots", "agentDir", "root", "pi", "env", "sandbox", "resources", "abortWaitMs", "termGraceSeconds"], where);
     const target: RemoteTarget = {
         host: str(obj.host, `${where}.host`),
         pi: undefined as never,
@@ -206,6 +226,12 @@ export function parseRemoteTarget(value: unknown, name: string): RemoteTarget {
     // The profile must reach the remote pi. Without a carrier the profile would be a label, not a request.
     const carriesProfile = [...(target.sandbox.args ?? []), ...Object.values(target.sandbox.env ?? {})].some((v) => v.includes("{profile}"));
     if (!carriesProfile) fail(`${where}.sandbox`, "no way to pass the profile to the remote pi: reference {profile} in sandbox.args or sandbox.env");
+    if (obj.resources !== undefined) {
+        const resources = plainObject(obj.resources, `${where}.resources`);
+        noUnknown(resources, ["session"], `${where}.resources`);
+        target.resources = {};
+        if (resources.session !== undefined) target.resources.session = parseCommandLimits(resources.session, `${where}.resources.session`, fail);
+    }
     for (const key of ["abortWaitMs", "termGraceSeconds"] as const) {
         if (obj[key] === undefined) continue;
         if (!Number.isInteger(obj[key]) || (obj[key] as number) < 0 || (obj[key] as number) > 600_000) fail(`${where}.${key}`, "must be a non-negative integer");
@@ -302,7 +328,7 @@ export function remotePiWords(target: RemoteTarget, runId: string, options: Remo
     return words;
 }
 
-export const REMOTE_EXIT = { sessionMissing: 94, setsidMissing: 95, sandboxVerify: 96, cwdMissing: 97, dirFailed: 98, cwdDenied: 99, piMissing: 127, sshFailed: 255 } as const;
+export const REMOTE_EXIT = { sessionMissing: 94, setsidMissing: 95, sandboxVerify: 96, cwdMissing: 97, dirFailed: 98, cwdDenied: 99, sessionLimits: 100, piMissing: 127, sshFailed: 255 } as const;
 
 /** Line that ends the environment section the bridge writes to the launch script's stdin. */
 export function envSentinel(runId: string): string {
@@ -330,11 +356,69 @@ export function buildEnvPayload(target: RemoteTarget, runId: string): string {
     return `${lines.join("\n")}\n`;
 }
 
+// ---- session limits (resources.session) ---------------------------------------
+
+/** The target's configured session limits, or undefined when none is set (an empty object counts as none). */
+export function sessionLimitsOf(target: RemoteTarget): CommandLimits | undefined {
+    const limits = target.resources?.session;
+    return hasCommandLimits(limits) ? limits : undefined;
+}
+
+/** The configured limits as written, only the keys that are set, in the documented order. */
+export function sessionLimitsRecord(limits: CommandLimits): CommandLimits {
+    const out: CommandLimits = {};
+    for (const key of COMMAND_LIMIT_KEYS) if (limits[key] !== undefined) (out as Record<string, string | number>)[key] = limits[key]!;
+    return out;
+}
+
+const SESSION_SCOPE_SUBJECT = "remote session limits";
+/** The scope's check as one line: it travels inside a command line, which scope tooling and logs show whole. */
+function oneLine(script: string): string {
+    return script.split("\n").join("; ");
+}
+const SESSION_PI_STARTER = `sh -c 'echo $$ > "$0/pid"; exec "$@"'`;
+
+/**
+ * POSIX sh lines that run before pi is staged and refuse the launch (exit `REMOTE_EXIT.sessionLimits`) unless a
+ * resource scope with the configured limits can really be started here: `systemd-run` exists, the user's
+ * systemd user manager is reachable, and a probe scope carries every controller the limits need. Over ssh the
+ * user manager is reachable only while the user has lingering enabled or an active login session; the reason
+ * (and the success note) say which applies. There is no unscoped fallback.
+ */
+function sessionLimitPreflight(limits: CommandLimits): string[] {
+    const scopeWords = resourceScopeArguments(limits, { stopGrace: false }).map(shellQuote).join(" ");
+    const probe = shellQuote(oneLine(resourceScopeCheckScript(limits, "exit 0", SESSION_SCOPE_SUBJECT)));
+    return [
+        `limit_fail() { echo "pi-remote: resources.session cannot be applied: $1; pi is not started without the bound" >&2; exit ${REMOTE_EXIT.sessionLimits}; }`,
+        `command -v systemd-run >/dev/null 2>&1 || limit_fail "systemd-run is not available on the remote host (session limits need a systemd user scope)"`,
+        `uid=$(id -u)`,
+        // The user manager's runtime directory; a non-login ssh command may not have it in its environment.
+        `case "\${XDG_RUNTIME_DIR:-}" in /*) ;; *) XDG_RUNTIME_DIR="/run/user/$uid";; esac; export XDG_RUNTIME_DIR`,
+        // Why the user manager exists for this launch: lingering, or an active login session that holds it.
+        `case "$(loginctl show-user "$uid" -p Linger --value 2>/dev/null)" in yes) basis="lingering is enabled";; no) basis="lingering is not enabled, so the user manager exists only while a login session is active";; *) basis="lingering and login-session state could not be read";; esac`,
+        `if [ -z "\${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ ! -S "$XDG_RUNTIME_DIR/bus" ] && [ ! -S "$XDG_RUNTIME_DIR/systemd/private" ]; then limit_fail "no systemd user manager is reachable for user $uid ($basis)"; fi`,
+        `probe_out=$(systemd-run ${scopeWords} -- sh -c ${probe} pi-session-scope-probe 2>&1) || limit_fail "a systemd user scope with the configured limits cannot be started: $(printf '%s\\n' "$probe_out" | tail -n 1) ($basis)"`,
+        `echo "pi-remote: session limits are applied through the systemd user manager ($basis)" >&2`,
+    ];
+}
+
+/** The launch words that start pi inside one resource scope (the scope's own check runs first, inside it). */
+function sessionScopeLaunch(limits: CommandLimits): string {
+    const scopeWords = resourceScopeArguments(limits, { stopGrace: false }).map(shellQuote).join(" ");
+    const check = shellQuote(oneLine(resourceScopeCheckScript(limits, 'exec "$@"', SESSION_SCOPE_SUBJECT)));
+    return `systemd-run ${scopeWords} -- sh -c ${check} pi-session-scope`;
+}
+
 /**
  * POSIX sh script that prepares the run directory and execs remote pi in its own session.
  * Requires `setsid`: stop works by session id and must reach every process the run started.
  * The environment arrives on stdin (see buildEnvPayload) and is staged in a 0600 file that is
  * removed once sourced; it never appears on a command line.
+ *
+ * With `resources.session` the script first checks that the limits can be applied (see
+ * sessionLimitPreflight) and then runs pi inside one `systemd-run --user --scope` placed under setsid: the
+ * recorded pid is still the session leader that becomes pi, and the scope holds pi and every child. Without
+ * `resources.session` the script is exactly the unscoped one.
  */
 export function buildLaunchScript(target: RemoteTarget, runId: string, options: RemotePiOptions): string {
     const cwd = effectiveRemoteCwd(target, options.cwd);
@@ -362,6 +446,8 @@ export function buildLaunchScript(target: RemoteTarget, runId: string, options: 
         }
         lines.push(`[ "$cwd_ok" = 1 ] || { echo "pi-remote: the working folder is outside the target's allowed cwdRoots" >&2; exit ${REMOTE_EXIT.cwdDenied}; }`);
     }
+    const sessionLimits = sessionLimitsOf(target);
+    if (sessionLimits) lines.push(...sessionLimitPreflight(sessionLimits));
     const sentinel = shellQuote(envSentinel(runId));
     const piWords = [pi, ...remotePiWords(target, runId, options)].join(" ");
     lines.push(
@@ -372,7 +458,9 @@ export function buildLaunchScript(target: RemoteTarget, runId: string, options: 
         `. "$EF"; rm -f "$EF"`,
         `now=$(date +%s%3N 2>/dev/null); case "$now" in ''|*[!0-9]*) now="$(date +%s)000";; esac`,
         `echo "${STARTED_MARKER} $now"`,
-        `exec setsid -w sh -c 'echo $$ > "$0/pid"; exec "$@"' "$RD" ${piWords}`,
+        sessionLimits
+            ? `exec setsid -w ${sessionScopeLaunch(sessionLimits)} ${SESSION_PI_STARTER} "$RD" ${piWords}`
+            : `exec setsid -w sh -c 'echo $$ > "$0/pid"; exec "$@"' "$RD" ${piWords}`,
     );
     return lines.join("\n");
 }
@@ -452,6 +540,8 @@ export interface RemoteRunMeta {
     agentDir?: string;
     /** Run this one resumed (same remote session, new pi process). */
     resumedFrom?: string;
+    /** Session limits the remote pi was bound by (one systemd user scope), as configured; absent when none is set. */
+    sessionLimits?: CommandLimits;
     /** Set by the parent after the bridge verified the remote sandbox launch audit entry. */
     sandbox?: RemoteSandboxVerification;
 }
@@ -534,6 +624,7 @@ export function buildRemotePlan(input: {
             ...(effectiveRemoteCwd(target, input.options.cwd) ? { cwd: effectiveRemoteCwd(target, input.options.cwd)! } : {}),
             ...(target.agentDir ? { agentDir: target.agentDir } : {}),
             ...(input.options.resumeSessionOf ? { resumedFrom: input.options.resumeSessionOf } : {}),
+            ...(sessionLimitsOf(target) ? { sessionLimits: sessionLimitsRecord(sessionLimitsOf(target)!) } : {}),
         },
         bridge: {
             argv: [...input.sshArgv, launch],
