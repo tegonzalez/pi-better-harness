@@ -464,8 +464,8 @@ describe("T09 T10 T17 fallback", () => {
         try {
             const registry = registryOf([model("github-copilot", "claude-opus-5.5")]);
             for (const [selector, owner, unavailable] of [
-                [{ roleId: "role.architect" }, /role role\.architect/, /openai\/gpt-6-astra/],
-                [{ agentId: "agent.pay" }, /agent agent\.pay/, /openai\/gpt-6-luna/],
+                [{ roleId: "role.architect" }, /^Role role\.architect default model/, /openai\/gpt-6-astra/],
+                [{ agentId: "agent.pay" }, /^Agent agent\.pay \(role role\.architect\) default model/, /openai\/gpt-6-luna/],
             ]) {
                 const decision = resolveModel({
                     effective: select(fixture.snapshot, selector),
@@ -482,8 +482,12 @@ describe("T09 T10 T17 fallback", () => {
                 assert.match(message, owner);
                 assert.match(message, unavailable);
                 assert.match(message, /pass model explicitly/i);
-                assert.match(message, /set an available default model/i);
+                assert.match(message, /set an available (model override for agent\.pay, or an available )?defaults\.model for role\.architect/);
+                assert.match(message, /personal role file ~\/\.pi\/agent\/agents\/roles\/role\.architect\.md or with \/agents/);
                 assert.match(message, /tierPolicy/);
+                assert.match(message, /listed in that tier's members/);
+                assert.match(message, /provider other than openai needs crossProvider: true/);
+                assert.doesNotMatch(message.split("Fix:")[1], /\b(role|agent) \1\./i, "the fix does not repeat the kind before the id");
                 assert.match(message, /no child was started/i);
                 assert.doesNotMatch(message, /Using foreground model/);
                 assert.throws(() => launchParameters(decision), /No child was started/);
