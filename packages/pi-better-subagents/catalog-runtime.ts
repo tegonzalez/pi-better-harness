@@ -315,14 +315,21 @@ const UNATTRIBUTED_LOAD_FAILURES: ReadonlySet<string> = new Set([
  * Files that failed to load or parse before their id was known. Any of them
  * could hold a definition that shadows the selection, so a catalog launch must
  * not silently continue with a lower-priority source. Failures in a scope below
- * the selected definition's scope cannot shadow it and are ignored.
+ * every selected definition's scope cannot shadow them and are ignored. Pass
+ * each definition the launch depends on (an agent and the role it inherits);
+ * the lowest-ranked one decides, since a broken file above it could replace it.
  */
-export function catalogLoadFailures(snapshot: Pick<CatalogSnapshot, "diagnostics">, selectedScope?: string): Diagnostic[] {
+export function catalogLoadFailures(
+    snapshot: Pick<CatalogSnapshot, "diagnostics">,
+    selectedScope?: string | readonly (string | undefined)[],
+): Diagnostic[] {
     const rank = (scope: string | undefined) => {
         const index = SOURCE_PRECEDENCE.indexOf(scope as (typeof SOURCE_PRECEDENCE)[number]);
         return index < 0 ? -1 : index;
     };
-    const selected = selectedScope === undefined ? Number.POSITIVE_INFINITY : rank(selectedScope);
+    const scopes = (Array.isArray(selectedScope) ? selectedScope : [selectedScope])
+        .filter((scope): scope is string => scope !== undefined);
+    const selected = scopes.length === 0 ? Number.POSITIVE_INFINITY : Math.max(...scopes.map(rank));
     // A file whose id was still read is attributed (for example invalid-shadow) and blocks only that id.
     const attributed = new Set(snapshot.diagnostics.filter((item) => item.id && item.path).map((item) => item.path));
     return snapshot.diagnostics.filter((item) => !item.id && item.path && !attributed.has(item.path)
@@ -359,7 +366,7 @@ export async function prepareCatalogJob(snapshot: CatalogSnapshot, job: CatalogJ
     }
     const selector = agent ? { agentId: agent } : { roleId: roles[0]! };
     const resolved = resolveSelection(snapshot, selector);
-    const loadFailures = catalogLoadFailures(snapshot, resolved.effective?.source?.scope);
+    const loadFailures = catalogLoadFailures(snapshot, [resolved.effective?.source?.scope, resolved.effective?.roleSource?.scope]);
     const loadMessage = loadFailures.length === 0 ? "" : `The agent catalog failed to load: ${loadFailures.map((item) => item.path && !item.message.includes(item.path) ? `${item.path}: ${item.message.trim()}` : item.message.trim()).join(" ")} A definition in that file could replace ${agent ?? roles[0]}, so the launch was refused instead of using another definition. Repair or remove the file, then retry. No child was started.`;
     if (!resolved.effective || resolved.status === "clarification-needed" || resolved.status === "not-found" || !resolved.launchable) {
         const message = [resolved.diagnostics.map((item) => item.message).join(" ") || "Catalog selection is not launchable. No child was started.", loadMessage].filter(Boolean).join(" ");
