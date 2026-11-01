@@ -1947,6 +1947,22 @@ export default function (pi: ExtensionAPI) {
         }
         return undefined;
     };
+    // A settings message sent with triggerTurn: false while a run streams is held until the turn
+    // ends. Until it lands in the branch, count it as the latest settings message so a second
+    // compaction (or the next run) does not send it twice.
+    let queuedSettings: { revision: string; afterEntryId: string } | undefined;
+    const queuedSettingsRevision = (ctx: ExtensionContext): string | undefined => {
+        if (!queuedSettings) return undefined;
+        const branch = ctx.sessionManager?.getBranch?.() ?? [];
+        const start = branch.findIndex((entry) => entry.id === queuedSettings!.afterEntryId);
+        const landed = start < 0 || branch.slice(start + 1)
+            .some((entry) => entry.type === "custom_message" && entry.customType === SUBAGENT_SETTINGS_CONTEXT);
+        if (landed) queuedSettings = undefined;
+        return queuedSettings?.revision;
+    };
+    /** Revision of the latest settings message the model context holds or will receive. */
+    const currentSettingsRevision = (ctx: ExtensionContext): string | undefined =>
+        queuedSettingsRevision(ctx) ?? contextSettingsRevision(ctx);
     // Persist one settings message at the point of change. Without triggerTurn, pi appends it
     // immediately when idle, or after the current turn's tool results while streaming; it
     // starts no turn and reaches the next model request of the same run.
@@ -2014,6 +2030,7 @@ export default function (pi: ExtensionAPI) {
         delegationOverride = undefined;
         capOverride = undefined;
         // A reloaded session or another branch holds its own settings history.
+        queuedSettings = undefined;
         announcedSettingsRevision = contextSettingsRevision(ctx);
         const branch = ctx.sessionManager?.getBranch?.();
         if (!Array.isArray(branch)) return;
@@ -3251,10 +3268,20 @@ export default function (pi: ExtensionAPI) {
     pi.on("before_agent_start", (event, ctx) => {
         const systemPrompt = `${appendExecutionPolicy(event.systemPrompt)}\n\n${subagentDelegationSystemPrompt()}`;
         const message = settingsMessage();
-        announcedSettingsRevision = contextSettingsRevision(ctx);
+        announcedSettingsRevision = currentSettingsRevision(ctx);
         if (message.details.revision === announcedSettingsRevision) return { systemPrompt };
         announcedSettingsRevision = message.details.revision;
         return { systemPrompt, message };
+    });
+    // Compaction can run inside a run (before the next response, or before an overflow retry),
+    // where before_agent_start does not fire. When it drops the latest settings message, add the
+    // current one back once; it starts no turn and lands after the current turn ends.
+    pi.on("session_compact", (event, ctx) => {
+        const message = settingsMessage();
+        if (message.details.revision === currentSettingsRevision(ctx)) return;
+        queuedSettings = { revision: message.details.revision, afterEntryId: event.compactionEntry.id };
+        announcedSettingsRevision = message.details.revision;
+        pi.sendMessage(message, { triggerTurn: false });
     });
 
     // ---- live-status lifecycle -----------------------------------------
