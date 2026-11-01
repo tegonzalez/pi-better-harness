@@ -14,7 +14,7 @@ Normative rules are R3, R4, R8, and the resolver half of R10. Prose parsing and 
 
 ## Precedence
 
-Model and effort are independent. A model-only choice keeps the resolved effort. Falling back to another model, including the foreground model, does not copy that model's effort.
+Model and effort are independent. A model-only choice keeps the resolved effort. Falling back to a configured same-tier candidate, or inheriting the foreground model, does not copy that model's effort.
 
 Effort, highest first:
 
@@ -29,10 +29,10 @@ Model, highest first:
 1. Invocation model, with a providerless id accepted only when one available model has that id.
 2. Authoritative model. Same providerless rule. Read only when `effective` is present, so catalog-free calls stay on the old chain.
 3. Saved agent model, otherwise the role model.
-4. If that preferred model is missing or not available: the first eligible configured candidate of the definition's tier, otherwise the foreground model.
-5. If the definition has no model preference (absent, or an explicit null override): configured `defaultModel` when it is available, otherwise the foreground model. Tier candidates are not used.
+4. If that preferred model is missing or not available: the first eligible configured candidate of the definition's tier. Otherwise launch is blocked (`unavailable-default-model`). The foreground model is never a silent substitute for an unavailable default. The error names the role or agent and the unavailable model, and says how to fix it: set an available default, add a `tierPolicy` candidate (the only opt-in fallback), or pass `model` explicitly.
+5. If the definition has no model preference (absent, or an explicit null override): configured `defaultModel`. When `defaultModel` is set but unavailable or invalid, launch is blocked (`unavailable-default-model`). Only when no `defaultModel` is set does the run inherit the foreground model. Tier candidates are not used.
 
-An explicit invocation or authoritative model that is unavailable, ambiguous, or paired with an unsupported effort blocks launch. Lower sources are not fallbacks. A saved model override is a preferred default, so it may fall through the tier and foreground chain. A saved effort override stays explicit on that fallback: an unsupported level blocks launch instead of moving to a nearby level.
+An explicit invocation or authoritative model that is unavailable, ambiguous, or paired with an unsupported effort blocks launch. Lower sources are not fallbacks. A saved model override is a preferred default, so it may fall through to a configured tier candidate, and otherwise blocks. A saved effort override stays explicit on that fallback: an unsupported level blocks launch instead of moving to a nearby level.
 
 ## Tier candidates
 
@@ -43,7 +43,7 @@ An explicit invocation or authoritative model that is unavailable, ambiguous, or
 - It is in the foreground available set.
 - Its provider matches the preferred model, or `crossProvider: true`. A string candidate does not opt into another provider.
 
-An unknown tier name, or a missing tier, does not borrow another tier. The reason is recorded and the resolver goes to the foreground model. If the foreground model is also unusable, the decision is blocked. The diagnostic says no child was started and how to recover.
+An unknown tier name, or a missing tier, does not borrow another tier. The reason is recorded and the decision is blocked. The diagnostic says no child was started and how to recover.
 
 ## Effort support
 
@@ -80,6 +80,6 @@ Persist `modelSelection` and `effortSelection` (`requested`, `actual`, `source`,
 
 ## Inspection
 
-`assessSelection` and `assessCatalog` attach default-launch availability to a snapshot. They do not apply invocation overrides. `schemaLaunchable` false stays `availability: "catalog-blocked"` and does not fall back to a model. A schema-valid role whose preferred model is missing can still be `launchable` when a candidate or the foreground model resolves. `capabilities` is the catalog object, not a new grant.
+`assessSelection` and `assessCatalog` attach default-launch availability to a snapshot. They do not apply invocation overrides. `schemaLaunchable` false stays `availability: "catalog-blocked"` and does not fall back to a model. A schema-valid role whose preferred model is missing can still be `launchable` when a configured tier candidate resolves; otherwise it is `unavailable`. `capabilities` is the catalog object, not a new grant.
 
 `/agents` and `agents_catalog` can show `launchable`, `availability`, `preferredModelAvailable`, and the decision's requested/actual/source/reason beside the existing inherited-versus-override fields.

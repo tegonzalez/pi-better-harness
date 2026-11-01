@@ -371,16 +371,18 @@ describe("T09 T10 T17 fallback", () => {
                     model("xai", "grok-4.7"),
                 ]),
             });
-            assert.equal(nonMember.modelSelection.actual, "xai/grok-4.7");
-            assert.equal(nonMember.modelSelection.source, "foreground");
+            // No eligible configured candidate: the foreground model is not a silent fallback.
+            assert.equal(nonMember.status, "blocked");
+            assert.equal(nonMember.modelSelection.actual, null);
+            assert.equal(codes(nonMember).includes(ModelResolutionCodes.unavailableDefaultModel), true);
             assert.match(nonMember.modelSelection.reason, /not a member/);
-            assert.match(nonMember.modelSelection.reason, /Foreground effort was not inherited/);
+            assert.match(nonMember.modelSelection.reason, /cross-provider|not a member/);
         } finally {
             fixture.cleanup();
         }
     });
 
-    it("uses foreground when the tier has no candidate or the tier is unknown, and does not swap approved models", () => {
+    it("blocks instead of using foreground when the tier has no candidate or the tier is unknown, and does not swap approved models", () => {
         const fixture = openFixture([
             { kind: "role", name: "role.developer.md", markdown: roleMarkdown("role.developer") },
             {
@@ -401,18 +403,21 @@ describe("T09 T10 T17 fallback", () => {
                 foregroundModel: "xai/grok-4.7",
                 configuredDefaultModel: "openai/gpt-6-luna",
             });
-            assert.equal(emptyTier.modelSelection.actual, "xai/grok-4.7");
-            assert.equal(emptyTier.modelSelection.source, "foreground");
+            assert.equal(emptyTier.status, "blocked");
+            assert.equal(emptyTier.modelSelection.actual, null);
+            assert.equal(codes(emptyTier).includes(ModelResolutionCodes.unavailableDefaultModel), true);
             assert.match(emptyTier.modelSelection.reason, /no configured candidates|no eligible available candidate/i);
             assert.equal(codes(emptyTier).includes(ModelResolutionCodes.unknownTier), false);
-            assert.equal(emptyTier.effortSelection.actual, "high");
+            // The configured defaultModel applies only to definitions without a model; it is not a fallback here.
+            assert.equal(emptyTier.modelSelection.actual === "openai/gpt-6-luna", false);
 
             const unknown = resolveModel({
                 effective: select(fixture.snapshot, { roleId: "role.custom" }),
                 registry,
                 foregroundModel: "xai/grok-4.7",
             });
-            assert.equal(unknown.modelSelection.actual, "xai/grok-4.7");
+            assert.equal(unknown.status, "blocked");
+            assert.equal(unknown.modelSelection.actual, null);
             assert.equal(codes(unknown).includes(ModelResolutionCodes.unknownTier), true);
             assert.match(unknown.diagnostics.find((item) => item.code === ModelResolutionCodes.unknownTier).message, /not guessed|was not guessed|No model from another tier/);
             assert.equal(unknown.modelSelection.actual === "openai/gpt-6-astra", false);
@@ -437,11 +442,10 @@ describe("T09 T10 T17 fallback", () => {
                         balanced: { members: ["openai/gpt-6.1-sol", "openai/gpt-6-luna"], candidates: ["openai/gpt-6-luna"] },
                     }),
                 });
-                assert.equal(decision.modelSelection.actual, "xai/grok-4.7");
-                assert.equal(decision.modelSelection.source, "foreground");
+                assert.equal(decision.status, "blocked");
+                assert.equal(decision.modelSelection.actual, null);
                 assert.equal(codes(decision).includes(ModelResolutionCodes.unknownTier), true);
-                assert.equal(decision.effortSelection.actual, "high");
-                assert.equal(decision.effortSelection.source, "role-default");
+                assert.equal(codes(decision).includes(ModelResolutionCodes.unavailableDefaultModel), true);
             } finally {
                 cleared.cleanup();
             }
@@ -450,13 +454,94 @@ describe("T09 T10 T17 fallback", () => {
         }
     });
 
-    it("does not start a child when preferred, candidates, and foreground are unusable", () => {
+    it("blocks an unavailable role or agent default instead of silently using the foreground model", () => {
+        const fixture = openFixture([
+            { kind: "role", name: "role.architect.md", markdown: roleMarkdown("role.architect", { model: "openai/gpt-6-astra" }) },
+            {
+                kind: "agent",
+                name: "agent.pay.md",
+                markdown: agentMarkdown("agent.pay", "role.architect", "  model: openai/gpt-6-luna\n"),
+            },
+        ]);
+        try {
+            const registry = registryOf([model("github-copilot", "claude-opus-5.5")]);
+            for (const [selector, owner, unavailable] of [
+                [{ roleId: "role.architect" }, /role role\.architect/, /openai\/gpt-6-astra/],
+                [{ agentId: "agent.pay" }, /agent agent\.pay/, /openai\/gpt-6-luna/],
+            ]) {
+                const decision = resolveModel({
+                    effective: select(fixture.snapshot, selector),
+                    registry,
+                    foregroundModel: "github-copilot/claude-opus-5.5",
+                });
+                assert.equal(decision.status, "blocked");
+                assert.equal(decision.launch, null);
+                assert.equal(decision.modelSelection.actual, null);
+                assert.equal(decision.modelSelection.source, "absent");
+                assert.equal(codes(decision).includes(ModelResolutionCodes.unavailableDefaultModel), true);
+                assert.equal(codes(decision).includes(ModelResolutionCodes.modelFallback), false);
+                const message = decision.diagnostics.find((item) => item.code === ModelResolutionCodes.unavailableDefaultModel).message;
+                assert.match(message, owner);
+                assert.match(message, unavailable);
+                assert.match(message, /pass model explicitly/i);
+                assert.match(message, /set an available default model/i);
+                assert.match(message, /tierPolicy/);
+                assert.match(message, /no child was started/i);
+                assert.doesNotMatch(message, /Using foreground model/);
+                assert.throws(() => launchParameters(decision), /No child was started/);
+            }
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    it("blocks an unavailable configured defaultModel for a definition with no model, and inherits foreground only when none is configured", () => {
         const fixture = openFixture([
             { kind: "role", name: "role.developer.md", markdown: roleMarkdown("role.developer") },
+            {
+                kind: "agent",
+                name: "agent.pay.md",
+                markdown: agentMarkdown("agent.pay", "role.developer", "  model: null\n"),
+            },
+        ]);
+        try {
+            const effective = select(fixture.snapshot, { agentId: "agent.pay" });
+            const registry = registryOf([model("xai", "grok-4.7")]);
+            const configured = resolveModel({
+                effective,
+                registry,
+                configuredDefaultModel: "openai/gpt-6-luna",
+                foregroundModel: "xai/grok-4.7",
+            });
+            assert.equal(configured.status, "blocked");
+            assert.equal(codes(configured).includes(ModelResolutionCodes.unavailableDefaultModel), true);
+            const message = configured.diagnostics.find((item) => item.code === ModelResolutionCodes.unavailableDefaultModel).message;
+            assert.match(message, /agent agent\.pay/i);
+            assert.match(message, /defaultModel openai\/gpt-6-luna/);
+            assert.match(message, /set config defaultModel to an available/);
+            assert.match(message, /pass model explicitly/i);
+
+            const inherit = resolveModel({ effective, registry, configuredDefaultModel: null, foregroundModel: "xai/grok-4.7" });
+            assert.equal(inherit.status, "ready");
+            assert.equal(inherit.modelSelection.actual, "xai/grok-4.7");
+            assert.equal(inherit.modelSelection.source, "foreground");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    it("does not start a child when a definition without a model has no usable foreground model", () => {
+        const fixture = openFixture([
+            { kind: "role", name: "role.developer.md", markdown: roleMarkdown("role.developer") },
+            {
+                kind: "agent",
+                name: "agent.pay.md",
+                markdown: agentMarkdown("agent.pay", "role.developer", "  model: null\n"),
+            },
         ]);
         try {
             const decision = resolveModel({
-                effective: select(fixture.snapshot, { roleId: "role.developer" }),
+                effective: select(fixture.snapshot, { agentId: "agent.pay" }),
                 tiers: configureTierPolicy({
                     balanced: { members: ["openai/gpt-6.1-sol", "openai/gpt-6-luna"], candidates: ["openai/gpt-6-luna"] },
                 }),
@@ -855,8 +940,10 @@ describe("catalog-free legacy chain and inspection guards", () => {
                     model("xai", "grok-4.7"),
                 ]),
             });
-            assert.equal(decision.modelSelection.actual, "xai/grok-4.7");
-            assert.equal(decision.modelSelection.source, "foreground");
+            // The registry row without a reasoning flag is ignored, so the role default is unusable and blocks.
+            assert.equal(decision.status, "blocked");
+            assert.equal(decision.modelSelection.actual, null);
+            assert.equal(codes(decision).includes(ModelResolutionCodes.unavailableDefaultModel), true);
         } finally {
             fixture.cleanup();
         }

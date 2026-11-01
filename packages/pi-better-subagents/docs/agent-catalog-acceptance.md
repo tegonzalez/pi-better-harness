@@ -38,7 +38,7 @@ Without `PI_CATALOG_REAL_PI=1` the test skips and default `npm test` does not ca
 | T07 | `model-resolution.test.mjs` bundled defaults | not launched (would call gpt-6) |
 | T08 | model-resolution precedence | not a separate real launch |
 | T09 | model-resolution same-tier | real role `role.acceptance-same-tier` if the coordinator omits model |
-| T10 | model-resolution foreground | real role `role.acceptance-foreground` if the coordinator omits model |
+| T10 | model-resolution foreground inheritance (no model preference) | real role `role.acceptance-foreground` if the coordinator omits model |
 | T11 | model-resolution no child | not re-run against a dead foreground |
 | T12 | model-resolution invocation provenance | legacy launch's structured model reaches argv and meta |
 | T13 | lifecycle "does not read a quoted model" is runtime-only | skill model vs quoted `openai/gpt-6-astra@xhigh` |

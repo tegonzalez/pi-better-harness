@@ -663,7 +663,10 @@ cannot be recovered automatically.
 The effective config also sets:
 
 - `defaultModel` — model for spawns that don't specify one (`null` = inherit the
-  foreground model).
+  foreground model). A role or agent default model that is unavailable fails the
+  launch with the role, the model, and how to fix it; it never silently runs on
+  the foreground model. Configure `tierPolicy` candidates to opt into a fallback
+  (see [agent-model-resolution.md](agent-model-resolution.md)).
 - `delegationMode` — foreground policy (`manual`, `adaptive`, or `coordinator`;
   default `adaptive`). `/subagents mode ...` changes only the current session.
   `/subagents save` saves mode and cap together as config defaults.
