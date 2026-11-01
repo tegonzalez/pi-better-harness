@@ -359,6 +359,12 @@ at load time and block launches (fail closed). Path entries are absolute, `~/…
 | `hardening.userns` | The confined child cannot create user namespaces (`--unshare-user --uid <uid> --gid <gid> --disable-userns`; the launching user's ids are mapped to themselves, so file ownership and git behave as before; `unshare(CLONE_NEWUSER)` fails with `ENOSPC`). | `true` |
 | `hardening.keyring` | `keyctl`, `add_key` and `request_key` fail with `EPERM` (a seccomp filter generated in `sandbox-core`, passed to bubblewrap with `--seccomp`; x86_64 and aarch64 only, any other architecture makes the measure unavailable). | `true` |
 | `hardening.fds` | The confined child inherits only descriptors 0, 1 and 2 (plus the filter's own, which bubblewrap closes after loading it): the launcher closes every other inherited descriptor before bubblewrap starts. | `true` |
+| `resources.command.memoryMax` | Memory cap of each confined launch (`MemoryMax=` of its systemd user scope). A size string: a decimal integer with an optional `K`, `M`, `G` or `T` suffix, powers of 1024, for example `"512M"`; greater than zero. The kernel kills what exceeds it inside the scope. | unset |
+| `resources.command.memorySwapMax` | Swap cap (`MemorySwapMax=`). A size string as above; `"0"` forbids swap. | unset |
+| `resources.command.tasksMax` | Cap on processes and threads (`TasksMax=`): a positive integer. Counts every task of the launch, including bubblewrap and its init, so allow a few more than the command itself needs. | unset |
+| `resources.command.cpuQuota` | CPU cap (`CPUQuota=`): a positive integer, percent of one CPU (`200` = two CPUs). | unset |
+| `resources.command.runtimeMaxSec` | Wall-clock bound (`RuntimeMaxSec=`): a positive integer, seconds. The scope is stopped when it ends, SIGTERM first and SIGKILL five seconds later. | unset |
+| `resources.tmpSize` | Size of the private `/tmp` tmpfs (bubblewrap `--size <bytes>` directly before `--tmpfs /tmp`). A size string as above; greater than zero. Writes beyond it fail with `ENOSPC`. | unset (the kernel's tmpfs default) |
 | `planTtlMs` | **Removed.** The plan is never recomputed during a session; the key is rejected so stale policies are noticed. | — |
 
 At launch the planner resolves the launching `PATH`, takes the realpath of each approved
@@ -454,6 +460,43 @@ a CPU architecture the seccomp program does not cover, no `/proc/self/fd`, or no
 remedy is to fix the cause or switch that one measure off in the policy.
 Approved tools whose real path is under a writable root are refused (the agent could replace them).
 
+#### Resource limits
+
+The policy's optional `resources` object bounds what a confined launch can consume. Both parts are optional, and an
+unset limit changes nothing: no scope is started and the launch is exactly the one without `resources`. The values are
+site decisions; the package ships none. The examples below are placeholders.
+
+```json
+{ "version": 1, "resources": { "command": { "memoryMax": "512M", "tasksMax": 128, "cpuQuota": 200, "runtimeMaxSec": 900 }, "tmpSize": "64M" } }
+```
+
+- **`resources.command`**: when it holds at least one key, every confined launch runs inside its own transient systemd
+  **user** scope, `systemd-run --user --scope --quiet --collect -p MemoryMax=… -p TasksMax=… …` (sizes are passed as
+  bytes; `runtimeMaxSec` adds a five-second stop timeout so a command that ignores SIGTERM cannot outlive its bound). The
+  launcher (the same one that closes descriptors and loads the keyring filter) starts the scope after those steps and
+  before bubblewrap, and `exec`s into it: the launch keeps its process id, so stopping a task or a foreground command
+  works exactly as before, and the scope disappears when the last process leaves it (`--collect` also removes a scope
+  the kernel killed). Because the scope is started outside bubblewrap, the launcher takes the user manager's location
+  (`XDG_RUNTIME_DIR`, default `/run/user/<uid>`, and `DBUS_SESSION_BUS_ADDRESS` when set) from the launching process and
+  not from the cleared environment inside. Inside the scope a check confirms, for this very launch, that the cgroup
+  controller of each configured limit is present before bubblewrap starts (memory for `memoryMax` and `memorySwapMax`,
+  pids for `tasksMax`, cpu for `cpuQuota`; `runtimeMaxSec` needs none). Memory used by the private `/tmp` tmpfs counts
+  against `memoryMax`.
+- **`resources.tmpSize`**: sizes the private `/tmp` only; it needs no user manager and starts no scope. It does not limit
+  writable roots, which never have a quota.
+- **Fails closed.** A configured limit that cannot be applied makes the plan inactive and every launch refuses to run,
+  with the reason: no systemd user manager is reachable (no login session or lingering user, no `systemd-run`), the manager
+  does not delegate a needed controller, a scope with the limits cannot be started, or bubblewrap lacks `--size`. The
+  command is never started without its limit. The remedy is to fix the cause or remove that limit from the policy.
+  Availability is checked by starting one short-lived real scope with the configured properties, at plan time and again
+  (cached briefly) when a launch is built.
+- **Visibility.** `resources` is part of `policyHash`. The audit carries `audit.resources` (below), and
+  `/sandbox workspace` and `/sandbox diagnostics confinement` list each configured limit as `on` or `unavailable` with its
+  reason, for example `command: memoryMax=512M tasksMax=128 — on (each launch runs in its own systemd user scope)`. A
+  policy without `resources` shows nothing of the kind.
+- Unknown keys, and every value that is not exactly the documented form (a number for a size, a lower-case suffix, a
+  fraction, zero, a string for an integer), are refused when the policy loads.
+
 ### Audit and machine-readable status
 
 Each status change is appended to the session as a custom entry with
@@ -471,6 +514,7 @@ can read it with RPC `get_entries` and refuse to prompt unless `active` is `true
 | `hash`, `audit` | (active only) legacy alias of `planHash`, and the full audit: binds with reasons, denied and skipped entries with reasons, symlink mounts, the synthetic `PATH`, the policy source and hash. |
 | `reason` | (inactive only) why the plan is not in force or failed. |
 | `audit.hardening` | The state of each hardening measure: `ipc`, `uts`, `userns`, `keyring`, `fds` are each `{ "state": "on" }`, `{ "state": "off" }` (switched off by policy) or `{ "state": "unavailable", "reason": … }`, plus the `hostname`. An unavailable measure makes the entry inactive (`reason` names it) and every launch fails closed. Also in the inactive entry as `hardening`. |
+| `audit.resources` | Only when the policy sets `resources`: `command` is `{ "limits": { … as written }, "state": … }` and `tmpSize` is `{ "size": "64M", "bytes": 67108864, "state": … }`, each state `{ "state": "on" }` or `{ "state": "unavailable", "reason": … }`. An unavailable limit makes the entry inactive (`reason` names it) and every launch fails closed. Also in the inactive entry as `resources`. |
 
 An entry is appended once per change, not per announcement. A session with no configured policy
 writes no entry. `/sandbox diagnostics confinement` prints the latest plan. Secret values are never recorded.
@@ -491,7 +535,7 @@ The owner can check what a confined worker can read and write from a separate pi
    Main must be enabled with Outside project = Off in that agent dir (the same permissions the worker uses).
 2. `/sandbox workspace` (also the first block of `/sandbox diagnostics confinement`) shows the working folder, agent
    dir, policy path, `policyHash` and `planHash`, whether the confinement is `active`, and each hardening measure as
-   `on`, `off by policy` or `unavailable` with its reason.
+   `on`, `off by policy` or `unavailable` with its reason, and each configured resource limit as `on` or `unavailable`.
 3. `/sandbox check <path>` reports read, write and exec for a path with the reason (the mount that grants it, or
    "not mounted"). It uses the same evaluator as the in-process tools, whose allow set is the kernel mount plan. Relative
    paths resolve against the working folder; symlinks are decided on their realpath. `/tmp` is the sandbox's private,
@@ -538,8 +582,10 @@ The owner can check what a confined worker can read and write from a separate pi
 - Planning is synchronous and bounded (`maxWalkEntries`, `maxWalkMs`); it runs at session start.
 - Secret detection is pattern-based; it reduces, not eliminates, the chance that a bound config holds a secret.
 - The synthetic `PATH` only constrains lookups by name; this mode is a read boundary, not a command allowlist.
-- bubblewrap is a mount/namespace boundary, not a resource or syscall policy: it sets no CPU, memory, disk, process-count
-  or time limits, and it shares the IPC namespace, kernel keyring, hostname and clock with the host. See
+- bubblewrap is a mount/namespace boundary, not a general resource policy. The IPC namespace, hostname, nested user
+  namespaces, kernel keyring and inherited descriptors are private or closed by default (the `hardening` switches), and
+  CPU, memory, process count, run time and the private `/tmp` size are bounded when the policy sets `resources`; with
+  nothing set they are unlimited. The clock is the host's, and writable roots have no disk quota. See
   [What bubblewrap can and cannot limit](#what-bubblewrap-can-and-cannot-limit) for the full table and mitigations.
 
 ### What bubblewrap can and cannot limit
