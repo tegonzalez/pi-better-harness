@@ -34,6 +34,7 @@ export const ModelResolutionCodes = {
     unsupportedExplicitEffort: "unsupported-explicit-effort",
     unknownTier: "unknown-tier",
     modelFallback: "model-fallback",
+    unavailableDefaultModel: "unavailable-default-model",
     effortAdjusted: "effort-adjusted",
     noUsableModel: "no-usable-model",
     registryRequired: "registry-required",
@@ -582,12 +583,41 @@ function fallbackPreference(
         : tier.value
             ? `Tier ${JSON.stringify(tier.value)} is not a configured tier.`
             : "Tier mapping is absent.";
-    return useForeground(effective, input, index, {
+    // Only a configured same-tier candidate is an opted-in fallback. The
+    // foreground model is not: silently running a role on another (often more
+    // expensive) model hides the misconfiguration, so fail closed instead.
+    return unavailableDefault(effective, diagnostics, {
         requested,
         requestedSource,
-        explicitRequest: false,
-        prefix: `Preferred ${requestedSource} model ${requested} is not usable (${unusableBecause(located)}). ${tierReason}`,
-    }, diagnostics);
+        message: `${ownerLabel(effective)} default model ${requested} is not usable (${unusableBecause(located)}). ${tierReason}`,
+        setDefault: `set an available default model for ${effective.kind} ${effective.id} (${effective.kind === "agent" ? "its model override or its role's model" : "the role's model"}), add an ordered same-tier candidate under tierPolicy in config to opt into a fallback`,
+    });
+}
+
+function ownerLabel(effective: EffectiveDefinition): string {
+    if (effective.kind === "agent") return `Agent ${effective.id}${effective.roleId ? ` (role ${effective.roleId})` : ""}`;
+    return `Role ${effective.id}`;
+}
+
+function unavailableDefault(
+    effective: EffectiveDefinition,
+    diagnostics: Diagnostic[],
+    base: { requested: string | null; requestedSource: ModelRequestSource; message: string; setDefault: string },
+): ModelOutcome {
+    const message = `${base.message} The foreground model is not used as a silent fallback, so no child was started. Fix: ${base.setDefault}, or pass model explicitly (provider/model) on this launch.`;
+    diagnostics.push(problem(effective, ModelResolutionCodes.unavailableDefaultModel, message, true, "model"));
+    return {
+        ok: false,
+        selection: {
+            requested: base.requested,
+            requestedSource: base.requestedSource,
+            actual: null,
+            source: "absent",
+            explicitRequest: false,
+            reason: message,
+        },
+        diagnostics,
+    };
 }
 
 function runtimeDefaultChain(
@@ -618,12 +648,28 @@ function runtimeDefaultChain(
                 diagnostics: [problem(effective, ModelResolutionCodes.modelFallback, reason, false, "model", "info")],
             };
         }
+        return unavailableDefault(effective, [], {
+            requested: null,
+            requestedSource,
+            message: `${cleared} ${ownerLabel(effective)} uses config defaultModel ${configured.model}, which is not usable (${unusableBecause(located)}).`,
+            setDefault: "set config defaultModel to an available provider/model (or null to inherit the foreground model)",
+        });
     }
+    if (configured.error) {
+        return unavailableDefault(effective, [], {
+            requested: null,
+            requestedSource,
+            message: `${cleared} ${ownerLabel(effective)} uses config defaultModel ${input.configuredDefaultModel}, which is invalid: ${configured.error}`,
+            setDefault: "set config defaultModel to an available provider/model (or null to inherit the foreground model)",
+        });
+    }
+    // No default is configured anywhere: inheriting the foreground model is the
+    // documented meaning of an unset default, not a fallback.
     return useForeground(effective, input, index, {
         requested: null,
         requestedSource,
         explicitRequest: false,
-        prefix: `${cleared} Configured default model ${text(input.configuredDefaultModel) ? input.configuredDefaultModel : "(none)"} was not an available provider/model.`,
+        prefix: `${cleared} No config defaultModel is set.`,
     }, []);
 }
 

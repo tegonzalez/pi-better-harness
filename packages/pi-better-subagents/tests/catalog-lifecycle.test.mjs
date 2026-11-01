@@ -557,67 +557,75 @@ fi
         assert.match(readFileSync(join(run, "prompt.md"), "utf8"), /Look at payments\./);
     });
 
-    it("falls back named-agent and direct-role launches when OpenAI models are unavailable", async () => {
+    it("fails named-agent and direct-role launches when the default model is unavailable instead of using the foreground model", async () => {
         const host = ctx();
         host.model = { provider: "xai", id: "grok-4.7" };
         host.modelRegistry = registryOf(model("xai", "grok-4.7"));
+        const runsDir = join(baseDir(), "runs");
+        const before = new Set(existsSync(runsDir) ? readdirSync(runsDir) : []);
 
-        const namedResult = await tools.subagent_spawn.execute("tc", {
-            prompt: "Use the named agent fallback.",
+        await assert.rejects(tools.subagent_spawn.execute("tc", {
+            prompt: "Use the named agent.",
             agent: "agent.payments",
             tools: "read,bash",
             sandbox: false,
-        }, null, null, host);
-        const roleResult = await tools.subagent_spawn.execute("tc", {
-            prompt: "Use the direct role fallback.",
+        }, null, null, host), (error) => {
+            assert.match(error.message, /Agent agent\.payments \(role role\.developer\) default model openai\/gpt-6\.1-sol is not usable/);
+            assert.match(error.message, /not used as a silent fallback/);
+            assert.match(error.message, /pass model explicitly/);
+            assert.doesNotMatch(error.message, /Using foreground model/);
+            return true;
+        });
+        await assert.rejects(tools.subagent_spawn.execute("tc", {
+            prompt: "Use the direct role.",
             role: "role.developer",
             tools: "read,bash",
             sandbox: false,
+        }, null, null, host), (error) => {
+            assert.match(error.message, /Role role\.developer default model openai\/gpt-6\.1-sol is not usable/);
+            assert.match(error.message, /set an available default model for role role\.developer/);
+            assert.match(error.message, /tierPolicy/);
+            return true;
+        });
+        const created = (existsSync(runsDir) ? readdirSync(runsDir) : []).filter((id) => !before.has(id));
+        assert.deepEqual(created, [], "no run may start on the foreground model");
+
+        // An explicit model still launches; it never needed the default.
+        const explicit = await tools.subagent_spawn.execute("tc", {
+            prompt: "Use the explicit model.",
+            role: "role.developer",
+            model: "xai/grok-4.7",
+            tools: "read,bash",
+            sandbox: false,
         }, null, null, host);
+        const id = runIdFrom(explicit);
+        assert.equal(metaOf(id).catalog.modelSelection.source, "invocation");
+        await settledMeta(id);
+    });
 
-        const namedId = runIdFrom(namedResult);
-        const roleId = runIdFrom(roleResult);
-        // A fallback is worded as a fallback, so the parent does not mistake it for an override to undo.
-        assert.match(textOf(namedResult), /^Model xai\/grok-4\.7@high \(agent default openai\/gpt-6\.1-sol@high unavailable; foreground fallback\)\.$/m);
-        assert.match(textOf(roleResult), /^Model xai\/grok-4\.7@high \(role developer default openai\/gpt-6\.1-sol@high unavailable; foreground fallback\)\.$/m);
-        const named = metaOf(namedId);
-        const role = metaOf(roleId);
-        const roleInstructions = loadCatalog({
-            cwd: fx.cwd,
-            projectTrusted: true,
-            userRoot: fx.userRoot,
-        }).roles.get("role.developer").definition.body;
-
-        assert.equal(named.name, "Payments Developer");
-        assert.equal(named.catalog.id, "agent.payments");
-        assert.equal(named.catalog.roleId, "role.developer");
-        assert.equal(named.model, "xai/grok-4.7");
-        assert.equal(named.effort, "high");
-        assert.equal(named.catalog.modelSelection.requested, "openai/gpt-6.1-sol");
-        assert.equal(named.catalog.modelSelection.requestedSource, "role-default");
-        assert.equal(named.catalog.modelSelection.source, "foreground");
-        assert.equal(named.catalog.effortSelection.source, "role-default");
-        assert.match(readFileSync(join(baseDir(), "runs", namedId, "prompt.md"), "utf8"), /Look at payments\./);
-
-        assert.match(role.name, /^developer-\d+$/);
-        assert.equal(role.catalog.roleId, "role.developer");
-        assert.equal(role.model, "xai/grok-4.7");
-        assert.equal(role.effort, "high");
-        assert.equal(role.catalog.modelSelection.requested, "openai/gpt-6.1-sol");
-        assert.equal(role.catalog.modelSelection.requestedSource, "role-default");
-        assert.equal(role.catalog.modelSelection.source, "foreground");
-        assert.equal(role.catalog.effortSelection.source, "role-default");
-        const rolePrompt = readFileSync(join(baseDir(), "runs", roleId, "prompt.md"), "utf8");
-        assert.ok(rolePrompt.includes(roleInstructions));
-        assert.match(rolePrompt, /Use the direct role fallback\./);
-
-        for (const id of [namedId, roleId]) {
+    it("keeps an explicitly configured same-tier candidate as the only default fallback", async () => {
+        const host = ctx();
+        host.model = { provider: "xai", id: "grok-4.7" };
+        host.modelRegistry = registryOf(model("xai", "grok-4.7"), model("openai", "gpt-6.1-sol-backup"));
+        setConfigForTests({
+            defaultTools: "read,bash",
+            maxConcurrent: 4,
+            defaultModel: null,
+            tierPolicy: { balanced: { members: ["openai/gpt-6.1-sol", "openai/gpt-6.1-sol-backup"], candidates: ["openai/gpt-6.1-sol-backup"] } },
+        });
+        try {
+            const result = await tools.subagent_spawn.execute("tc", {
+                prompt: "Use the configured candidate.",
+                role: "role.developer",
+                tools: "read,bash",
+                sandbox: false,
+            }, null, null, host);
+            assert.match(textOf(result), /^Model openai\/gpt-6\.1-sol-backup@high \(role developer default openai\/gpt-6\.1-sol@high unavailable; same-tier fallback\)\.$/m);
+            const id = runIdFrom(result);
+            assert.equal(metaOf(id).catalog.modelSelection.source, "tier-candidate");
             await settledMeta(id);
-            const run = join(baseDir(), "runs", id);
-            const argv = readFileSync(join(run, "argv.txt"), "utf8");
-            assert.match(argv, /--model\nxai\/grok-4\.7/);
-            assert.match(argv, /--thinking\nhigh/);
-            assert.match(textOf(await tools.subagent_result.execute("tc", { id })), /done/);
+        } finally {
+            setConfigForTests(undefined);
         }
     });
 

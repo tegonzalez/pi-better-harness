@@ -5,7 +5,7 @@
  */
 import assert from "node:assert/strict";
 import { describe, it, after } from "node:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -15,6 +15,23 @@ mkdirSync(runtimeTmp, { recursive: true });
 process.env.TMPDIR = runtimeTmp;
 process.env.PI_CODING_AGENT_DIR = join(root, "agent");
 mkdirSync(process.env.PI_CODING_AGENT_DIR, { recursive: true });
+// An agent without a model preference inherits the foreground model. A role
+// whose own default is unavailable blocks instead (no silent foreground fallback),
+// so foreground freshness is observed through this agent.
+mkdirSync(join(process.env.PI_CODING_AGENT_DIR, "agents", "agents"), { recursive: true });
+writeFileSync(join(process.env.PI_CODING_AGENT_DIR, "agents", "agents", "agent.fresh.md"), `---
+schema: pi-agent/v1
+kind: agent
+id: agent.fresh
+name: Fresh
+roleId: role.developer
+instructions:
+  mode: add
+overrides:
+  model: null
+---
+Inherit the foreground model.
+`);
 
 const { setConfigForTests } = await import("../config.ts");
 const { createLaunchEnricher, loadLaunchSnapshot, noteCatalogHost } = await import("../catalog-runtime.ts");
@@ -58,12 +75,12 @@ function harness(initial) {
     return { notices, state };
 }
 
-function developer(list) {
-    return list.entries.find((entry) => entry.id === "role.developer");
+function freshEntry(list) {
+    return list.entries.find((entry) => entry.id === "agent.fresh");
 }
 
-async function inspect(state) {
-    return tools.agents_catalog.execute("inspect", { action: "inspect", id: "role.developer" }, undefined, undefined, state.ctx);
+async function inspect(state, id = "agent.fresh") {
+    return tools.agents_catalog.execute("inspect", { action: "inspect", id }, undefined, undefined, state.ctx);
 }
 
 describe("current foreground for /agents", { concurrency: false }, () => {
@@ -87,7 +104,7 @@ describe("current foreground for /agents", { concurrency: false }, () => {
         state.models = [afterModel];
         state.ctx.model = afterModel;
         await events.model_select({}, state.ctx);
-        const command = await commands.agents.handler("inspect role.developer", state.ctx);
+        const command = await commands.agents.handler("inspect agent.fresh", state.ctx);
         const fresh = await inspect(state);
 
         assert.equal(command.data.actualModel, "local/after");
@@ -103,18 +120,18 @@ describe("current foreground for /agents", { concurrency: false }, () => {
     it("propagates a later command context when model_select did not run", async () => {
         setConfigForTests({ ...baseConfig });
         const { notices, state } = harness(model("before"));
-        await commands.agents.handler("inspect role.developer", state.ctx);
+        await commands.agents.handler("inspect agent.fresh", state.ctx);
         assert.match(notices.at(-1), /actual model: "local\/before"/);
 
         const later = model("later");
         state.models = [later];
         state.ctx.model = later;
         const listed = await commands.agents.handler("list", state.ctx);
-        const shown = await commands.agents.handler("show role.developer", state.ctx);
+        const shown = await commands.agents.handler("show agent.fresh", state.ctx);
         const tool = await inspect(state);
 
-        assert.equal(developer(listed.data).actualModel, "local/later");
-        assert.equal(developer(listed.data).launchable, true);
+        assert.equal(freshEntry(listed.data).actualModel, "local/later");
+        assert.equal(freshEntry(listed.data).launchable, true);
         assert.equal(shown.data.actualModel, "local/later");
         assert.equal(shown.data.launchable, true);
         assert.equal(tool.details.view.actualModel, shown.data.actualModel);
@@ -135,7 +152,7 @@ describe("current foreground for /agents", { concurrency: false }, () => {
             userRoot: process.env.PI_CODING_AGENT_DIR,
         });
         const row = createLaunchEnricher()({
-            inspection: { id: "role.developer", found: true },
+            inspection: { id: "agent.fresh", found: true },
             snapshotDigest: snapshot.digest,
         });
         assert.equal(row.actualModel, "local/after");
@@ -147,7 +164,11 @@ describe("current foreground for /agents", { concurrency: false }, () => {
         setConfigForTests({ ...baseConfig });
         const { state } = harness(model("before"));
         const first = await commands.agents.handler("inspect role.developer", state.ctx);
-        assert.equal(first.data.actualModel, "local/before");
+        // The role default is unavailable and no candidate is configured: blocked, not foreground.
+        assert.equal(first.data.actualModel, null);
+        assert.equal(first.data.launchable, false);
+        assert.match(first.data.modelReason, /openai\/gpt-6\.1-sol/);
+        assert.match(first.data.modelReason, /not used as a silent fallback/);
 
         const backup = { provider: "openai", id: "gpt-6.1-sol-backup", reasoning: true };
         setConfigForTests({
@@ -161,7 +182,7 @@ describe("current foreground for /agents", { concurrency: false }, () => {
         });
         state.models = [backup];
         const command = await commands.agents.handler("inspect role.developer", state.ctx);
-        const tool = await inspect(state);
+        const tool = await inspect(state, "role.developer");
 
         assert.equal(command.data.actualModel, "openai/gpt-6.1-sol-backup");
         assert.equal(command.data.launchable, true);
@@ -174,11 +195,11 @@ describe("current foreground for /agents", { concurrency: false }, () => {
     it("does not keep a foreground the current context cleared", async () => {
         setConfigForTests({ ...baseConfig });
         const { notices, state } = harness(model("before"));
-        await commands.agents.handler("inspect role.developer", state.ctx);
+        await commands.agents.handler("inspect agent.fresh", state.ctx);
 
         state.models = [];
         state.ctx.model = undefined;
-        const command = await commands.agents.handler("inspect role.developer", state.ctx);
+        const command = await commands.agents.handler("inspect agent.fresh", state.ctx);
         const tool = await inspect(state);
 
         assert.equal(command.data.actualModel, null);
@@ -210,7 +231,7 @@ describe("current foreground for /agents", { concurrency: false }, () => {
             userRoot: process.env.PI_CODING_AGENT_DIR,
         });
         const kept = createLaunchEnricher()({
-            inspection: { id: "role.developer", found: true },
+            inspection: { id: "agent.fresh", found: true },
             snapshotDigest: snapshot.digest,
         });
         assert.equal(kept.actualModel, "local/before");
@@ -223,7 +244,7 @@ describe("current foreground for /agents", { concurrency: false }, () => {
             configuredDefaultModel: null,
         });
         const cleared = createLaunchEnricher()({
-            inspection: { id: "role.developer", found: true },
+            inspection: { id: "agent.fresh", found: true },
             snapshotDigest: snapshot.digest,
         });
         assert.equal(cleared.actualModel, null);
