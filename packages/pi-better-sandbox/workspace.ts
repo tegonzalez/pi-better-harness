@@ -7,6 +7,8 @@
  * evaluators the in-process tools and the kernel mount plan use.
  */
 
+import { formatHardening, type ReadConfinementHardeningAudit } from "./shared-read-confinement.ts";
+
 export type WorkspaceInfo = {
     /** Canonical working folder the session captured (also the writable project root). */
     cwd: string | undefined;
@@ -19,6 +21,8 @@ export type WorkspaceInfo = {
     planHash?: string;
     /** Why the confinement is not active, when it is not. */
     note?: string;
+    /** Each confined-launch hardening measure: on, off by policy, or unavailable (launches fail closed). */
+    hardening?: ReadConfinementHardeningAudit;
 };
 
 export type AccessVerdict = { allowed: boolean; reason: string };
@@ -44,6 +48,7 @@ export function formatWorkspace(info: WorkspaceInfo): string {
         `  policyHash: ${info.policyHash ?? "-"}`,
         `  planHash:   ${info.planHash ?? "-"}`,
         `  confinement: ${info.confinement}${info.note ? ` — ${info.note}` : ""}`,
+        ...(info.hardening ? formatHardening(info.hardening).map((line) => `  ${line}`) : []),
     ];
     return lines.join("\n");
 }

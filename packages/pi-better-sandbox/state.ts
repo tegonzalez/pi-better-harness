@@ -17,6 +17,7 @@ import { loadConfiguredReadConfinementPolicy } from "./read-confinement-settings
 import {
     formatReadConfinementAudit,
     planReadConfinement,
+    type ReadConfinementHardeningAudit,
     type LoadedReadConfinementPolicy,
     type ReadConfinementPlan,
     type ReadConfinementSeams,
@@ -121,6 +122,7 @@ function confinementMounts(plan: ReadConfinementPlan): ReadConfinementMounts {
         ...(plan.denyRemove && { denyRemove: plan.denyRemove }),
         ...(plan.overlayArgs && { overlayArgs: plan.overlayArgs }),
         ...(plan.gitFile && { gitFile: plan.gitFile }),
+        hardening: plan.hardening,
     };
 }
 
@@ -139,7 +141,7 @@ export type ReadConfinementControllerSeams = {
  */
 export type ReadConfinementRecord =
     | { version: 1; active: true; profile: "main"; policyHash: string; planHash: string; hash: string; audit: ReadConfinementPlan["audit"] }
-    | { version: 1; active: false; profile: "main"; reason: string; policyHash?: string; planHash?: string };
+    | { version: 1; active: false; profile: "main"; reason: string; policyHash?: string; planHash?: string; hardening?: ReadConfinementHardeningAudit };
 
 export type ForegroundSandboxSeams = PolicySeams & {
     readConfinement?: ReadConfinementControllerSeams;
@@ -173,7 +175,7 @@ export class ForegroundSandboxController {
     #runtimePaths: readonly string[] = [];
     #taskScratch: ReturnType<typeof createTaskScratch> | undefined;
     /** Computed once per session start and frozen: never recomputed, never aged out. */
-    #confinement: { project: string; loaded: LoadedReadConfinementPolicy; plan: ReadConfinementPlan } | { project: string; failure: Error } | { project: string; none: true } | undefined;
+    #confinement: { project: string; loaded: LoadedReadConfinementPolicy; plan: ReadConfinementPlan; blocked?: string } | { project: string; failure: Error } | { project: string; none: true } | undefined;
     #lastAuditHash: string | undefined;
     #lastRecordKey: string | undefined;
     #envMarker: boolean = false;
@@ -220,6 +222,9 @@ export class ForegroundSandboxController {
         const c = this.#confinement;
         if (!c || "none" in c) return undefined;
         if ("failure" in c) return { version: 1, active: false, profile: "main", reason: c.failure.message };
+        if (c.blocked) {
+            return { version: 1, active: false, profile: "main", reason: c.blocked, policyHash: c.loaded.sha256, planHash: c.plan.hash, hardening: c.plan.audit.hardening };
+        }
         const status = this.status();
         const off = status.permissions?.enabled && status.permissions.outsideProject === "off";
         const base = { policyHash: c.loaded.sha256, planHash: c.plan.hash };
@@ -248,7 +253,8 @@ export class ForegroundSandboxController {
         if (!c || !("plan" in c)) {
             return workspace + "Read confinement: no plan computed in this session. It applies to Linux bubblewrap with Outside project = Off and a configured policy file (PI_SANDBOX_READ_CONFINEMENT_POLICY, or the sandboxReadConfinement setting in the agent dir's settings.json).";
         }
-        return workspace + formatReadConfinementAudit(c.plan.audit, c.plan.hash) + "\n  (computed once at session start and frozen; later symlink or .git changes apply to the next session)";
+        const refusal = c.blocked ? `Read confinement: inactive, every launch fails closed. ${c.blocked}\n` : "";
+        return workspace + refusal + formatReadConfinementAudit(c.plan.audit, c.plan.hash) + "\n  (computed once at session start and frozen; later symlink or .git changes apply to the next session)";
     }
 
     /** The active workspace: working folder, agent dir, policy location and the hashes to compare with another session. */
@@ -259,8 +265,9 @@ export class ForegroundSandboxController {
         if ("failure" in c) return { ...base, confinement: "failed", note: c.failure.message };
         const record = this.readConfinementRecord();
         return {
-            ...base, confinement: record?.active ? "active" : "not-in-force",
+            ...base, confinement: c.blocked ? "failed" : record?.active ? "active" : "not-in-force",
             policyPath: c.loaded.source, policyHash: c.loaded.sha256, planHash: c.plan.hash,
+            hardening: c.plan.audit.hardening,
             ...(record && !record.active ? { note: record.reason } : {}),
         };
     }
@@ -359,12 +366,26 @@ export class ForegroundSandboxController {
             this.#envMarker = true;
         }
         try {
+            // The hardening measures are checked against the bubblewrap this controller's launches use.
+            const hardeningSeams = {
+                ...(this.#seams.lookupExecutable && { lookupExecutable: this.#seams.lookupExecutable }),
+                ...(this.#seams.bwrapHelp && { bwrapHelp: this.#seams.bwrapHelp }),
+                ...(this.#seams.arch && { arch: this.#seams.arch }),
+                ...rc.plan?.hardening,
+            };
             const plan = planReadConfinement(loaded, project, {
                 home: (this.#seams.home ?? homedir)(), agentId: "main",
-                extraWritableRoots: this.#otherWritableRoots(), ...rc.plan,
+                extraWritableRoots: this.#otherWritableRoots(), ...rc.plan, hardening: hardeningSeams,
             });
-            this.#confinement = { project, loaded, plan };
-            publishProcessReadConfinement({ state: "active", mounts: confinementMounts(plan) }, this);
+            // A measure that is on but cannot be applied here (an older bubblewrap, an architecture without a
+            // seccomp table) makes the plan inactive: every launch fails closed with the reason.
+            const unavailable = Object.entries(plan.audit.hardening).flatMap(([measure, state]) =>
+                typeof state === "object" && state.state === "unavailable" ? [`hardening.${measure} unavailable: ${state.reason}`] : []);
+            const blocked = unavailable.length
+                ? `Read confinement failed closed: ${unavailable.join("; ")}. Fix the cause, or switch the measure off in the policy's "hardening" object.`
+                : undefined;
+            this.#confinement = { project, loaded, plan, ...(blocked && { blocked }) };
+            publishProcessReadConfinement(blocked ? { state: "failed", reason: blocked } : { state: "active", mounts: confinementMounts(plan) }, this);
             this.#lastAuditHash = plan.hash;
             try { this.#onConfinementPlan?.(plan); } catch { /* an audit-write failure must not widen or block access */ }
         } catch (error) {
@@ -387,6 +408,7 @@ export class ForegroundSandboxController {
         if (!c || "none" in c) return undefined;
         if ("failure" in c) throw c.failure;
         if (c.project !== project) throw new Error(`Read confinement failed closed: the frozen plan is for ${c.project}, not ${project}.`);
+        if (c.blocked) throw new Error(c.blocked);
         return c.plan;
     }
 
