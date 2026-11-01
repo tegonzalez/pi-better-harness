@@ -553,13 +553,16 @@ inside the sandbox; the table lists what remains and what to add **outside** bub
 still marked *Not limited* are recommendations only; none is implemented by this package. The IPC, hostname, nested
 user namespace, kernel keyring and inherited descriptor rows are *Limited* by the confined-launch hardening of the
 read-confinement policy (`hardening`, every measure on by default, each with its own switch); the tests are
-`test/bubblewrap-limits.test.ts` and `test/hardening*.test.ts`.
+`test/bubblewrap-limits.test.ts` and `test/hardening*.test.ts`. The CPU, memory, process-count, wall-time and private
+`/tmp` size rows are *Limited when configured* by `resources` of the same policy (`resources.command` and
+`resources.tmpSize`); with nothing configured they limit nothing. Their tests are `test/bubblewrap-limits.test.ts` and
+`test/resources-*.test.ts`.
 
 | Area | Result | Mechanism / observed | Recommended mitigation outside bubblewrap |
 | --- | --- | --- | --- |
 | Read a file outside the allow set | **Limited** | Not mounted: `ENOENT`. Reachable only through project symlinks (followed at launch), `readOnly`, approved tool `bind`/`config`. | Keep `deny.paths` and `walkSkipDirNames` for anything a symlink must never reach. |
 | Write outside writable roots | **Limited** | `/usr` and the synthetic root are read-only (`EROFS`); other paths do not exist. Symlink-reachable and `readOnly` folders are read-only. | None needed. |
-| Private `/tmp` | **Limited** | Fresh tmpfs; host `/tmp` entries are invisible and sandbox writes never reach the host. | Size cap: see Resources. |
+| Private `/tmp` | **Limited** | Fresh tmpfs; host `/tmp` entries are invisible and sandbox writes never reach the host. Its size is the kernel default unless `resources.tmpSize` caps it (see Resources: disk). | Set `resources.tmpSize` to bound it. |
 | Exec by absolute path | **Not limited** | Any binary readable under the bound runtime roots (`/usr`, `/bin`, ...) runs, as does any executable in a writable root or read-only mount (no `noexec`). | Command allowlisting needs a separate layer (seccomp filter, or wrapper that execs only approved binaries). |
 | Exec by name (`PATH`) | **Limited** | Synthetic `PATH` holds only approved tools; other names fail `ENOENT`/exit 127. It is a lookup convenience, not a boundary. | Do not rely on it for security. |
 | Network, Network Off | **Limited** | `--unshare-net`: own namespace with only its own loopback. TCP/UDP to host loopback and LAN, DNS, and *abstract* unix sockets (host D-Bus, X11) are unreachable. Covers tools with their own network stack, since it is the namespace, not a library. | None needed. |
@@ -573,8 +576,8 @@ read-confinement policy (`hardening`, every measure on by default, each with its
 | New user namespaces inside | **Limited** | `--unshare-user` (same uid and gid, so file ownership seen inside is unchanged) with `--disable-userns`: `unshare(CLONE_NEWUSER)` fails inside (`ENOSPC`), and so does `unshare -U`. Switch: `hardening.userns`. A bubblewrap without `--disable-userns` fails the launch closed. | None needed. Turn the switch off only for a tool that must create user namespaces. |
 | IPC (SysV shm, POSIX mq) | **Limited** | `--unshare-ipc`: a private IPC namespace; host segments and queues are not visible, so attaching by id or opening by name fails. Switch: `hardening.ipc`. | None needed. |
 | Kernel keyring (`keyctl`) | **Limited** | A seccomp filter passed to bubblewrap makes `keyctl`, `add_key` and `request_key` fail with `EPERM` or `ENOSYS`, so host keys are not readable by id. x86_64 and aarch64; any other architecture, or a bubblewrap that cannot take the filter, fails the launch closed. Switch: `hardening.keyring`. | None needed. |
-| Resources: CPU, memory, processes, wall time | **Not limited** | No cgroups, no rlimits set: limits are inherited from the launcher unchanged. A fork bomb or busy loop affects the host; the pid namespace does not cap counts. | `systemd-run --user -p MemoryMax= -p CPUQuota= -p TasksMax=` (cgroups), `ulimit`/`prlimit`, and a timeout on every launch. |
-| Resources: disk | **Not limited** | Writable roots are the host filesystem (project, git dirs, caches); private `/tmp` is a tmpfs with the kernel default size. | Filesystem quotas or a size-capped scratch mount; a `tmpfs` size option for private `/tmp`; `RLIMIT_FSIZE`. |
+| Resources: CPU, memory, processes, wall time | **Limited when configured** | `resources.command` in the read-confinement policy: each confined launch runs in its own transient `systemd-run --user --scope` whose cgroup applies `memoryMax` (`MemoryMax=`), `memorySwapMax` (`MemorySwapMax=`), `tasksMax` (`TasksMax=`), `cpuQuota` (`CPUQuota=`, percent of one CPU, 200 = two CPUs) and `runtimeMaxSec` (`RuntimeMaxSec=`). Memory beyond the cap is killed inside the scope, forks beyond `tasksMax` fail (`EAGAIN`), a command that outlives `runtimeMaxSec` is ended. Sizes are a decimal integer with an optional `K`, `M`, `G` or `T` suffix (powers of 1024); the other keys are positive integers; any other key or form is refused at load. Needs a reachable systemd user manager that delegates the `cpu`, `memory` and `pids` controllers: if a configured limit cannot be applied (no user manager, missing controller) the launch fails closed with a recorded reason. The values are in the audit entry, `/sandbox workspace`, `/sandbox diagnostics confinement` and `policyHash`. A key left unset limits nothing: limits are then inherited from the launcher unchanged, and a fork bomb or busy loop affects the host. | Choose the values in your own policy (this package ships none); `ulimit`/`prlimit` for what cgroups do not express. |
+| Resources: disk | **Limited when configured** for the private `/tmp`; **Not limited** for writable roots | `resources.tmpSize` (a size string, as above) caps the private `/tmp` tmpfs through bubblewrap `--size`: writes beyond it fail with `ENOSPC`. Unset, it keeps the kernel default size. Writable roots are the host filesystem (project, git dirs, caches) and have no quota here: disk quotas need root or filesystem support and are out of scope. | Filesystem quotas or a size-capped scratch mount for writable roots; `RLIMIT_FSIZE`. |
 | Hostname | **Limited** | `--unshare-uts` with a fixed generic hostname, or the `hardening.hostname` the policy names: the host's name is not visible. Switches: `hardening.uts`, `hardening.hostname`. | None needed. |
 | Time, uid | **Not limited** | No time namespace; uid is the caller's. | Observable only. |
 | Environment | **Limited** | `--clearenv`: only `PATH`, `HOME`, `LANG`, `LC_ALL`, `TERM`, `TMPDIR`, `TZ` and `env.allow` names. Anything in `env.allow` is deliberately visible. | Keep `env.allow` minimal. |
@@ -588,8 +591,9 @@ Notes:
   missing one.
 - *Foreign mount points*: bubblewrap cannot withdraw access it did not remove; anything you add with `readOnly`, `bind`,
   `config`, the project or a symlink is fully reachable, including executables and sockets there.
-- *Resource limits* are the largest gap. Wrap the launcher in a cgroup (for example a transient `systemd-run` scope or
-  service) and a timeout; this is a host decision, not a package setting.
+- *Resource limits* apply only where the policy configures them (`resources.command`, `resources.tmpSize`); the values
+  are site decisions and the package ships none. Without them there is no CPU, memory, process-count or wall-time bound,
+  and writable roots never have a disk quota: wrap the launcher in your own cgroup, quota or timeout if you need that.
 - Probes and the observed values behind this table are re-checked by the test file; set
   `PI_SANDBOX_LIMITS_DUMP=1` to print them.
 

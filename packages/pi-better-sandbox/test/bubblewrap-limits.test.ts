@@ -16,9 +16,14 @@
  * confined-launch hardening (decision D4; policy `hardening` switches, all on by default). Their detailed
  * proof, including that each switch set to `false` brings the old behaviour back, is in hardening.test.ts and
  * hardening-fds.test.ts; the rows here assert the default refusal.
- * No resource-exhaustion is exercised: CPU, memory, disk fill, fork bombs and wall
- * time are documented from the mechanism (nothing in the argv sets them), plus a cheap
- * check that resource limits are inherited from the launcher unchanged.
+ * The resource rows are LIMITED *when configured* (decision D5): `resources.command` of the read-confinement
+ * policy puts each confined launch in its own systemd user scope (memoryMax, memorySwapMax, tasksMax, cpuQuota,
+ * runtimeMaxSec) and `resources.tmpSize` sizes the private /tmp. The tests here exercise real exhaustion with
+ * small capped values and bounded loops (an over-memory allocation is killed, forks beyond tasksMax fail, a
+ * sleeping command is ended by runtimeMaxSec, writes beyond tmpSize fail with ENOSPC); the per-key,
+ * scope-property, fail-closed, visibility and parser proofs are in resources-command.test.ts,
+ * resources-visibility.test.ts and resources-policy.test.ts. With no limit configured nothing is limited
+ * (resource limits are inherited from the launcher unchanged), and writable roots have no disk quota.
  *
  * Skips cleanly without bubblewrap, without a working user namespace, or without
  * python3 under the runtime roots. Fixtures live under a non-scratch base (override with
@@ -40,6 +45,7 @@ import { hashPolicy, parseReadConfinementPolicy } from "../shared-read-confineme
 import { ForegroundSandboxController } from "../state.ts";
 import { nonTempBase } from "./support/fixture-base.ts";
 import { leakProbeViaBuilder, leakProbeViaOuterShell, makeFixture, type Fixture } from "./support/hardening-support.ts";
+import { DISK_PROBE, MEMORY_PROBE, TASKS_PROBE, controllerWith, jsonLine, runBuilt, runPython, systemdSkip } from "./support/limits-support.ts";
 import { realBackendSkip } from "./support/resolvable-backend.ts";
 
 const PYTHON = "/usr/bin/python3";
@@ -457,7 +463,7 @@ t("LIMITED: the hostname is private: a fixed generic name (or the policy's), nev
     }
 });
 
-t("NOT LIMITED: uid and clock are the host's; resource limits are inherited unchanged", () => {
+t("NOT LIMITED: uid and clock are the host's; with no resources.command configured resource limits are inherited unchanged", () => {
     assert.equal(A("clock_skew_seconds"), "ok:True");
     const probeLimits = hostLibc(`import resource,sys;print(resource.getrlimit(resource.RLIMIT_NPROC),resource.getrlimit(resource.RLIMIT_AS),resource.getrlimit(resource.RLIMIT_FSIZE),resource.getrlimit(resource.RLIMIT_NOFILE),sep="|")`).stdout.trim().split("|");
     assert.deepEqual([A("rlimit_nproc"), A("rlimit_as"), A("rlimit_fsize"), A("rlimit_nofile")].map((v) => v.replace(/^ok:/, "")), probeLimits);
@@ -478,4 +484,47 @@ t("PARTIAL: an approved tool's config folder is readable whole; files matching t
 t("NOT LIMITED: a symlink in the project to a folder is followed read-only at launch", () => {
     assert.equal(A("read_via_project_symlink"), "ok:linked-secret\n");
     assert.equal(A("exec_via_project_symlink"), "ok:rc=0 linked-binary-ran", "and its executables run");
+});
+
+// ---- resources: LIMITED when configured (decision D5) -------------------------------------------------
+// Own fixture per test (the shared launches above are fixed variants A-C), launched through the same controller,
+// frozen plan and argument builder.
+const scopeSkip = baseSkip || systemdSkip();
+const MiB = 1 << 20;
+const withResources = <T>(resources: Parameters<typeof controllerWith>[1], body: (controller: ReturnType<typeof controllerWith>, fx: Fixture) => T): T => {
+    const fx = makeFixture("pbs-bwrap-limits-res-");
+    const controller = controllerWith(fx, resources);
+    try { return body(controller, fx); } finally { controller.dispose(); rmSync(fx.root, { recursive: true, force: true }); }
+};
+
+test("LIMITED when configured: CPU, memory, processes and wall time (resources.command: systemd user scope; keys memoryMax, memorySwapMax, tasksMax, cpuQuota, runtimeMaxSec)", { skip: scopeSkip }, () => {
+    const resources = { command: { memoryMax: "64M", memorySwapMax: "0", tasksMax: 24, cpuQuota: 100, runtimeMaxSec: 4 } };
+    withResources(resources, (controller, fx) => {
+        const memory = runPython(controller, fx, MEMORY_PROBE, ["256"]);
+        assert.doesNotMatch(memory.stdout, /ALLOC-DONE/, "memory beyond memoryMax is killed");
+        assert.notEqual(memory.status, 0);
+        const tasks = jsonLine<{ forked: number; error: string | null }>(runPython(controller, fx, TASKS_PROBE, ["48"]));
+        assert.equal(tasks.error, "EAGAIN", "forks beyond tasksMax fail");
+        assert.ok(tasks.forked < 24, String(tasks.forked));
+        const slept = runBuilt(controller, fx, "/bin/sh", ["-c", "/usr/bin/sleep 60; echo SLEPT"], 55_000);
+        assert.doesNotMatch(slept.stdout, /SLEPT/, "a command past runtimeMaxSec is ended");
+        assert.ok(slept.elapsedMs < 40_000, `${slept.elapsedMs} ms`);
+        const quick = runBuilt(controller, fx, "/bin/sh", ["-c", "echo QUICK"]);
+        assert.match(quick.stdout, /QUICK/, "a command within the limits is unaffected");
+    });
+});
+
+test("LIMITED when configured: the private /tmp size (resources.tmpSize); writable roots stay NOT LIMITED (no disk quota)", { skip: baseSkip }, () => {
+    const probe = (resources: Parameters<typeof controllerWith>[1]) => withResources(resources, (controller, fx) => {
+        const out = runPython(controller, fx, DISK_PROBE, ["64", `${fx.project}/bulk.bin`]);
+        assert.equal(out.status, 0, out.stderr);
+        return jsonLine<{ written: number; error: string | null; projectWritten: number; projectError: string | null }>(out);
+    });
+    const capped = probe({ tmpSize: "1M" });
+    assert.equal(capped.error, "ENOSPC", "writes beyond tmpSize fail");
+    assert.ok(capped.written <= MiB && capped.written >= MiB / 2, String(capped.written));
+    assert.equal(capped.projectError, null, "the project (a writable root) is not capped by tmpSize");
+    assert.equal(capped.projectWritten, 2 * MiB);
+    const unset = probe(undefined);
+    assert.deepEqual([unset.error, unset.written], [null, 4 * MiB], "with tmpSize unset the private /tmp keeps the kernel default size");
 });
