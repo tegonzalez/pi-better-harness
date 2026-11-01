@@ -508,11 +508,14 @@ site decisions; the package ships none. The examples below are placeholders.
   controller of each configured limit is present before bubblewrap starts (memory for `memoryMax` and `memorySwapMax`,
   pids for `tasksMax`, cpu for `cpuQuota`; `runtimeMaxSec` needs none). Memory used by the private `/tmp` tmpfs counts
   against `memoryMax`.
-- **Inside a remote pi.** If this policy is also the policy of a remote subagent whose target sets
-  `resources.session` (see the pi-better-subagents remote documentation), a confined launch of that remote pi starts
-  its own `systemd-run --user --scope`, and systemd places that scope beside the session scope, not below it. Such a
-  launch is therefore bounded by `resources.command`, not by the session scope's limits (the remote pi and its
-  unconfined children still are). Set `resources.command` as well when confined launches need a bound.
+- **Inside a remote pi.** A remote subagent whose target sets `resources.session` (see the pi-better-subagents
+  remote documentation) runs its pi in one session scope. What bounds a confined launch there depends on this policy:
+  without `resources.command` the launch starts no scope and runs in the session scope, bounded by the session limits;
+  with `resources.command` it starts its own `systemd-run --user --scope`, which systemd places beside the session
+  scope, not below it, so that launch is bounded by `resources.command` and not by the session scope's limits (the
+  remote pi and its unscoped children still are). The session limits then no longer cap the whole run. Stopping the
+  remote run does not by itself end a confined launch that is still running (known limit, described in the remote
+  documentation).
 - **`resources.tmpSize`**: sizes the private `/tmp` only; it needs no user manager and starts no scope. It does not limit
   writable roots, which never have a quota.
 - **Fails closed.** A configured limit that cannot be applied makes the plan inactive and every launch refuses to run,
