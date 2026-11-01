@@ -1141,14 +1141,17 @@ You are read-only in prose only.
             writeDefinition(join(ctx.cwd, ".pi", "agents", "roles"), "renamed.md", hidden);
             const fallback = load(ctx);
             assert.equal(fallback.roles.get("role.developer").scope, "bundled");
+            // The id was not read, so the file could shadow any role: the launch fails instead of silently using bundled.
             const preparedFallback = await prepareCatalogJob(fallback, { role: "role.developer", prompt: "Review" }, host);
-            assert.equal(preparedFallback.status, "ready");
+            assert.equal(preparedFallback.status, "blocked");
+            assert.match(preparedFallback.message, /renamed\.md/);
+            assert.match(preparedFallback.message, /catalog failed to load/);
         } finally {
             ctx.cleanup();
         }
     });
 
-    it("keeps bundled roles launchable when a catalog directory cannot be listed", async () => {
+    it("keeps bundled roles loadable but refuses their launch while a higher-priority catalog directory cannot be listed", async () => {
         const ctx = fixture("real");
         const directory = join(ctx.userRoot, "agents", "roles");
         mkdirSync(directory, { recursive: true });
@@ -1175,10 +1178,12 @@ You are read-only in prose only.
             assert.ok(listed, during.diagnostics.map((item) => `${item.code} ${item.path} ${item.message}`).join("\n"));
             assert.match(listed.message, /EACCES|permission denied/);
             assert.equal(listed.blocking, false);
+            // The unreadable user directory could hold an override; launching the bundled role would hide that.
             const prepared = await prepareCatalogJob(during, { role: "role.developer", prompt: "Review" }, launchHost(ctx, { projectTrusted: false }));
-            assert.equal(prepared.status, "ready");
-            assert.equal(prepared.assign.catalog.id, "role.developer");
-            assert.equal(prepared.assign.catalog.source.scope, "bundled");
+            assert.equal(prepared.status, "blocked");
+            assert.match(prepared.message, /catalog failed to load/);
+            assert.ok(prepared.message.includes(directory), prepared.message);
+            assert.match(prepared.message, /No child was started/);
         } finally {
             try {
                 chmodSync(directory, 0o700);

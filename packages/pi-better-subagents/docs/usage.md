@@ -660,6 +660,12 @@ other shipped defaults. To retain custom keys from an older package-local config
 copy those keys into the user file before upgrading. Already-overwritten values
 cannot be recovered automatically.
 
+If the saved `piBetterHarness.subagents` section or the shipped `config.json`
+cannot be read or parsed, settings readers keep the shipped defaults, but session
+start reports the error and every `subagent_spawn` / `subagent_spawn_batch`
+launch is refused with it until the file is fixed. A launch never silently runs
+without your saved `defaultModel`, `tierPolicy`, or tool settings.
+
 The effective config also sets:
 
 - `defaultModel` — model for spawns that don't specify one (`null` = inherit the
