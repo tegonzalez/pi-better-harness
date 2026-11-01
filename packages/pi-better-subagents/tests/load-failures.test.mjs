@@ -216,6 +216,17 @@ describe("catalog load failures", { concurrency: false }, () => {
         assert.match(prepared.message, /No child was started/);
     });
 
+    it("names a lower-ranked broken file when a project agent's role is missing", async (t) => {
+        const host = roleInheritanceFixture(t);
+        writeFileSync(join(host.cwd, ".pi", "agents", "agents", "payments.md"),
+            "---\nschema: pi-agent/v1\nkind: agent\nid: agent.payments\nname: Payments\nroleId: role.payments-dev\ninstructions:\n  mode: add\n---\nPayments work.\n");
+        const prepared = await prepareCatalogJob(loadLaunchSnapshot(host), { prompt: "Build.", agent: "agent.payments" }, host);
+        assert.equal(prepared.status, "blocked");
+        assert.match(prepared.message, /my-developer\.md/, "the broken personal file could hold the missing role");
+        assert.match(prepared.message, /could define role\.payments-dev, which agent\.payments needs/);
+        assert.match(prepared.message, /No child was started/);
+    });
+
     it("does not block a project agent and project role on a lower-ranked broken personal file", async (t) => {
         const host = roleInheritanceFixture(t, { projectRole: true });
         const prepared = await prepareCatalogJob(loadLaunchSnapshot(host), { prompt: "Build.", agent: "agent.payments" }, host);
