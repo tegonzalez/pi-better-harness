@@ -13,10 +13,10 @@
  *    cannot silently go stale; if one starts failing, the boundary got tighter (update
  *    the README) or the probe broke. They are not endorsements.
  * The IPC, hostname, nested-user-namespace, kernel-keyring and inherited-descriptor rows are LIMITED by the
- * confined-launch hardening (decision D4; policy `hardening` switches, all on by default). Their detailed
+ * confined-launch hardening (policy `hardening` switches, all on by default). Their detailed
  * proof, including that each switch set to `false` brings the old behaviour back, is in hardening.test.ts and
  * hardening-fds.test.ts; the rows here assert the default refusal.
- * The resource rows are LIMITED *when configured* (decision D5): `resources.command` of the read-confinement
+ * The resource rows are LIMITED *when configured* : `resources.command` of the read-confinement
  * policy puts each confined launch in its own systemd user scope (memoryMax, memorySwapMax, tasksMax, cpuQuota,
  * runtimeMaxSec) and `resources.tmpSize` sizes the private /tmp. The tests here exercise real exhaustion with
  * small capped values and bounded loops (an over-memory allocation is killed, forks beyond tasksMax fail, a
@@ -26,7 +26,9 @@
  * (resource limits are inherited from the launcher unchanged), and writable roots have no disk quota.
  *
  * Skips cleanly without bubblewrap, without a working user namespace, or without
- * python3 under the runtime roots. Fixtures live under a non-scratch base (override with
+ * python3 under the runtime roots; with PI_SANDBOX_REQUIRE_BACKEND set, a missing or unusable bubblewrap fails
+ * instead (the resource rows that need a systemd user manager still skip without one).
+ * Python3 is looked up at a fixed path, so its absence skips even under that variable. Fixtures live under a non-scratch base (override with
  * PI_SANDBOX_TEST_NON_TEMP_BASE) and are removed afterwards.
  * @level kernel
  */
@@ -40,11 +42,11 @@ import { join } from "node:path";
 import test, { after, before, type TestContext } from "node:test";
 
 import { defaultSandboxPermissions } from "../permissions.ts";
-import { buildSandboxCommand } from "../shared-sandbox-core.ts";
+import { buildSandboxCommand, describeSandboxSupport } from "../shared-sandbox-core.ts";
 import { hashPolicy, parseReadConfinementPolicy } from "../shared-read-confinement.ts";
 import { ForegroundSandboxController } from "../state.ts";
 import { nonTempBase } from "./support/fixture-base.ts";
-import { leakProbeViaBuilder, leakProbeViaOuterShell, makeFixture, type Fixture } from "./support/hardening-support.ts";
+import { leakProbeViaBuilder, leakProbeViaOuterShell, makeFixture, requireOrSkip, type Fixture } from "./support/hardening-support.ts";
 import { DISK_PROBE, MEMORY_PROBE, TASKS_PROBE, controllerWith, jsonLine, runBuilt, runPython, systemdSkip } from "./support/limits-support.ts";
 import { realBackendSkip } from "./support/resolvable-backend.ts";
 
@@ -53,12 +55,17 @@ const hostLibc = (code: string, args: string[] = []) =>
     spawnSync(PYTHON, ["-c", code, ...args], { encoding: "utf8" });
 
 function environmentSkip(): string | false {
+    // Throws (instead of skipping) when PI_SANDBOX_REQUIRE_BACKEND is set and the backend is not usable.
     const backend = realBackendSkip();
     if (backend) return backend;
+    if (process.platform !== "linux") return "Linux bubblewrap only";
+    if (!existsSync(PYTHON)) return `${PYTHON} is required for the in-sandbox probes`;
     // A user namespace with the confinement's own mount shape, plus the interpreter used for probes.
-    const probe = spawnSync("bwrap", ["--unshare-pid", "--unshare-net", "--ro-bind", "/usr", "/usr", "--ro-bind", "/lib", "/lib",
+    // The probe runs the executable the product itself selected (never a PATH lookup: the product ignores PATH).
+    const support = describeSandboxSupport();
+    const probe = spawnSync(support.supported ? support.executable : "bwrap", ["--unshare-pid", "--unshare-net", "--ro-bind", "/usr", "/usr", "--ro-bind", "/lib", "/lib",
         "--ro-bind", "/bin", "/bin", "--ro-bind", "/lib64", "/lib64", "--", PYTHON, "-c", "print(1)"], { encoding: "utf8" });
-    if (probe.status !== 0) return `bubblewrap with --unshare-pid/--unshare-net and ${PYTHON} unavailable: ${(probe.stderr || probe.error?.message || "").trim()}`;
+    if (probe.status !== 0) return requireOrSkip(`bubblewrap with --unshare-pid/--unshare-net and ${PYTHON} unavailable: ${(probe.stderr || probe.error?.message || "").trim()}`);
     return false;
 }
 const skip = environmentSkip();
@@ -486,7 +493,7 @@ t("NOT LIMITED: a symlink in the project to a folder is followed read-only at la
     assert.equal(A("exec_via_project_symlink"), "ok:rc=0 linked-binary-ran", "and its executables run");
 });
 
-// ---- resources: LIMITED when configured (decision D5) -------------------------------------------------
+// ---- resources: LIMITED when configured -------------------------------------------------
 // Own fixture per test (the shared launches above are fixed variants A-C), launched through the same controller,
 // frozen plan and argument builder.
 const scopeSkip = baseSkip || systemdSkip();

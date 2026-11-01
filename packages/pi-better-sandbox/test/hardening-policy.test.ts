@@ -1,8 +1,8 @@
 /**
- * Row `switches` (parser half): the read-confinement policy's optional `hardening` object. Boolean keys `ipc`,
+ * Hardening switches (parser half): the read-confinement policy's optional `hardening` object. Boolean keys `ipc`,
  * `uts`, `userns`, `keyring`, `fds` (all default true) and an optional string `hostname`. Unknown keys are
  * refused at load, values of the wrong type are refused, and every switch is part of `policyHash`.
- * The frozen interface is the key set; error wording is the product's.
+ * The contract is the key set; error wording is the product's.
  * @level unit
  */
 import assert from "node:assert/strict";

@@ -1,5 +1,5 @@
 /**
- * Row `fds`: a confined child sees only descriptors 0, 1 and 2 (plus any the launch passes on purpose, such as a
+ * Inherited descriptors (`hardening.fds`): a confined child sees only descriptors 0, 1 and 2 (plus any the launch passes on purpose, such as a
  * seccomp program). /proc is absent inside, so the probe is `>&N` writes to two marker files that the host holds
  * open on descriptors 3 and 7 WITHOUT close-on-exec; a leak shows up as marker content on the host.
  *
@@ -8,7 +8,7 @@
  *     left open (how a spawner or outer shell that leaks descriptors looks to bubblewrap);
  *  2. foreground launcher with a leaky outer shell (a configured shell that opens the markers, then execs the
  *     real shell, as a user's shell start-up file can): the real launcher path leaks them unless the measure holds;
- *  3. every launcher type with a seam at b853864, started in its own process that inherits the markers: foreground
+ *  3. every launcher type with a test seam, started in its own process that inherits the markers: foreground
  *     bash, task bash, background tasks (process.ts) and subagents (spawn.ts + sandbox.ts).
  *
  * NOTE on level 3: Node's own child_process closes every descriptor that is not named in `stdio`, so a launcher
@@ -16,11 +16,12 @@
  * level 3 therefore has no working control and only guards against a launcher starting to pass descriptors on
  * purpose. The falsifiable evidence is levels 1 and 2.
  *
- * Open evidence obligation: task file operations (task-sandbox/files.ts) run a fixed worker program with JSON on
+ * Not covered: task file operations (task-sandbox/files.ts) run a fixed worker program with JSON on
  * stdin. No seam lets a test put a probe inside, and /proc is absent, so a descriptor leak there cannot be observed
- * from outside; it is not claimed. Its spawn also names only stdio, so it shares the level 3 reasoning.
+ * from outside, so nothing is claimed for it. Its spawn also names only stdio, so it shares the level 3 reasoning.
  *
- * Remediation row covered: fds (with `switches`). Expected results come from kernel semantics.
+ * Expected results come from kernel semantics. Skips without bubblewrap; with PI_SANDBOX_REQUIRE_BACKEND set, a
+ * missing or unusable bubblewrap fails instead.
  * @level kernel
  */
 import assert from "node:assert/strict";

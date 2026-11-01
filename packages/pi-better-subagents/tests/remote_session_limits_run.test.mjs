@@ -1,5 +1,5 @@
 /**
- * Remote session limits (`resources.session`, decision D5, wave P1.3), AC-02 session cases, on the
+ * Remote session limits (`resources.session`), run cases, on the
  * local launch-script path: the real bridge, launch script and stop script run over the fake ssh
  * transport (tests/fixtures/remote), so the "remote" command runs locally.
  *
@@ -11,7 +11,9 @@
  *      configured properties; stop and kill leave no process and no scope; RuntimeMaxSec ends a
  *      hanging run; an unreachable user manager fails closed with a recorded reason.
  *
- * Expectations come from the plan and from systemd/kernel semantics, not from product output.
+ * Expectations come from the documented limit keys and from systemd/kernel semantics, not from product output.
+ * These real-systemd skips are not turned into failures by PI_SANDBOX_REQUIRE_BACKEND (it names sandbox
+ * backends, and a systemd user manager is not one); no case here uses bubblewrap.
  * Every scope the tests create is stopped in a finally/after hook.
  *
  * // @level integration
