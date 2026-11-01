@@ -95,7 +95,7 @@ exec setsid -w systemd-run --user --scope ... -p MemoryMax=... -- sh -c '<scope 
 ```
 
 - **One scope for the run.** The process that becomes pi, and every child, grandchild and detached sleeper,
-  runs in that one transient scope, so the bound is shared (the sum of all of them, not per process). The scope
+  runs in that one transient scope (a scoped confined launch is the exception, see below), so the bound is shared (the sum of all of them, not per process). The scope
   is created by the launch itself and ends when its last process ends.
 - **setsid, pid file and stop are unchanged.** `systemd-run --scope` registers the calling process in the scope
   and then replaces itself with the command, so the pid in `<root>/<run id>/pid` is still the session leader that
@@ -103,6 +103,13 @@ exec setsid -w systemd-run --user --scope ... -p MemoryMax=... -- sh -c '<scope 
   run started and leaves no process behind. When the last process dies the scope is gone: `subagent_stop`
   leaves neither a process nor a scope. As before, a process that starts yet another session itself is out of
   the stop script's reach; it stays inside the scope's bounds and `runtimeMaxSec` ends it with the scope.
+- **Confined launches inside the remote pi.** When the remote pi's own sandbox policy also sets
+  `resources.command` (see the pi-better-sandbox README), each confined launch starts its own
+  `systemd-run --user --scope`. systemd creates that scope beside the session scope, not inside it (a nested
+  `systemd-run --user --scope` lands in a sibling scope of the user manager's `app.slice`). Such a launch is bounded by
+  its command limits and **not** by the session scope's memory, task or CPU limits; the session bound is then shared
+  only by the remote pi and by children that are not scoped launches. This is how the scopes combine today, not a
+  tuned guarantee: if confined launches must be bounded, set `resources.command` in that policy.
 - **`runtimeMaxSec`** makes systemd stop the scope (SIGTERM, then SIGKILL after the user manager's stop
   timeout) when the time is up, which ends pi and everything in it; the bridge then records the exit as for any
   remote pi that ends.
