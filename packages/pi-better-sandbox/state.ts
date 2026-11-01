@@ -18,6 +18,7 @@ import {
     formatReadConfinementAudit,
     planReadConfinement,
     type ReadConfinementHardeningAudit,
+    type ReadConfinementResourcesAudit,
     type LoadedReadConfinementPolicy,
     type ReadConfinementPlan,
     type ReadConfinementSeams,
@@ -123,6 +124,7 @@ function confinementMounts(plan: ReadConfinementPlan): ReadConfinementMounts {
         ...(plan.overlayArgs && { overlayArgs: plan.overlayArgs }),
         ...(plan.gitFile && { gitFile: plan.gitFile }),
         hardening: plan.hardening,
+        ...(plan.resources && { resources: plan.resources }),
     };
 }
 
@@ -141,7 +143,7 @@ export type ReadConfinementControllerSeams = {
  */
 export type ReadConfinementRecord =
     | { version: 1; active: true; profile: "main"; policyHash: string; planHash: string; hash: string; audit: ReadConfinementPlan["audit"] }
-    | { version: 1; active: false; profile: "main"; reason: string; policyHash?: string; planHash?: string; hardening?: ReadConfinementHardeningAudit };
+    | { version: 1; active: false; profile: "main"; reason: string; policyHash?: string; planHash?: string; hardening?: ReadConfinementHardeningAudit; resources?: ReadConfinementResourcesAudit };
 
 export type ForegroundSandboxSeams = PolicySeams & {
     readConfinement?: ReadConfinementControllerSeams;
@@ -223,7 +225,7 @@ export class ForegroundSandboxController {
         if (!c || "none" in c) return undefined;
         if ("failure" in c) return { version: 1, active: false, profile: "main", reason: c.failure.message };
         if (c.blocked) {
-            return { version: 1, active: false, profile: "main", reason: c.blocked, policyHash: c.loaded.sha256, planHash: c.plan.hash, hardening: c.plan.audit.hardening };
+            return { version: 1, active: false, profile: "main", reason: c.blocked, policyHash: c.loaded.sha256, planHash: c.plan.hash, hardening: c.plan.audit.hardening, ...(c.plan.audit.resources && { resources: c.plan.audit.resources }) };
         }
         const status = this.status();
         const off = status.permissions?.enabled && status.permissions.outsideProject === "off";
@@ -268,6 +270,7 @@ export class ForegroundSandboxController {
             ...base, confinement: c.blocked ? "failed" : record?.active ? "active" : "not-in-force",
             policyPath: c.loaded.source, policyHash: c.loaded.sha256, planHash: c.plan.hash,
             hardening: c.plan.audit.hardening,
+            ...(c.plan.audit.resources && { resources: c.plan.audit.resources }),
             ...(record && !record.active ? { note: record.reason } : {}),
         };
     }
@@ -377,12 +380,17 @@ export class ForegroundSandboxController {
                 home: (this.#seams.home ?? homedir)(), agentId: "main",
                 extraWritableRoots: this.#otherWritableRoots(), ...rc.plan, hardening: hardeningSeams,
             });
-            // A measure that is on but cannot be applied here (an older bubblewrap, an architecture without a
-            // seccomp table) makes the plan inactive: every launch fails closed with the reason.
-            const unavailable = Object.entries(plan.audit.hardening).flatMap(([measure, state]) =>
-                typeof state === "object" && state.state === "unavailable" ? [`hardening.${measure} unavailable: ${state.reason}`] : []);
+            // A measure or limit that is on but cannot be applied here (an older bubblewrap, an architecture without
+            // a seccomp table, no reachable systemd user manager, an undelegated controller) makes the plan
+            // inactive: every launch fails closed with the reason.
+            const unavailable = [
+                ...Object.entries(plan.audit.hardening).flatMap(([measure, state]) =>
+                    typeof state === "object" && state.state === "unavailable" ? [`hardening.${measure} unavailable: ${state.reason}`] : []),
+                ...Object.entries(plan.audit.resources ?? {}).flatMap(([name, entry]) =>
+                    entry.state.state === "unavailable" ? [`resources.${name} unavailable: ${entry.state.reason}`] : []),
+            ];
             const blocked = unavailable.length
-                ? `Read confinement failed closed: ${unavailable.join("; ")}. Fix the cause, or switch the measure off in the policy's "hardening" object.`
+                ? `Read confinement failed closed: ${unavailable.join("; ")}. Fix the cause, or switch the measure off in the policy's "hardening" object or remove the limit from its "resources" object.`
                 : undefined;
             this.#confinement = { project, loaded, plan, ...(blocked && { blocked }) };
             publishProcessReadConfinement(blocked ? { state: "failed", reason: blocked } : { state: "active", mounts: confinementMounts(plan) }, this);
