@@ -31,6 +31,7 @@ name fails the launch closed before anything starts.
         "env": { "EXAMPLE_SANDBOX_PROFILE": "{profile}" },
         "verifyCommand": "test -x /path/to/sandbox-backend"
       },
+      "resources": { "session": { "memoryMax": "4G", "tasksMax": 512, "runtimeMaxSec": 7200 } },
       "abortWaitMs": 3000,
       "termGraceSeconds": 5
     }
@@ -59,6 +60,7 @@ Schema (validated on use; unknown fields are rejected):
 | `sandbox.entryProfile` | no | `profile` value the audit entry must carry (default: `sandbox.profile`). The pi-better-sandbox entry reports its permission profile, `"main"`, so set `"entryProfile": "main"` for it. |
 | `sandbox.policyHash` | no | Expected `policyHash` (64-hex sha256) of the remote sandbox policy. When set, an audit entry with any other hash fails closed (`sandbox-unverified`, no prompt); when omitted the hash is only recorded, so any active remote policy is accepted. Pin it when the remote policy must not change unnoticed. |
 | `sandbox.verifyTimeoutMs` | no | How long the bridge waits for that entry (default 30000). |
+| `resources.session` | no | Limits for the whole remote pi process and everything it starts, applied with one systemd user scope. Keys, forms and failure behaviour: [Session limits](#session-limits). Any other key under `resources` is rejected. |
 | `abortWaitMs` | no | How long stop waits for the RPC abort to be acknowledged (default 3000). |
 | `termGraceSeconds` | no | Seconds between remote TERM and KILL on stop (default 5). |
 
@@ -66,6 +68,82 @@ The extension does not implement sandboxing. It passes the profile through, the 
 its own sandbox, and the bridge **verifies** that it did (next section). Model, thinking, tool allowlist/denylist and `approve` from the launch are
 passed as the usual `pi` flags. Local extensions and the local task sandbox do not apply to a
 remote run; extensions backing requested tools must be installed on the remote host.
+
+## Session limits
+
+An optional `resources.session` object bounds the whole remote pi process and every child it starts. The
+values are yours to choose; the numbers in the example above are placeholders. Every key is optional, and
+a key that is not set limits nothing:
+
+| Key | Type and unit | systemd property |
+| --- | --- | --- |
+| `memoryMax` | Size string: a decimal integer with an optional `K`, `M`, `G` or `T` suffix (powers of 1024), for example `"4G"` | `MemoryMax=` |
+| `memorySwapMax` | Size string, as above (`"0"` allowed) | `MemorySwapMax=` |
+| `tasksMax` | Positive integer: processes and threads | `TasksMax=` |
+| `cpuQuota` | Positive integer: percent of one CPU (`200` is two CPUs) | `CPUQuota=` |
+| `runtimeMaxSec` | Positive integer: seconds | `RuntimeMaxSec=` |
+
+Any other key, form or value (a JSON number for a size, `"64MB"`, `0`, a fraction, an unknown key) is
+refused when the target is loaded. The keys and parser are the ones of the sandbox policy's
+`resources.command` (see the pi-better-sandbox README), with the same forms.
+
+When at least one key is set, the remote launch script starts pi through
+`systemd-run --user --scope -p <property>=<value> ...` under `setsid`:
+
+```
+exec setsid -w systemd-run --user --scope ... -p MemoryMax=... -- sh -c '<scope check>' ... sh -c 'echo $$ > "$0/pid"; exec "$@"' "$RD" pi ...
+```
+
+- **One scope for the run.** The process that becomes pi, and every child, grandchild and detached sleeper,
+  runs in that one transient scope, so the bound is shared (the sum of all of them, not per process). The scope
+  is created by the launch itself and ends when its last process ends.
+- **setsid, pid file and stop are unchanged.** `systemd-run --scope` registers the calling process in the scope
+  and then replaces itself with the command, so the pid in `<root>/<run id>/pid` is still the session leader that
+  became pi, and the stop script (TERM, then KILL of every member of that session) still reaches everything the
+  run started and leaves no process behind. When the last process dies the scope is gone: `subagent_stop`
+  leaves neither a process nor a scope. As before, a process that starts yet another session itself is out of
+  the stop script's reach; it stays inside the scope's bounds and `runtimeMaxSec` ends it with the scope.
+- **`runtimeMaxSec`** makes systemd stop the scope (SIGTERM, then SIGKILL after the user manager's stop
+  timeout) when the time is up, which ends pi and everything in it; the bridge then records the exit as for any
+  remote pi that ends.
+- **The scope carries only the configured properties.** The memory limit is a hard cap: a scope that exceeds
+  `memoryMax` has its processes killed by the kernel's OOM killer, not paused.
+
+### When the limits cannot be applied
+
+A configured limit is never applied "if possible". Before staging the environment, the launch script checks,
+and refuses (exit code 100, a `session-limits-unavailable` incident, pi is not started and no prompt is sent)
+when any of these fails:
+
+1. `systemd-run` is missing on the remote host.
+2. The user's systemd **user manager** is not reachable: neither `$XDG_RUNTIME_DIR/bus` nor
+   `$XDG_RUNTIME_DIR/systemd/private` exists and `DBUS_SESSION_BUS_ADDRESS` is not set
+   (`XDG_RUNTIME_DIR` defaults to `/run/user/<uid>`). Over ssh the user manager exists only while the user
+   has **lingering** enabled (`loginctl enable-linger <user>`, an administrator action on the remote host) or
+   has an active login session. The reason names which applies (`lingering is enabled`, or `lingering is not
+   enabled, so the user manager exists only while a login session is active`; `lingering and login-session
+   state could not be read` when `loginctl` is unavailable). The launch log carries the same note for a
+   successful start.
+3. A probe scope with the configured properties cannot be started (for example the manager rejects a
+   property), or a controller a limit needs (`memory` for `memoryMax` and `memorySwapMax`, `pids` for
+   `tasksMax`, `cpu` for `cpuQuota`) is not delegated to the user manager: systemd silently ignores a property
+   whose controller is missing, so the scope's cgroup is checked for the control files. `runtimeMaxSec` needs
+   no controller.
+
+The same check runs again inside the real scope immediately before pi starts. There is no unscoped fallback.
+A target without `resources.session` (or with an empty one) generates the same launch script as before and
+needs no systemd on the remote host.
+
+### What the run shows
+
+The run record (`meta.remote.sessionLimits`) holds the configured keys and values as written, and
+`subagent_result` adds one line after the `Remote workspace` line, for example:
+
+```
+Remote session limits (build-box): one systemd user scope · memoryMax=4G · tasksMax=512 · runtimeMaxSec=7200
+```
+
+Runs without session limits show neither.
 
 ## Parent sandbox: a remote spawn is network use
 
@@ -173,6 +251,9 @@ without the definition carrying anything.
    cannot report sessions: it never guesses;
 3. stops the bridge and records `killed`.
 
+With `resources.session`, pi and its children run in one systemd user scope (see [Session limits](#session-limits));
+the same stop applies unchanged and the scope ends with its last process.
+
 The stop is asynchronous: the tool, shutdown, timing stops and the navigator never block the event loop
 (the navigator reports the row as stopping and dismisses it when the stop is verified). A run whose
 remote work is known to be over (agent settled, or failed before any remote work) is stopped without
@@ -196,6 +277,7 @@ unfinalized (health marks it orphaned) with a `bridge-died` incident.
 | Session to resume missing | Run fails with a `session-missing` incident. |
 | Remote cwd missing | Run fails with a `cwd-missing` incident. |
 | Working folder outside the target's `cwdRoots` | Run fails with a `cwd-denied` incident; pi is never started. |
+| `resources.session` set but `systemd-run`, the user manager (no lingering and no login session) or a needed controller is missing | Run fails with a `session-limits-unavailable` incident naming the reason; pi is never started and there is no unscoped fallback. |
 | Verification fails and the remote stop cannot be verified | The marker is `remote-unstopped` (written *before* the stop is attempted, replaced by `sandbox-unverified` only after a verified stop), so a bridge killed meanwhile never reads as "surely gone"; `subagent_stop` retries. |
 | SSH channel drops after the prompt was sent (even before the first event) | Same as mid-run: `channel-lost`, not finalized. Only a drop *before* the prompt is `ssh-failed`. |
 | SSH channel drops mid-run | A `channel-lost` incident is recorded and the run is not finalized: normal health reconciliation marks it orphaned/lost. `subagent_stop` still kills the remote process. |
@@ -207,4 +289,6 @@ Unit tests (`tests/remote_subagents.test.mjs`) run the real bridge and scripts o
 entries, and detach a grandchild). `tests/remote_subagents_live.test.mjs` runs against a real host and
 is skipped unless `PI_REMOTE_TEST_HOST` and `PI_REMOTE_TEST_SANDBOX_PROFILE` are set (see the file
 header for the other variables); it also verifies the sandbox entry. It touches only its own run-scoped remote directories and leaves
-nothing running.
+nothing running. `tests/remote_session_limits*.test.mjs` cover `resources.session`: the parser, the generated
+script (against a stand-in `systemd-run`), and, when a user manager with the cpu, memory and pids controllers
+is available, real small scopes whose cleanup the tests verify.
