@@ -592,8 +592,28 @@ function fallbackPreference(
         requested,
         requestedSource,
         message: `${ownerLabel(effective)} default model ${requested} is not usable (${unusableBecause(located)}). ${tierReason}`,
-        setDefault: `set an available default model for ${effective.kind} ${effective.id} (${effective.kind === "agent" ? "its model override or its role's model" : "the role's model"}), add an ordered same-tier candidate under tierPolicy in config to opt into a fallback`,
+        setDefault: `${setDefaultHint(effective)}; or add an ordered same-tier candidate under tierPolicy in config to opt into a fallback (${candidateRules(requested)})`,
     });
+}
+
+/** Rules a tierPolicy candidate must meet, so a fix that is not taken is not suggested blindly. */
+function candidateRules(requested: string): string {
+    const provider = providerOf(requested);
+    const cross = provider
+        ? `a candidate from a provider other than ${provider} needs crossProvider: true`
+        : "because the default names no provider, every candidate needs crossProvider: true";
+    return `the candidate must also be listed in that tier's members, and ${cross}`;
+}
+
+/** Where the owner of an unavailable default can set a working one. */
+function setDefaultHint(effective: EffectiveDefinition): string {
+    const roleId = effective.kind === "agent" ? effective.roleId : effective.id;
+    const roleDefault = roleId
+        ? `defaults.model for ${roleId} in the personal role file ~/.pi/agent/agents/roles/${roleId}.md or with /agents`
+        : "its role's defaults.model with /agents";
+    return effective.kind === "agent"
+        ? `set an available model override for ${effective.id}, or an available ${roleDefault}`
+        : `set an available ${roleDefault}`;
 }
 
 function ownerLabel(effective: EffectiveDefinition): string {
