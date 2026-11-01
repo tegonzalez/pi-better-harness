@@ -564,12 +564,50 @@ export default function planExtension(pi: ExtensionAPI): void {
     },
   });
 
+  // A plan message sent with triggerTurn: false while a run streams is held until the turn ends.
+  // Until it lands in the branch, count it as the latest plan message so it is not sent twice.
+  let queuedPlanContext: { revision: string; afterEntryId: string } | undefined;
+  const queuedPlanRevision = (ctx: ExtensionContext): string | undefined => {
+    if (!queuedPlanContext) return undefined;
+    const branch = ctx.sessionManager?.getBranch?.() ?? [];
+    const start = branch.findIndex((entry) => entry.id === queuedPlanContext!.afterEntryId);
+    const landed = start < 0 || branch.slice(start + 1)
+      .some((entry) => entry.type === "custom_message" && entry.customType === PLAN_CONTEXT);
+    if (landed) queuedPlanContext = undefined;
+    return queuedPlanContext?.revision;
+  };
+  /** The plan message the model context needs, or undefined when its latest plan message is current. */
+  const pendingPlanContext = (ctx: ExtensionContext) => {
+    const active = workflowPlanOwner(ctx) || workflowBinding(ctx.sessionManager.getBranch()) ? null : currentPlan;
+    const mode = active ? activeDelegationMode(pi) : null;
+    const revision = active && mode ? planContextRevision(active, mode) : INACTIVE_PLAN_REVISION;
+    const previous = queuedPlanRevision(ctx) ?? contextPlanRevision(ctx);
+    // Nothing to supersede when no plan message is in context and no plan is active.
+    if (revision === previous || (revision === INACTIVE_PLAN_REVISION && previous === undefined)) return undefined;
+    return {
+      customType: PLAN_CONTEXT,
+      content: active && mode ? planPrompt(active, mode) : INACTIVE_PLAN_PROMPT,
+      display: false,
+      details: { revision },
+    };
+  };
+
   pi.on("session_start", async (_event, ctx) => {
+    queuedPlanContext = undefined;
     installWidget(ctx);
     restore(ctx);
   });
   pi.on("session_tree", async (_event, ctx) => {
+    queuedPlanContext = undefined;
     restore(ctx);
+  });
+  // Compaction can run inside a run (before the next response, or before an overflow retry), where
+  // before_agent_start does not fire. When it drops the latest plan message, add it back.
+  pi.on("session_compact", async (event, ctx) => {
+    const message = pendingPlanContext(ctx);
+    if (!message) return;
+    queuedPlanContext = { revision: message.details.revision, afterEntryId: event.compactionEntry.id };
+    pi.sendMessage(message, { triggerTurn: false });
   });
   // The system prompt carries only deterministic text, so plan progress never invalidates the
   // provider's cached prefix. The plan reaches the model as a persisted message, added once per
@@ -577,23 +615,9 @@ export default function planExtension(pi: ExtensionAPI): void {
   pi.on("before_agent_start", async (event, ctx) => {
     const systemPrompt = appendExecutionPolicy(event.systemPrompt);
     const result = systemPrompt === event.systemPrompt ? {} : { systemPrompt };
-    const active = workflowPlanOwner(ctx) || workflowBinding(ctx.sessionManager.getBranch()) ? null : currentPlan;
-    const mode = active ? activeDelegationMode(pi) : null;
-    const revision = active && mode ? planContextRevision(active, mode) : INACTIVE_PLAN_REVISION;
-    const previous = contextPlanRevision(ctx);
-    // Nothing to supersede when no plan message is in context and no plan is active.
-    if (revision === previous || (revision === INACTIVE_PLAN_REVISION && previous === undefined)) {
-      return "systemPrompt" in result ? result : undefined;
-    }
-    return {
-      ...result,
-      message: {
-        customType: PLAN_CONTEXT,
-        content: active && mode ? planPrompt(active, mode) : INACTIVE_PLAN_PROMPT,
-        display: false,
-        details: { revision },
-      },
-    };
+    const message = pendingPlanContext(ctx);
+    if (!message) return "systemPrompt" in result ? result : undefined;
+    return { ...result, message };
   });
   pi.on("session_shutdown", async (_event, ctx) => {
     cancelCompletedPlanClear();

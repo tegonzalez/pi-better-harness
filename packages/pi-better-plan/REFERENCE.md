@@ -74,7 +74,7 @@ The binding records the active workflow's name, which is shown in the plan view.
 
 ## Model Context and Prompt Caching
 
-The plan never enters the system prompt, which only gains the fixed Harness execution policy, so plan progress does not invalidate the provider's cached prefix. Instead, at the start of a run the plan adds one hidden `pi-better-plan-context` message holding the steps, ready steps, and guidance for the active delegation mode. It adds one only when the plan revision or delegation mode differs from the latest such message in the branch's model context, and never moves or rewrites earlier ones, so earlier history stays byte-stable. When the plan is cleared, or a workflow takes over planning, one message says no generic plan is active. Changes made by `update_plan` within a run reach the model through the tool call and its result.
+The plan never enters the system prompt, which only gains the fixed Harness execution policy, so plan progress does not invalidate the provider's cached prefix. Instead, at the start of a run the plan adds one hidden `pi-better-plan-context` message holding the steps, ready steps, and guidance for the active delegation mode. It adds one only when the plan revision or delegation mode differs from the latest such message in the branch's model context, and never moves or rewrites earlier ones, so earlier history stays byte-stable. When the plan is cleared, or a workflow takes over planning, one message says no generic plan is active. Changes made by `update_plan` within a run reach the model through the tool call and its result. When compaction drops the latest plan message, including compaction inside a run, the plan adds the message back once, after the current turn ends.
 
 ## Plan Display
 

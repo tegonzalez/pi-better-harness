@@ -514,3 +514,143 @@ async function clearByCompletion(update: (plan: PlanStepInput[]) => Promise<unkn
   }
   fire?.();
 }
+
+/** A session whose model context mocks compaction: dropped entries leave buildContextEntries. */
+function compactingSession() {
+  type Entry = SessionEntry & { id: string; content?: string; details?: unknown };
+  let branch: Entry[] = [];
+  const dropped = new Set<string>();
+  const tools = new Map<string, ToolDefinition>();
+  const handlers = new Map<string, (event: any, ctx: ExtensionContext) => unknown>();
+  const sent: Array<{ message: { customType: string; content: string; details?: unknown }; options: unknown }> = [];
+  const held: Entry[] = [];
+  let ids = 0;
+  let streaming = false;
+  const entry = (fields: Omit<Entry, "id">): Entry => ({ id: `e${++ids}`, ...fields });
+  const ctx = {
+    mode: "print", hasUI: false,
+    sessionManager: {
+      getBranch: () => branch,
+      buildContextEntries: () => branch.filter((item) => item.type === "custom_message" && !dropped.has(item.id)),
+    },
+    ui: { setWidget() {}, setStatus() {} },
+  } as unknown as ExtensionContext;
+  extension({
+    events: new EventEmitter(),
+    appendEntry(customType: string, data: unknown) { branch.push(entry({ type: "custom", customType, data })); },
+    registerTool(tool: ToolDefinition) { tools.set(tool.name, tool); },
+    registerCommand() {},
+    on(event: string, handler: (event: any, ctx: ExtensionContext) => unknown) { handlers.set(event, handler); },
+    // Like pi: while a run streams, triggerTurn: false holds the message until the turn ends.
+    sendMessage(message: { customType: string; content: string; details?: unknown }, options: unknown) {
+      sent.push({ message, options });
+      const item = entry({ type: "custom_message", customType: message.customType, content: message.content, details: message.details });
+      if (streaming) held.push(item);
+      else branch.push(item);
+    },
+  } as unknown as ExtensionAPI);
+  const session = {
+    ctx, handlers, sent, branch: () => branch,
+    setBranch(next: Entry[]) { branch = next; },
+    setStreaming(value: boolean) { streaming = value; },
+    flush() { branch.push(...held.splice(0)); },
+    planMessages: () => branch.filter((item) => item.customType === PLAN_CONTEXT_TYPE),
+    update: (plan: PlanStepInput[]) => tools.get("update_plan")!.execute("u", { plan }, undefined, undefined, ctx),
+    async run() {
+      const result = await handlers.get("before_agent_start")!({ systemPrompt: "base" }, ctx) as PromptUpdate;
+      if (result?.message) {
+        branch.push(entry({ type: "custom_message", customType: result.message.customType,
+          content: result.message.content, details: result.message.details }));
+      }
+      return result;
+    },
+    /** Compacts the session; `drop` selects the entries the summary replaces. */
+    async compact(drop: (item: Entry) => boolean) {
+      for (const item of branch) if (drop(item)) dropped.add(item.id);
+      const compactionEntry = entry({ type: "compaction" });
+      branch.push(compactionEntry);
+      await handlers.get("session_compact")!({ type: "session_compact", compactionEntry, fromExtension: false,
+        reason: "threshold", willRetry: false }, ctx);
+    },
+  };
+  return session;
+}
+const PLAN_CONTEXT_TYPE = "pi-better-plan-context";
+
+test("compaction inside a run that drops the plan message adds it back once", async () => {
+  const session = compactingSession();
+  await session.handlers.get("session_start")!({}, session.ctx);
+  await session.update([{ step: "Build", status: "in_progress" }]);
+  const first = await session.run();
+  assert.equal(first?.message?.customType, PLAN_CONTEXT_TYPE);
+
+  session.setStreaming(true);
+  await session.compact((item) => item.type === "custom_message");
+  assert.equal(session.sent.length, 1, "the dropped plan message is re-sent");
+  assert.deepEqual(session.sent[0]!.options, { triggerTurn: false });
+  assert.deepEqual(session.sent[0]!.message, first!.message, "the re-sent message matches the dropped one");
+
+  // While the re-sent message waits for the turn to end, neither another compaction nor the start of
+  // the next run adds a second copy.
+  await session.compact(() => false);
+  assert.equal(session.sent.length, 1);
+  const during = await session.run();
+  assert.equal(during?.message, undefined);
+  assert.equal(during?.systemPrompt, first?.systemPrompt, "the system prompt stays byte-stable");
+  session.flush();
+  session.setStreaming(false);
+  assert.equal(session.planMessages().length, 2);
+  assert.equal((await session.run())?.message, undefined, "the restored message is current");
+
+  // Once it has landed, a later compaction that drops it again adds it back again.
+  await session.compact((item) => item.type === "custom_message");
+  assert.equal(session.sent.length, 2);
+  assert.equal(session.planMessages().length, 3, "idle sends land at once");
+});
+
+test("compaction that keeps the plan message sends nothing", async () => {
+  const session = compactingSession();
+  await session.handlers.get("session_start")!({}, session.ctx);
+  await session.compact(() => true);
+  assert.equal(session.sent.length, 0, "no plan and no plan message: nothing to restore");
+
+  await session.update([{ step: "Build", status: "in_progress" }]);
+  await session.run();
+  session.setStreaming(true);
+  await session.compact((item) => item.type !== "custom_message");
+  assert.equal(session.sent.length, 0);
+});
+
+test("compaction that keeps an older plan message sends the current revision", async () => {
+  const session = compactingSession();
+  await session.handlers.get("session_start")!({}, session.ctx);
+  await session.update([{ step: "Build", status: "in_progress" }]);
+  await session.run();
+  await session.update([{ step: "Build", status: "completed" }, { step: "Ship", status: "in_progress" }]);
+  const latest = await session.run();
+  const [older] = session.planMessages();
+  await session.compact((item) => item.type === "custom_message" && item.id !== older!.id);
+  assert.equal(session.sent.length, 1);
+  assert.deepEqual(session.sent[0]!.message, latest!.message);
+});
+
+test("a branch or fork without the current plan message gets it at the next run", async () => {
+  const session = compactingSession();
+  await session.handlers.get("session_start")!({}, session.ctx);
+  await session.update([{ step: "Build", status: "in_progress" }]);
+  const first = await session.run();
+  const withPlanMessage = [...session.branch()];
+  assert.equal((await session.run())?.message, undefined);
+
+  // Navigate to the point before the plan message: the plan state is there, its message is not.
+  session.setBranch(withPlanMessage.filter((item) => item.type !== "custom_message"));
+  await session.handlers.get("session_tree")!({}, session.ctx);
+  const branched = await session.run();
+  assert.deepEqual(branched?.message, first?.message);
+  assert.equal(branched?.systemPrompt, first?.systemPrompt);
+
+  session.setBranch(withPlanMessage.filter((item) => item.type !== "custom_message"));
+  await session.handlers.get("session_start")!({ reason: "fork" }, session.ctx);
+  assert.deepEqual((await session.run())?.message, first?.message);
+  assert.equal((await session.run())?.message, undefined);
+});
