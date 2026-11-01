@@ -175,4 +175,50 @@ describe("catalog load failures", { concurrency: false }, () => {
         assert.equal(prepared.status, "blocked");
         assert.match(prepared.message, /payments\.md/);
     });
+
+    function roleInheritanceFixture(t, { projectRole = false } = {}) {
+        setConfigForTests({ defaultModel: null, tierPolicy: null, maxConcurrent: 4 });
+        t.after(() => setConfigForTests(undefined));
+        const userRoot = mkdtempSync(join(root, "user-"));
+        const cwd = mkdtempSync(join(root, "proj-"));
+        const userRoles = join(userRoot, "agents", "roles");
+        mkdirSync(userRoles, { recursive: true });
+        // Meant to override the shipped developer role; its id cannot be read.
+        writeFileSync(join(userRoles, "my-developer.md"), "---\nschema: [unclosed\n---\nbody\n");
+        const projectAgents = join(cwd, ".pi", "agents", "agents");
+        mkdirSync(projectAgents, { recursive: true });
+        writeFileSync(join(projectAgents, "payments.md"),
+            "---\nschema: pi-agent/v1\nkind: agent\nid: agent.payments\nname: Payments\nroleId: role.developer\ninstructions:\n  mode: add\n---\nPayments work.\n");
+        if (projectRole) {
+            const projectRoles = join(cwd, ".pi", "agents", "roles");
+            mkdirSync(projectRoles, { recursive: true });
+            writeFileSync(join(projectRoles, "developer.md"),
+                "---\nschema: pi-agent/v1\nkind: role\nid: role.developer\nname: Project Developer\ndefaults:\n  model: openai/gpt-6.1-sol\n---\nProject developer.\n");
+        }
+        return {
+            cwd,
+            projectTrusted: true,
+            userRoot,
+            projectConfigDirName: ".pi",
+            hasUI: false,
+            foregroundModel: "openai/gpt-6-luna",
+            configuredDefaultModel: null,
+            registry: { getAvailable: () => [model("openai", "gpt-6.1-sol"), model("openai", "gpt-6-luna")], find: () => undefined },
+        };
+    }
+
+    it("blocks a project agent whose inherited role resolves below a broken personal file", async (t) => {
+        const host = roleInheritanceFixture(t);
+        const snapshot = loadLaunchSnapshot(host);
+        const prepared = await prepareCatalogJob(snapshot, { prompt: "Build.", agent: "agent.payments" }, host);
+        assert.equal(prepared.status, "blocked", "the shipped role must not launch while a personal role file is broken");
+        assert.match(prepared.message, /my-developer\.md/);
+        assert.match(prepared.message, /No child was started/);
+    });
+
+    it("does not block a project agent and project role on a lower-ranked broken personal file", async (t) => {
+        const host = roleInheritanceFixture(t, { projectRole: true });
+        const prepared = await prepareCatalogJob(loadLaunchSnapshot(host), { prompt: "Build.", agent: "agent.payments" }, host);
+        assert.equal(prepared.status, "ready", prepared.message);
+    });
 });
