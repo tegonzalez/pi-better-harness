@@ -358,7 +358,7 @@ at load time and block launches (fail closed). Path entries are absolute, `~/…
 | `hardening.hostname` | The hostname inside the sandbox when `uts` is on: 1-64 letters, digits, dots or hyphens. | `sandbox` |
 | `hardening.userns` | The confined child cannot create user namespaces (`--unshare-user --uid <uid> --gid <gid> --disable-userns`; the launching user's ids are mapped to themselves, so file ownership and git behave as before; `unshare(CLONE_NEWUSER)` fails with `ENOSPC`). | `true` |
 | `hardening.keyring` | `keyctl`, `add_key` and `request_key` fail with `EPERM` (a seccomp filter generated in `sandbox-core`, passed to bubblewrap with `--seccomp`; x86_64 and aarch64 only, any other architecture makes the measure unavailable). | `true` |
-| `hardening.fds` | The confined child inherits only descriptors 0, 1 and 2 (plus the filter's own, which bubblewrap closes after loading it): the launcher closes every other inherited descriptor before bubblewrap starts. | `true` |
+| `hardening.fds` | The confined child inherits only descriptors 0, 1 and 2 (the filter's own descriptor, 9, exists only until bubblewrap has loaded the program: it closes it before it runs the command, so the command never sees it): the launcher closes every other inherited descriptor before bubblewrap starts. | `true` |
 | `resources.command.memoryMax` | Memory cap of each confined launch (`MemoryMax=` of its systemd user scope). A size string: a decimal integer with an optional `K`, `M`, `G` or `T` suffix, powers of 1024, for example `"512M"`; greater than zero. The kernel kills what exceeds it inside the scope. | unset |
 | `resources.command.memorySwapMax` | Swap cap (`MemorySwapMax=`). A size string as above; `"0"` forbids swap. | unset |
 | `resources.command.tasksMax` | Cap on processes and threads (`TasksMax=`): a positive integer. Counts every task of the launch, including bubblewrap and its init, so allow a few more than the command itself needs. | unset |
@@ -438,6 +438,7 @@ covered: their `config`, `hooks` and `.git` are ordinary writable files, and a h
 The sandbox also gets `--clearenv` (only `env.allow` names, taken from the launching process when each
 command is built, reach the child; the task runtime's own env passthrough is filtered the same way),
 `--unshare-pid` (the child cannot signal host processes; `/proc` is not mounted) and `--new-session`.
+Approved tools whose real path is under a writable root are refused (the agent could replace them).
 
 #### Hardening of every confined launch
 
@@ -451,14 +452,14 @@ nothing else. Unknown `hardening` keys are refused at load time, and the switche
 | Private hostname | `uts`, `hostname` | `--unshare-uts --hostname <name>` (default name `sandbox`) |
 | No nested user namespaces | `userns` | `--unshare-user --uid <uid> --gid <gid> --disable-userns` |
 | No kernel keyring | `keyring` | `--seccomp <fd>` with a classic-BPF program generated in `sandbox-core` (`keyringSeccompProgram`): it checks `seccomp_data.arch`, denies `keyctl`, `add_key` and `request_key` with `EPERM` on x86_64 and aarch64, allows every other call, and kills a process that uses any other ABI (x32, 32-bit compat) |
-| Only stdio inherited | `fds` | a launcher script, in a private per-user directory outside every writable root, that closes every descriptor above 2 and opens the seccomp program on descriptor 9 before it `exec`s bubblewrap |
+| Only stdio inherited | `fds` | a launcher script, in a private per-user directory outside every writable root, that closes every descriptor above 2 and opens the seccomp program on descriptor 9 before it `exec`s bubblewrap; bubblewrap reads the program and closes descriptor 9 before it runs the command |
 
-The launcher takes bubblewrap's own arguments, so `command.file` is the launcher (not `bwrap`) only when `fds` or
-`keyring` is on; with every switch off the launch is exactly the pre-hardening one. **A measure that is on but cannot be
+The launcher takes bubblewrap's own arguments, so `command.file` is the launcher (not `bwrap`) when `fds` or
+`keyring` is on, and also whenever `resources.command` is set (the launcher starts the resource scope, see below);
+with every switch off and no `resources.command` the launch is exactly the pre-hardening one. **A measure that is on but cannot be
 applied fails the launch closed** and is reported as unavailable with its reason: a bubblewrap without the needed flag,
 a CPU architecture the seccomp program does not cover, no `/proc/self/fd`, or no usable directory for the launcher. The
 remedy is to fix the cause or switch that one measure off in the policy.
-Approved tools whose real path is under a writable root are refused (the agent could replace them).
 
 #### Resource limits
 
@@ -482,6 +483,11 @@ site decisions; the package ships none. The examples below are placeholders.
   controller of each configured limit is present before bubblewrap starts (memory for `memoryMax` and `memorySwapMax`,
   pids for `tasksMax`, cpu for `cpuQuota`; `runtimeMaxSec` needs none). Memory used by the private `/tmp` tmpfs counts
   against `memoryMax`.
+- **Inside a remote pi.** If this policy is also the policy of a remote subagent whose target sets
+  `resources.session` (see the pi-better-subagents remote documentation), a confined launch of that remote pi starts
+  its own `systemd-run --user --scope`, and systemd places that scope beside the session scope, not below it. Such a
+  launch is therefore bounded by `resources.command`, not by the session scope's limits (the remote pi and its
+  unconfined children still are). Set `resources.command` as well when confined launches need a bound.
 - **`resources.tmpSize`**: sizes the private `/tmp` only; it needs no user manager and starts no scope. It does not limit
   writable roots, which never have a quota.
 - **Fails closed.** A configured limit that cannot be applied makes the plan inactive and every launch refuses to run,
@@ -534,7 +540,8 @@ The owner can check what a confined worker can read and write from a separate pi
 
    Main must be enabled with Outside project = Off in that agent dir (the same permissions the worker uses).
 2. `/sandbox workspace` (also the first block of `/sandbox diagnostics confinement`) shows the working folder, agent
-   dir, policy path, `policyHash` and `planHash`, whether the confinement is `active`, and each hardening measure as
+   dir, policy path, `policyHash` and `planHash`, whether the confinement is `active` or `failed` (a hardening measure or resource limit that is on but unavailable;
+   every launch then fails closed, and the reason is shown), and each hardening measure as
    `on`, `off by policy` or `unavailable` with its reason, and each configured resource limit as `on` or `unavailable`.
 3. `/sandbox check <path>` reports read, write and exec for a path with the reason (the mount that grants it, or
    "not mounted"). It uses the same evaluator as the in-process tools, whose allow set is the kernel mount plan. Relative
@@ -582,6 +589,9 @@ The owner can check what a confined worker can read and write from a separate pi
 - Planning is synchronous and bounded (`maxWalkEntries`, `maxWalkMs`); it runs at session start.
 - Secret detection is pattern-based; it reduces, not eliminates, the chance that a bound config holds a secret.
 - The synthetic `PATH` only constrains lookups by name; this mode is a read boundary, not a command allowlist.
+- The keyring filter kills a process that uses another system-call ABI than the native one: an x32 or 32-bit
+  (compat) binary run inside a confined launch is killed on its first system call while `hardening.keyring` is on.
+  Switch that measure off for such a tool.
 - bubblewrap is a mount/namespace boundary, not a general resource policy. The IPC namespace, hostname, nested user
   namespaces, kernel keyring and inherited descriptors are private or closed by default (the `hardening` switches), and
   CPU, memory, process count, run time and the private `/tmp` size are bounded when the policy sets `resources`; with
@@ -848,6 +858,13 @@ unprotected:
   (`failed`). Relaunch Pi from the directory you are actually working in, or
   turn the sandbox off on purpose.
 - A backend that was selected but failed to start. It is never retried directly.
+- A read-confinement plan that cannot be applied as configured: a hardening measure that is on but unavailable
+  (for example a bubblewrap without a needed flag, or an unsupported CPU architecture for the keyring filter), or a
+  `resources` limit that cannot be applied (no reachable systemd user manager, a missing controller, a bubblewrap
+  without `--size`). The plan is then inactive (`confinement` reads `failed`, the audit entry's `reason` names the
+  cause) and every confined launch is refused, never run without the measure or limit. Fix the cause, or switch the
+  measure off or remove the limit in the policy (see [Hardening](#hardening-of-every-confined-launch) and
+  [Resource limits](#resource-limits)).
 
 ## Paths, symlinks and denied files
 
