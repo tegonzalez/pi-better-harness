@@ -1642,11 +1642,12 @@ const SCOPE_STOP_TIMEOUT_SEC = 5;
  * transient user scope with `limits`. `--quiet` keeps the scope notice off stderr and `--collect` unloads
  * the scope even when the kernel killed it.
  */
-export function resourceScopeArguments(limits: CommandLimits): string[] {
+export function resourceScopeArguments(limits: CommandLimits, options: { stopGrace?: boolean } = {}): string[] {
     const args = ["--user", "--scope", "--quiet", "--collect", "--no-ask-password"];
     for (const property of commandLimitProperties(limits)) args.push("-p", property);
-    // Only a time limit ends a scope by itself; the grace period bounds how long the end takes.
-    if (limits.runtimeMaxSec !== undefined) args.push("-p", `TimeoutStopSec=${SCOPE_STOP_TIMEOUT_SEC}`);
+    // Only a time limit ends a scope by itself; the grace period bounds how long the end takes. A caller that
+    // wants the scope to carry exactly the configured properties (a remote session) passes `stopGrace: false`.
+    if (limits.runtimeMaxSec !== undefined && options.stopGrace !== false) args.push("-p", `TimeoutStopSec=${SCOPE_STOP_TIMEOUT_SEC}`);
     return args;
 }
 
@@ -1655,18 +1656,18 @@ export function resourceScopeArguments(limits: CommandLimits): string[] {
  * limits need (the cgroup control files exist). It ends with `exec "$@"`, so the scoped command follows as
  * the script's arguments. Used for the launch itself and for the availability probe.
  */
-export function resourceScopeCheckScript(limits: CommandLimits, finalStep: 'exec "$@"' | "exit 0" = 'exec "$@"'): string {
+export function resourceScopeCheckScript(limits: CommandLimits, finalStep: 'exec "$@"' | "exit 0" = 'exec "$@"', subject = "confined launch"): string {
     const lines = [
         "cg=",
         'while IFS= read -r line; do case $line in 0::*) cg=${line#0::} ;; esac; done < /proc/self/cgroup',
-        '[ -n "$cg" ] || { echo "confined launch refused: the scope\'s cgroup is unknown, so the resource limits cannot be confirmed" >&2; exit 126; }',
+        `[ -n "$cg" ] || { echo "${subject} refused: the scope's cgroup is unknown, so the resource limits cannot be confirmed" >&2; exit 126; }`,
     ];
     const seen = new Set<string>();
     for (const key of COMMAND_LIMIT_KEYS) {
         const needs = COMMAND_LIMIT_CONTROLLERS[key];
         if (limits[key] === undefined || !needs || seen.has(needs.file)) continue;
         seen.add(needs.file);
-        lines.push(`[ -e "/sys/fs/cgroup$cg/${needs.file}" ] || { echo "confined launch refused: the ${needs.controller} controller is not delegated to the scope, so ${key} cannot be applied" >&2; exit 126; }`);
+        lines.push(`[ -e "/sys/fs/cgroup$cg/${needs.file}" ] || { echo "${subject} refused: the ${needs.controller} controller is not delegated to the scope, so ${key} cannot be applied" >&2; exit 126; }`);
     }
     lines.push(finalStep);
     return lines.join("\n");
