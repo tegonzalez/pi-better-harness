@@ -32,7 +32,19 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
-import { broadCredentialPaths, RUNTIME_ROOTS, type ReadConfinementMounts } from "./shared-sandbox-core.ts";
+import {
+    broadCredentialPaths,
+    bubblewrapExecutable,
+    hardeningStates,
+    HARDENING_MEASURES,
+    resolveHardening,
+    RUNTIME_ROOTS,
+    type HardeningState,
+    type HardeningSwitches,
+    type ReadConfinementMounts,
+    type ResolvedHardening,
+    type SandboxSeams,
+} from "./shared-sandbox-core.ts";
 
 // ---------------------------------------------------------------------------
 // Policy schema
@@ -77,6 +89,13 @@ export type ReadConfinementPolicy = {
     caches?: { persistentDir?: string };
     /** Where the synthetic PATH directory appears inside the sandbox. */
     syntheticPathMount?: string;
+    /**
+     * Confined-launch hardening. Every boolean defaults to `true`; `false` removes exactly that measure.
+     * `ipc`: private SysV/POSIX IPC. `uts`: private hostname (`hostname`, default "sandbox").
+     * `userns`: no user namespaces inside. `keyring`: keyctl/add_key/request_key denied by a seccomp
+     * filter. `fds`: only descriptors 0-2 (and the filter's own) survive into the child.
+     */
+    hardening?: HardeningSwitches;
 };
 
 const DEFAULT_LIMITS = { maxSymlinks: 2000, maxDepth: 8, maxWalkEntries: 200_000, maxBinds: 500, maxWalkMs: 15_000, minPrefixDepth: 3 };
@@ -162,7 +181,7 @@ function compilePattern(pattern: string, path: string): RegExp {
 
 /** Strictly validate a policy document; unknown keys and malformed values fail closed. */
 export function parseReadConfinementPolicy(value: unknown): ReadConfinementPolicy {
-    const root = checkKeys(value, "$", ["version", "limits", "walkSkipDirNames", "deny", "tools", "secretDetector", "caches", "syntheticPathMount", "env", "readOnly"]);
+    const root = checkKeys(value, "$", ["version", "limits", "walkSkipDirNames", "deny", "tools", "secretDetector", "caches", "syntheticPathMount", "env", "readOnly", "hardening"]);
     if (root.version !== 1) fail("$.version", "must be 1");
     const policy: ReadConfinementPolicy = { version: 1 };
     if (root.limits !== undefined) {
@@ -265,6 +284,20 @@ export function parseReadConfinementPolicy(value: unknown): ReadConfinementPolic
         allow?.forEach((name, i) => { if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) fail(`$.env.allow[${i}]`, "expected an environment variable name"); });
         policy.env = allow ? { allow } : {};
     }
+    if (root.hardening !== undefined) {
+        const h = checkKeys(root.hardening, "$.hardening", [...HARDENING_MEASURES, "hostname"]);
+        policy.hardening = {};
+        for (const measure of HARDENING_MEASURES) {
+            const value = boolean(h[measure], `$.hardening.${measure}`);
+            if (value !== undefined) policy.hardening[measure] = value;
+        }
+        if (h.hostname !== undefined) {
+            if (typeof h.hostname !== "string" || !/^[A-Za-z0-9]([A-Za-z0-9.-]{0,62}[A-Za-z0-9])?$/.test(h.hostname)) {
+                fail("$.hardening.hostname", "expected a host name: 1-64 letters, digits, dots or hyphens, starting and ending with a letter or digit");
+            }
+            policy.hardening.hostname = h.hostname;
+        }
+    }
     return policy;
 }
 
@@ -310,7 +343,12 @@ export type ReadConfinementSeams = {
     agentId?: string;
     /** Further directories some active profile can write; the policy file must not be inside any of them. */
     extraWritableRoots?: readonly string[];
+    /** Where the hardening measures are checked against bubblewrap (executable lookup, `--help` text, architecture). */
+    hardening?: Pick<SandboxSeams, "lookupExecutable" | "bwrapHelp" | "arch">;
 };
+
+/** The state of each confined-launch hardening measure, as recorded in the audit. */
+export type ReadConfinementHardeningAudit = { readonly [measure in (typeof HARDENING_MEASURES)[number]]: HardeningState } & { readonly hostname: string };
 
 export type ReadConfinementAudit = {
     version: 1;
@@ -330,9 +368,12 @@ export type ReadConfinementAudit = {
     envAllow: string[];
     /** Paths inside writable git dirs that stay write-denied (hooks, config, alternates, sibling worktrees, ...). */
     denyWrite: string[];
+    /** Per measure: `on`, `off` (by policy) or `unavailable` with its reason (the launch then fails closed). */
+    hardening: ReadConfinementHardeningAudit;
 };
 
 export type ReadConfinementPlan = ReadConfinementMounts & {
+    hardening: ResolvedHardening;
     audit: ReadConfinementAudit;
     /** Stable digest of the audit. */
     hash: string;
@@ -1120,6 +1161,9 @@ export function planReadConfinement(
     // Other allowlisted names are copied from the launching process when each command is built
     // (see `sandbox-core`), so per-command values such as TERM or TMPDIR stay current.
 
+    const hardening = resolveHardening(policy.hardening);
+    const hardeningSeams: SandboxSeams = { ...(seams.hardening ?? {}), env };
+    const hardeningBwrap = bubblewrapExecutable(hardeningSeams);
     const readRoots = [...new Set([project, ...cacheSources, ...entries.filter((b) => b.mode !== "tmpfs" && !b.source).map((b) => b.path)])].sort();
     const audit: ReadConfinementAudit = {
         version: 1,
@@ -1137,6 +1181,7 @@ export function planReadConfinement(
         symlinksFollowed,
         envAllow,
         denyWrite: [...denyWriteSet].sort(),
+        hardening: { ...hardeningStates(hardening, hardeningBwrap, hardeningSeams), hostname: hardening.hostname },
     };
     return {
         args,
@@ -1150,6 +1195,7 @@ export function planReadConfinement(
         project,
         envAllow,
         pathValue,
+        hardening,
         hash: createHash("sha256").update(JSON.stringify(audit)).digest("hex"),
         syntheticDir,
     };
@@ -1166,8 +1212,18 @@ export function formatReadConfinementAudit(audit: ReadConfinementAudit, hash?: s
     if (audit.symlinkMounts.length) lines.push(`  symlink mounts (${audit.symlinkMounts.length}):`, ...audit.symlinkMounts.map((s) => `    ${s.path} -> ${s.text}`));
     if (audit.denied.length) lines.push(`  denied (${audit.denied.length}):`, ...audit.denied.map((d) => `    ${d.path} — ${d.reason}${d.via ? ` (via ${d.via})` : ""}`));
     if (audit.skipped.length) lines.push(`  skipped (${audit.skipped.length}):`, ...audit.skipped.map((d) => `    ${d.path} — ${d.reason}${d.via ? ` (via ${d.via})` : ""}`));
+    lines.push(...formatHardening(audit.hardening).map((line) => `  ${line}`));
     lines.push(audit.syntheticPath
         ? `  PATH ${audit.syntheticPath.mount}: ${audit.syntheticPath.tools.map((t) => t.name + (t.implicit ? "*" : "")).join(" ")} (* = needed interpreter)`
         : "  PATH: empty (no approved tools)");
     return lines.join("\n");
+}
+
+/** One line per hardening measure: on, off by policy, or unavailable with its reason. */
+export function formatHardening(hardening: ReadConfinementHardeningAudit): string[] {
+    return ["hardening:", ...HARDENING_MEASURES.map((measure) => {
+        const state = hardening[measure];
+        const text = state.state === "on" ? "on" : state.state === "off" ? "off by policy" : `unavailable (inactive, launches fail closed) — ${state.reason}`;
+        return `  ${measure}: ${text}${measure === "uts" && state.state === "on" ? ` (hostname ${hardening.hostname})` : ""}`;
+    })];
 }

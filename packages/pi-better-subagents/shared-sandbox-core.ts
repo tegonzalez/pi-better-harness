@@ -19,7 +19,8 @@
  */
 
 import { spawn, spawnSync } from "node:child_process";
-import { platform as osPlatform } from "node:os";
+import { createHash } from "node:crypto";
+import { platform as osPlatform, tmpdir } from "node:os";
 import {
     accessSync,
     closeSync,
@@ -29,9 +30,12 @@ import {
     mkdirSync,
     openSync,
     readdirSync,
+    readFileSync,
     readlinkSync,
     realpathSync,
+    renameSync,
     statSync,
+    unlinkSync,
     writeFileSync,
 } from "node:fs";
 import { basename, delimiter, dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
@@ -97,7 +101,43 @@ export type ReadConfinementMounts = {
      * below that file (`.git/hooks`) names the same thing in each of those dirs, so it is mapped there when compiled.
      */
     gitFile?: { readonly path: string; readonly dirs: readonly string[] };
+    /**
+     * Confined-launch hardening (see `resolveHardening`). Absent means every measure is on with the default
+     * hostname, so a plan that predates the switches is hardened rather than silently weaker.
+     */
+    hardening?: ResolvedHardening;
 };
+
+/** The hardening measures a confined launch applies, each with its own policy switch. */
+export const HARDENING_MEASURES = ["ipc", "uts", "userns", "keyring", "fds"] as const;
+export type HardeningMeasure = (typeof HARDENING_MEASURES)[number];
+
+/** Hostname inside a confined launch when the policy names none. A fixed, generic value. */
+export const DEFAULT_HARDENING_HOSTNAME = "sandbox";
+
+/** The policy's `hardening` object as written: every key optional. */
+export type HardeningSwitches = { [measure in HardeningMeasure]?: boolean } & { hostname?: string };
+
+/** The effective hardening of a confined launch: every switch decided, the hostname named. */
+export type ResolvedHardening = { readonly [measure in HardeningMeasure]: boolean } & { readonly hostname: string };
+
+/** Whether one measure is applied, switched off by the policy, or could not be applied (the launch then fails closed). */
+export type HardeningState =
+    | { readonly state: "on" }
+    | { readonly state: "off" }
+    | { readonly state: "unavailable"; readonly reason: string };
+
+/** Every measure is on unless the policy switches it off. */
+export function resolveHardening(switches?: HardeningSwitches): ResolvedHardening {
+    return Object.freeze({
+        ipc: switches?.ipc ?? true,
+        uts: switches?.uts ?? true,
+        userns: switches?.userns ?? true,
+        keyring: switches?.keyring ?? true,
+        fds: switches?.fds ?? true,
+        hostname: switches?.hostname ?? DEFAULT_HARDENING_HOSTNAME,
+    });
+}
 
 /** Environment variable naming the read-confinement policy file. Its presence means a profile requires confinement. */
 export const READ_CONFINEMENT_POLICY_ENV = "PI_SANDBOX_READ_CONFINEMENT_POLICY";
@@ -268,6 +308,10 @@ export type SandboxSeams = {
     makeDirectory?: (path: string) => void;
     /** Broad-write Linux planning: empty mode-000 mask sources. */
     maskSources?: (profilePath: string) => { directory: string; file: string };
+    /** Confined-launch hardening: the text of `bwrap --help` (defaults to running it once per executable). */
+    bwrapHelp?: (bwrap: string) => string | undefined;
+    /** Confined-launch hardening: the CPU architecture (defaults to `process.arch`). */
+    arch?: string;
 };
 
 /** A policy with every path canonicalized, deduplicated, and ordered. */
@@ -515,6 +559,7 @@ function compile(
                 ...(readConfinement.denyRemove && { denyRemove: [...new Set(readConfinement.denyRemove.map((path) => canonicalizePath(path, seams)))].sort() }),
                 ...(readConfinement.overlayArgs && { overlayArgs: [...readConfinement.overlayArgs] }),
                 ...(readConfinement.gitFile && { gitFile: { path: readConfinement.gitFile.path, dirs: [...readConfinement.gitFile.dirs] } }),
+                ...(readConfinement.hardening && { hardening: { ...readConfinement.hardening } }),
             },
         }),
         ...(policy.permissions && {
@@ -1278,6 +1323,338 @@ function buildLinuxSandboxCommand(
     };
 }
 
+// ---------------------------------------------------------------------------
+// Confined-launch hardening
+// ---------------------------------------------------------------------------
+//
+// Every confined launch (Linux, a read-confinement plan, Outside project = Off)
+// additionally gets, each behind its own policy switch (`hardening` in the
+// read-confinement policy, all default on):
+//
+//   ipc      private SysV/POSIX IPC namespace             bwrap --unshare-ipc
+//   uts      private hostname                              bwrap --unshare-uts --hostname
+//   userns   no nested user namespaces                     bwrap --unshare-user --uid --gid --disable-userns
+//   keyring  keyctl/add_key/request_key denied (EPERM)     bwrap --seccomp FD, a classic-BPF program built below
+//   fds      only descriptors 0-2 (and the filter's own)   a launcher that closes every other inherited descriptor
+//
+// A measure that is on but cannot be applied (an older bubblewrap, an
+// architecture without a syscall table, no way to place the launcher) fails the
+// launch closed with the reason. It is never silently dropped.
+
+const HARDENING_FLAGS: Readonly<Record<HardeningMeasure, readonly string[]>> = {
+    ipc: ["--unshare-ipc"],
+    uts: ["--unshare-uts", "--hostname"],
+    userns: ["--unshare-user", "--uid", "--gid", "--disable-userns"],
+    keyring: ["--seccomp"],
+    fds: [],
+};
+
+/** Descriptor the launcher hands the seccomp program to bubblewrap on. Everything else above 2 is closed. */
+const SECCOMP_FD = 9;
+
+const bwrapHelpCache = new Map<string, string>();
+
+function bwrapHelpText(bwrap: string, seams: SandboxSeams): string | undefined {
+    if (seams.bwrapHelp) return seams.bwrapHelp(bwrap);
+    const cached = bwrapHelpCache.get(bwrap);
+    if (cached !== undefined) return cached;
+    const result = spawnSync(bwrap, ["--help"], { encoding: "utf8", env: {}, timeout: 10_000 });
+    if (result.error) return undefined;
+    const text = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+    if (!text.includes("--unshare-pid")) return undefined;
+    bwrapHelpCache.set(bwrap, text);
+    return text;
+}
+
+/**
+ * Architectures the keyring filter has a syscall table for. A filter for any other architecture would deny
+ * nothing (or everything), so the measure is unavailable there instead.
+ */
+const KEYRING_FILTER_ARCHITECTURES: readonly string[] = ["x64", "arm64"];
+
+/** Why the keyring filter cannot be applied on this CPU, or undefined when it can. */
+function keyringFilterGap(seams: SandboxSeams): string | undefined {
+    const arch = seams.arch ?? process.arch;
+    if (!KEYRING_FILTER_ARCHITECTURES.includes(arch)) return `no keyring syscall table for CPU architecture ${arch} (supported: x86_64, aarch64)`;
+    if (endianness() !== "LE") return "the seccomp program is only generated for little-endian CPUs";
+    return undefined;
+}
+
+/**
+ * The state of each measure for one bubblewrap executable. `bwrap` is undefined when none is available.
+ * Pure of side effects except the one cached `bwrap --help` read.
+ */
+export function hardeningStates(
+    hardening: ResolvedHardening,
+    bwrap: string | undefined,
+    seams: SandboxSeams = {},
+): Record<HardeningMeasure, HardeningState> {
+    const help = bwrap ? bwrapHelpText(bwrap, seams) : undefined;
+    const states = {} as Record<HardeningMeasure, HardeningState>;
+    for (const measure of HARDENING_MEASURES) {
+        if (!hardening[measure]) { states[measure] = { state: "off" }; continue; }
+        const unavailable = (reason: string): HardeningState => ({ state: "unavailable", reason });
+        if (!bwrap) { states[measure] = unavailable("bubblewrap was not found"); continue; }
+        const missing = HARDENING_FLAGS[measure].find((flag) => help === undefined || !new RegExp(`(^|\\s)${flag}(\\s|$)`, "m").test(help));
+        if (missing !== undefined) {
+            states[measure] = unavailable(help === undefined
+                ? `cannot read the option list of ${bwrap} (--help)`
+                : `bubblewrap ${missing} is not supported by ${bwrap}; use a newer bubblewrap`);
+            continue;
+        }
+        if (measure === "userns" && (process.getuid === undefined || process.getgid === undefined)) {
+            states[measure] = unavailable("the current user and group ids are not available to map");
+            continue;
+        }
+        if (measure === "keyring") {
+            const gap = keyringFilterGap(seams);
+            if (gap) { states[measure] = unavailable(gap); continue; }
+        }
+        if (measure === "fds" && (!existsSync("/proc/self/fd") || !systemSandboxExecutable("sh"))) {
+            states[measure] = unavailable("closing inherited descriptors needs /proc/self/fd and a system sh");
+            continue;
+        }
+        states[measure] = { state: "on" };
+    }
+    return states;
+}
+
+function endianness(): "LE" | "BE" {
+    return new Uint8Array(new Uint16Array([1]).buffer)[0] === 1 ? "LE" : "BE";
+}
+
+// ---- the keyring seccomp program -------------------------------------------
+
+// Classic BPF (struct sock_filter { u16 code; u8 jt; u8 jf; u32 k }), little-endian.
+const BPF_LD_W_ABS = 0x20;
+const BPF_JEQ_K = 0x15;
+const BPF_JSET_K = 0x45;
+const BPF_RET_K = 0x06;
+const SECCOMP_DATA_NR = 0;
+const SECCOMP_DATA_ARCH = 4;
+const AUDIT_ARCH_X86_64 = 0xc000003e;
+const AUDIT_ARCH_AARCH64 = 0xc00000b7;
+const X32_SYSCALL_BIT = 0x40000000;
+const SECCOMP_RET_ALLOW = 0x7fff0000;
+const SECCOMP_RET_KILL_PROCESS = 0x80000000;
+const SECCOMP_RET_ERRNO = 0x00050000;
+const EPERM = 1;
+
+/** The kernel-keyring system calls: add_key, request_key, keyctl. */
+export const KEYRING_SYSCALLS: Readonly<Record<"x86_64" | "aarch64", Readonly<Record<"add_key" | "request_key" | "keyctl", number>>>> = Object.freeze({
+    x86_64: Object.freeze({ add_key: 248, request_key: 249, keyctl: 250 }),
+    aarch64: Object.freeze({ add_key: 217, request_key: 218, keyctl: 219 }),
+});
+
+type BpfInstruction = { code: number; k: number; jt?: string; jf?: string; label?: string };
+
+/**
+ * The seccomp filter that denies the keyring system calls with EPERM and allows everything else.
+ *
+ * Both supported ABIs are in one program so it does not depend on the building host: x86_64 (its x32 ABI
+ * and any other architecture, including 32-bit compat, are killed rather than left a way around the
+ * filter) and aarch64. Generated here, with no library, because the filter has three syscall numbers and
+ * a fixed shape; `KEYRING_SYSCALLS` is the table a reader checks it against.
+ */
+export function keyringSeccompProgram(): Buffer {
+    const x86 = Object.values(KEYRING_SYSCALLS.x86_64);
+    const a64 = Object.values(KEYRING_SYSCALLS.aarch64);
+    const program: BpfInstruction[] = [
+        { code: BPF_LD_W_ABS, k: SECCOMP_DATA_ARCH },
+        { code: BPF_JEQ_K, k: AUDIT_ARCH_X86_64, jt: "x86", jf: "next" },
+        { code: BPF_JEQ_K, k: AUDIT_ARCH_AARCH64, jt: "a64", jf: "kill" },
+        // Classic BPF only jumps forward, so the two failure outcomes sit at the end.
+        { code: BPF_LD_W_ABS, k: SECCOMP_DATA_NR, label: "x86" },
+        { code: BPF_JSET_K, k: X32_SYSCALL_BIT, jt: "kill", jf: "next" },
+        ...x86.map((nr): BpfInstruction => ({ code: BPF_JEQ_K, k: nr, jt: "deny", jf: "next" })),
+        { code: BPF_RET_K, k: SECCOMP_RET_ALLOW },
+        { code: BPF_LD_W_ABS, k: SECCOMP_DATA_NR, label: "a64" },
+        ...a64.map((nr): BpfInstruction => ({ code: BPF_JEQ_K, k: nr, jt: "deny", jf: "next" })),
+        { code: BPF_RET_K, k: SECCOMP_RET_ALLOW },
+        { code: BPF_RET_K, k: SECCOMP_RET_ERRNO | EPERM, label: "deny" },
+        { code: BPF_RET_K, k: SECCOMP_RET_KILL_PROCESS, label: "kill" },
+    ];
+    const labels = new Map<string, number>();
+    program.forEach((instruction, index) => { if (instruction.label) labels.set(instruction.label, index); });
+    const out = Buffer.alloc(program.length * 8);
+    program.forEach((instruction, index) => {
+        const target = (name: string | undefined): number => {
+            if (name === undefined) return 0;
+            const to = name === "next" ? index + 1 : labels.get(name);
+            if (to === undefined || to <= index || to - index - 1 > 255) throw new Error(`Invalid seccomp jump ${name} at ${index}`);
+            return to - index - 1;
+        };
+        out.writeUInt16LE(instruction.code, index * 8);
+        out.writeUInt8(target(instruction.jt), index * 8 + 2);
+        out.writeUInt8(target(instruction.jf), index * 8 + 3);
+        out.writeUInt32LE(instruction.k >>> 0, index * 8 + 4);
+    });
+    return out;
+}
+
+// ---- the launcher ----------------------------------------------------------
+
+function shellQuote(value: string): string {
+    return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+/** What the launcher does before it becomes bubblewrap. */
+export type ConfinedLauncherSpec = {
+    /** The bubblewrap executable it finally execs. */
+    bwrap: string;
+    /** Close every descriptor above 2 it inherited. */
+    closeDescriptors: boolean;
+    /** Seccomp program file to open read-only on `SECCOMP_FD` for `--seccomp`. */
+    seccompProgram?: Buffer;
+    /**
+     * Wrapper argv placed in front of bubblewrap (for example a transient resource scope). It runs after
+     * the descriptors are closed and the program is open, and `bwrap` and its arguments follow it.
+     */
+    prefix?: readonly string[];
+};
+
+/**
+ * The launcher script. `fileArgs` of the confined command stay bubblewrap's own, so a launcher is a drop-in
+ * for the `bwrap` executable: it closes inherited descriptors, opens the seccomp program on `SECCOMP_FD`,
+ * and execs `[prefix...] bwrap "$@"`.
+ *
+ * The work happens in a `-c` shell so that no script descriptor is open while descriptors are closed. When
+ * bash is available it closes any descriptor; a plain POSIX shell can only name descriptors 0-9, so a leaked
+ * higher one makes the launch fail closed instead.
+ */
+function confinedLauncherScript(spec: ConfinedLauncherSpec, programPath: string | undefined, bash: string | undefined, sh: string): string {
+    const body: string[] = [];
+    if (spec.closeDescriptors) {
+        body.push(
+            '[ -d /proc/self/fd ] || { echo "confined launch refused: /proc/self/fd is not readable, so inherited descriptors cannot be closed" >&2; exit 126; }',
+            "for f in /proc/self/fd/*; do",
+            "  n=${f##*/}",
+            "  case $n in",
+            "    0|1|2) ;;",
+            '    [0-9]) eval "exec $n>&-" ;;',
+            bash
+                ? '    *) eval "exec $n>&-" ;;'
+                : '    *) echo "confined launch refused: inherited descriptor $n cannot be closed without bash" >&2; exit 126 ;;',
+            "  esac",
+            "done",
+        );
+    }
+    if (programPath) body.push(`exec ${SECCOMP_FD}<${shellQuote(programPath)} || exit 126`);
+    body.push(`exec ${[...(spec.prefix ?? []), spec.bwrap].map(shellQuote).join(" ")} "$@"`);
+    const shell = bash ? `${shellQuote(bash)} -p` : shellQuote(sh);
+    return [
+        `#!${sh}`,
+        "case $1 in --pi-confined-launcher-selftest) exit 0 ;; esac",
+        `exec ${shell} -c ${shellQuote(body.join("\n"))} pi-confined-launcher "$@"`,
+        "",
+    ].join("\n");
+}
+
+const launcherCache = new Map<string, string>();
+
+function isInside(root: string, path: string): boolean {
+    return path === root || path.startsWith(root.endsWith(sep) ? root : root + sep);
+}
+
+function writeAtomically(path: string, content: string | Buffer, mode: number): void {
+    try {
+        if (readFileSync(path).equals(Buffer.from(content))) return;
+    } catch { /* absent or unreadable: write it */ }
+    const temporary = `${path}.${process.pid}.${Math.random().toString(36).slice(2)}`;
+    try {
+        writeFileSync(temporary, content, { mode, flag: "wx" });
+        renameSync(temporary, path);
+    } catch (error) {
+        try { unlinkSync(temporary); } catch { /* nothing to remove */ }
+        throw error;
+    }
+}
+
+/**
+ * Create (or reuse) the executable launcher for `spec` and return its path.
+ *
+ * The files live in a per-user directory only the launching user can write, outside every root a confined
+ * command can write (`avoid`: the project, runtime and writable plan roots), so a confined command can
+ * never alter the launcher the next command starts under. They are content-addressed and never deleted: a
+ * resumed task re-runs the launch vector it captured. Each candidate directory is proven by running the
+ * launcher, which rejects one on a no-exec mount. Throws when none works; the launch then fails closed.
+ */
+export function ensureConfinedLauncher(spec: ConfinedLauncherSpec, avoid: readonly string[], seams: SandboxSeams = {}): string {
+    const env = seams.env ?? process.env;
+    const uid = process.getuid?.() ?? 0;
+    const candidates = [...new Set([env.XDG_RUNTIME_DIR, tmpdir(), "/tmp"]
+        .filter((entry): entry is string => typeof entry === "string" && isAbsolute(entry)))];
+    const key = JSON.stringify([spec.bwrap, spec.closeDescriptors, spec.seccompProgram?.toString("hex"), spec.prefix, candidates, avoid]);
+    const cached = launcherCache.get(key);
+    if (cached !== undefined && existsSync(cached)) return cached;
+    const bash = systemSandboxExecutable("bash");
+    const sh = systemSandboxExecutable("sh");
+    if (!sh) throw new Error("no system sh to start the confined launcher");
+    const problems: string[] = [];
+    for (const base of candidates) {
+        try {
+            const root = realpathSync(base);
+            const directory = join(root, `pi-confined-launch-${uid}`);
+            if (avoid.some((entry) => isInside(entry, directory))) throw new Error("inside a path a confined command can write");
+            try { mkdirSync(directory, { mode: 0o700 }); } catch (error) {
+                if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+            }
+            const info = lstatSync(directory);
+            if (!info.isDirectory() || info.isSymbolicLink() || info.uid !== uid || (info.mode & 0o077) !== 0) {
+                throw new Error("exists but is not a private directory owned by this user");
+            }
+            let programPath: string | undefined;
+            if (spec.seccompProgram) {
+                programPath = join(directory, `keyring-${createHash("sha256").update(spec.seccompProgram).digest("hex").slice(0, 24)}.bpf`);
+                writeAtomically(programPath, spec.seccompProgram, 0o400);
+            }
+            const script = confinedLauncherScript(spec, programPath, bash, sh);
+            const path = join(directory, `launch-${createHash("sha256").update(script).digest("hex").slice(0, 24)}.sh`);
+            writeAtomically(path, script, 0o500);
+            const proof = spawnSync(path, ["--pi-confined-launcher-selftest"], { env: {}, timeout: 10_000 });
+            if (proof.status !== 0) throw new Error(`cannot run it${proof.error ? `: ${proof.error.message}` : " (no-exec mount?)"}`);
+            launcherCache.set(key, path);
+            return path;
+        } catch (error) {
+            problems.push(`${base}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+    }
+    throw new Error(`no usable directory for the confined launcher (${problems.join("; ")})`);
+}
+
+/** The launch flags and executable that apply `hardening`; `file` is bubblewrap itself when nothing needs the launcher. */
+function hardenLaunch(
+    bwrap: string,
+    hardening: ResolvedHardening,
+    avoid: readonly string[],
+    seams: SandboxSeams,
+): { file: string; flags: string[] } {
+    const states = hardeningStates(hardening, bwrap, seams);
+    for (const measure of HARDENING_MEASURES) {
+        const state = states[measure];
+        if (state.state === "unavailable") {
+            throw new Error(`Confined launch refused (fails closed): hardening.${measure} is on but unavailable: ${state.reason}. ` +
+                `Fix the cause, or switch it off with "hardening": { "${measure}": false } in the read-confinement policy.`);
+        }
+    }
+    const flags: string[] = [];
+    if (hardening.ipc) flags.push("--unshare-ipc");
+    if (hardening.uts) flags.push("--unshare-uts", "--hostname", hardening.hostname);
+    if (hardening.userns) flags.push("--unshare-user", "--uid", String(process.getuid!()), "--gid", String(process.getgid!()), "--disable-userns");
+    if (hardening.keyring) flags.push("--seccomp", String(SECCOMP_FD));
+    if (!hardening.fds && !hardening.keyring) return { file: bwrap, flags };
+    try {
+        const file = ensureConfinedLauncher({
+            bwrap, closeDescriptors: hardening.fds,
+            ...(hardening.keyring && { seccompProgram: keyringSeccompProgram() }),
+        }, avoid, seams);
+        return { file, flags };
+    } catch (error) {
+        throw new Error(`Confined launch refused (fails closed): the launcher that applies hardening.${hardening.keyring ? "keyring" : "fds"} ` +
+            `could not be prepared: ${error instanceof Error ? error.message : String(error)}.`);
+    }
+}
+
 function buildLinuxPermissionCommand(
     bwrap: string,
     args: SandboxCommandArgs,
@@ -1479,9 +1856,14 @@ function buildLinuxPermissionCommand(
     // root and the parents of bound paths become read-only; only the explicit
     // writable binds and the private /tmp stay writable.
     if (policy.readConfinement && permissions.outsideProject === "off") mounts.push("--remount-ro", "/");
+    // Hardening goes last so the flags above keep their historical order. It cannot sit under a root the
+    // confined command can write, which is where the launcher is kept.
+    const hardened = confined
+        ? hardenLaunch(bwrap, resolveHardening(policy.readConfinement?.hardening), [project, ...(policy.runtimeWrite ?? []), ...(policy.readConfinement?.writeRoots ?? [])], seams)
+        : undefined;
     return {
-        file: bwrap,
-        fileArgs: [...mounts, ...(!permissions.network ? ["--unshare-net"] : []),
+        file: hardened?.file ?? bwrap,
+        fileArgs: [...mounts, ...(hardened?.flags ?? []), ...(!permissions.network ? ["--unshare-net"] : []),
             "--", args.execPath, ...args.execArgs],
     };
 }
@@ -1751,6 +2133,11 @@ function buildLinuxBroadCommand(
             `Sandbox: created an empty read-only placeholder where a protected symlink points at nothing, and left it in place (remove it before creating the real target): ${created.join(", ")}`,
         ] }),
     };
+}
+
+/** The bubblewrap executable a Linux launch would use, if any. */
+export function bubblewrapExecutable(seams: SandboxSeams = {}): string | undefined {
+    return (seams.lookupExecutable ?? systemSandboxExecutable)("bwrap");
 }
 
 function linuxSandboxBackend(seams: SandboxSeams): SandboxBackend | undefined {
