@@ -21,6 +21,7 @@ import {
     type RemoteStopResult,
     type RemoteTarget,
 } from "./remote.ts";
+import { COMMAND_LIMIT_KEYS } from "./shared-sandbox-core.ts";
 import { logPathFor, promptPathFor, readMeta, runDir, writeMeta } from "./registry.ts";
 import { observeFailures } from "./shared-failure-observations.ts";
 import { spawnDetached, type SpawnResult } from "./spawn.ts";
@@ -91,8 +92,21 @@ export function readRemoteSandbox(id: string): RemoteSandboxVerification | undef
 }
 
 /**
+ * The session limits the remote pi runs under (one systemd user scope), as configured; undefined when none is set.
+ * Values are the configured ones (`memoryMax` and `memorySwapMax` size strings, `tasksMax` count, `cpuQuota`
+ * percent of one CPU, `runtimeMaxSec` seconds).
+ */
+export function remoteSessionLimitsLine(remote: RemoteRunMeta | undefined): string | undefined {
+    const limits = remote?.sessionLimits;
+    if (!remote || !limits) return undefined;
+    const shown = COMMAND_LIMIT_KEYS.filter((key) => limits[key] !== undefined).map((key) => `${key}=${limits[key]}`);
+    return shown.length ? `Remote session limits (${remote.target}): one systemd user scope · ${shown.join(" · ")}` : undefined;
+}
+
+/**
  * One line naming the remote run's workspace (working folder, agent dir) and the verified sandbox hashes, so the
  * owner can compare them with `/sandbox workspace` in their own pi started in the same working folder.
+ * A run with session limits adds the limits line right after it (the workspace line itself keeps its form).
  */
 export function remoteWorkspaceLine(id: string, remote: RemoteRunMeta | undefined): string | undefined {
     if (!remote) return undefined;
@@ -102,7 +116,9 @@ export function remoteWorkspaceLine(id: string, remote: RemoteRunMeta | undefine
         ...(remote.agentDir ? [`agent dir ${remote.agentDir}`] : []),
         verified ? `policyHash ${verified.policyHash} · planHash ${verified.planHash}` : "sandbox not verified yet",
     ];
-    return `Remote workspace (${remote.target}): ${parts.join(" · ")}`;
+    const workspace = `Remote workspace (${remote.target}): ${parts.join(" · ")}`;
+    const limits = remoteSessionLimitsLine(remote);
+    return limits ? `${workspace}\n${limits}` : workspace;
 }
 
 /**
