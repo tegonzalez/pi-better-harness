@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: accepted, amended 2026-10-31
 date: 2026-09-23
 ---
 
@@ -13,6 +13,11 @@ launch snapshots, while reusing the existing subagent execution lifecycle.
 
 This records accepted design for DEV-23 / GitHub #289. It does not claim the
 catalog or Agentier integration is implemented.
+
+Amended 2026-10-31: default-model resolution no longer ends at the foreground
+model. An unavailable resolved default fails the launch; the foreground model is
+used only when no default is set anywhere. See the model resolution boundary
+below.
 
 ## Definition and execution boundaries
 
@@ -58,8 +63,15 @@ unrelated valid definitions.
 The coordinator translates authoritative task/workflow instructions into launch
 parameters; the runtime does not parse arbitrary prose for model choices.
 Explicit per-run models override saved defaults. Default-model resolution follows
-preferred → configured same-tier candidate → foreground; explicit unavailable
-per-run models fail. Cross-provider candidates require explicit configuration.
+preferred → configured same-tier candidate; explicit unavailable per-run models
+fail. Cross-provider candidates require explicit configuration.
+
+Amended 2026-10-31 (originally: preferred → configured same-tier candidate →
+foreground): an unavailable resolved default (role, agent, or configured
+`defaultModel`) fails the launch instead of silently running on the foreground
+model. The foreground model is inherited only when no default is set anywhere.
+`tierPolicy` remains the configured fallback: an available same-tier candidate
+still launches in place of an unavailable default.
 
 Availability comes from the foreground registry. This deliberately accepts that
 isolated child initialization can still fail; surface that lifecycle failure
