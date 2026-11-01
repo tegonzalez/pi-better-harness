@@ -385,3 +385,126 @@ test("/subagents reports config, changes only this session, rejects invalid args
         setConfigForTests(undefined);
     }
 });
+
+// A session that models compaction inside a run: entries carry ids, compaction drops the selected
+// entries from the model context, and triggerTurn: false holds a message until the turn ends.
+function compactingSession() {
+    const handlers = new Map();
+    const commands = new Map();
+    let branch = [];
+    const dropped = new Set();
+    const held = [];
+    const sent = [];
+    let ids = 0;
+    let streaming = false;
+    const entry = (fields) => ({ id: `e${++ids}`, ...fields });
+    extension({
+        events: new EventEmitter(),
+        appendEntry(customType, data) { branch.push(entry({ type: "custom", customType, data })); },
+        sendMessage(message, options) {
+            sent.push({ message, options });
+            const item = entry({ type: "custom_message", customType: message.customType, content: message.content,
+                display: message.display, details: message.details });
+            if (streaming) held.push(item);
+            else branch.push(item);
+        },
+        registerTool() {},
+        registerCommand(name, command) { commands.set(name, command); },
+        on(name, handler) { handlers.set(name, handler); },
+    });
+    const ctx = { ui: { notify() {} },
+        sessionManager: { getBranch: () => branch, buildContextEntries: () => branch.filter((item) => !dropped.has(item.id)) } };
+    return {
+        handlers, commands, sent, ctx,
+        setStreaming(value) { streaming = value; },
+        flush() { branch.push(...held.splice(0)); },
+        settingsEntries: () => branch.filter((item) => item.type === "custom_message" && item.customType === SETTINGS),
+        run(prompt = "Next prompt") {
+            const result = handlers.get("before_agent_start")({ type: "before_agent_start", prompt, systemPrompt: "Base prompt." }, ctx) ?? {};
+            branch.push(entry({ type: "message", message: { role: "user", content: prompt } }));
+            if (result.message) branch.push(entry({ type: "custom_message", ...structuredClone(result.message) }));
+            return result;
+        },
+        /** Compacts the session; `drop` selects the entries the summary replaces. */
+        async compact(drop) {
+            for (const item of branch) if (drop(item)) dropped.add(item.id);
+            const compactionEntry = entry({ type: "compaction" });
+            branch.push(compactionEntry);
+            await handlers.get("session_compact")({ type: "session_compact", compactionEntry, fromExtension: false,
+                reason: "threshold", willRetry: false }, ctx);
+        },
+    };
+}
+const isSettings = (item) => item.type === "custom_message" && item.customType === SETTINGS;
+
+test("compaction inside a run that drops the settings message adds the current one back once", async () => {
+    setConfigForTests({ delegationMode: "adaptive", maxConcurrent: 4 });
+    try {
+        const s = compactingSession();
+        await s.handlers.get("session_start")({}, s.ctx);
+        const first = s.run("First prompt");
+        assert.equal(first.message?.customType, SETTINGS);
+
+        s.setStreaming(true);
+        await s.compact(isSettings);
+        assert.equal(s.sent.length, 1, "the dropped settings message is re-sent");
+        assert.deepEqual(s.sent[0].options, { triggerTurn: false });
+        assert.deepEqual(s.sent[0].message, first.message, "the re-sent message matches the dropped one");
+
+        // While it waits for the turn to end, neither another compaction nor the next run adds a second copy.
+        await s.compact(() => false);
+        assert.equal(s.sent.length, 1, "a second compaction before delivery sends no duplicate");
+        const during = s.run("During");
+        assert.equal(during.message, undefined);
+        assert.equal(during.systemPrompt, first.systemPrompt, "the system prompt stays byte-stable");
+        s.flush();
+        s.setStreaming(false);
+        assert.equal(s.settingsEntries().length, 2);
+        assert.equal(s.run("After").message, undefined, "the restored message is current");
+
+        // Once landed, a later compaction that drops it again adds it back again; idle sends land at once.
+        await s.compact(isSettings);
+        assert.equal(s.sent.length, 2);
+        assert.equal(s.settingsEntries().length, 3);
+    } finally {
+        setConfigForTests(undefined);
+    }
+});
+
+test("compaction that keeps the settings message sends nothing", async () => {
+    setConfigForTests({ delegationMode: "adaptive", maxConcurrent: 4 });
+    try {
+        const s = compactingSession();
+        await s.handlers.get("session_start")({}, s.ctx);
+        s.run("First prompt");
+        s.setStreaming(true);
+        await s.compact((item) => !isSettings(item));
+        assert.equal(s.sent.length, 0);
+    } finally {
+        setConfigForTests(undefined);
+    }
+});
+
+test("compaction that keeps an older settings message sends the current revision, and navigation clears the held one", async () => {
+    setConfigForTests({ delegationMode: "adaptive", maxConcurrent: 4 });
+    try {
+        const s = compactingSession();
+        await s.handlers.get("session_start")({}, s.ctx);
+        s.run("First prompt");
+        await s.commands.get("subagents").handler("cap 2", s.ctx);
+        assert.equal(s.sent.length, 1, "the settings change is sent at the point of change");
+        const [older, latest] = s.settingsEntries();
+        s.setStreaming(true);
+        await s.compact((item) => item.id === latest.id);
+        assert.equal(s.sent.length, 2);
+        assert.match(s.sent[1].message.content, /concurrency limit 2 \(session\)/);
+        assert.notEqual(s.sent[1].message.details.revision, older.details.revision);
+
+        // Branch navigation forgets the held message: that branch's context decides.
+        await s.handlers.get("session_tree")({}, s.ctx);
+        await s.compact(() => false);
+        assert.equal(s.sent.length, 3, "after navigation the context, not the held message, decides");
+    } finally {
+        setConfigForTests(undefined);
+    }
+});

@@ -62,6 +62,9 @@ stored in the conversation once per settings revision, where the change happens:
 - At the start of each prompt, a missing or outdated message is added once. This
   covers the first prompt, changed saved defaults, branch navigation, and
   compaction that summarized the previous message.
+- When compaction drops the latest message inside a run (before the next
+  response, or before an overflow retry), it is added back once, after the
+  current turn ends, without starting a turn.
 
 Earlier messages are never moved or rewritten, so each request extends the
 previous one and the provider's prompt cache keeps the history. The latest
