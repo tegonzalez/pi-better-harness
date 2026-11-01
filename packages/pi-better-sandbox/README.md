@@ -535,6 +535,56 @@ The owner can check what a confined worker can read and write from a separate pi
 - Planning is synchronous and bounded (`maxWalkEntries`, `maxWalkMs`); it runs at session start.
 - Secret detection is pattern-based; it reduces, not eliminates, the chance that a bound config holds a secret.
 - The synthetic `PATH` only constrains lookups by name; this mode is a read boundary, not a command allowlist.
+- bubblewrap is a mount/namespace boundary, not a resource or syscall policy: it sets no CPU, memory, disk, process-count
+  or time limits, and it shares the IPC namespace, kernel keyring, hostname and clock with the host. See
+  [What bubblewrap can and cannot limit](#what-bubblewrap-can-and-cannot-limit) for the full table and mitigations.
+
+### What bubblewrap can and cannot limit
+
+Measured, not assumed: `test/bubblewrap-limits.test.ts` launches real bubblewrap commands built by the package's own
+planner and argv builder (Main profile, Outside project = Off, Network Off, commands On, read confinement active; two
+extra launches with Network On and with a policy that adds a `readOnly` folder and an approved tool with `config`) and
+asserts each *Limited* row. *Not limited* rows are asserted as documented expectations so this table cannot go stale.
+Tested with bubblewrap 0.12 using unprivileged user namespaces. "Limited" means the kernel refuses the operation
+inside the sandbox; the table lists what remains and what to add **outside** bubblewrap. The mitigations are
+recommendations only; none is implemented by this package.
+
+| Area | Result | Mechanism / observed | Recommended mitigation outside bubblewrap |
+| --- | --- | --- | --- |
+| Read a file outside the allow set | **Limited** | Not mounted: `ENOENT`. Reachable only through project symlinks (followed at launch), `readOnly`, approved tool `bind`/`config`. | Keep `deny.paths` and `walkSkipDirNames` for anything a symlink must never reach. |
+| Write outside writable roots | **Limited** | `/usr` and the synthetic root are read-only (`EROFS`); other paths do not exist. Symlink-reachable and `readOnly` folders are read-only. | None needed. |
+| Private `/tmp` | **Limited** | Fresh tmpfs; host `/tmp` entries are invisible and sandbox writes never reach the host. | Size cap: see Resources. |
+| Exec by absolute path | **Not limited** | Any binary readable under the bound runtime roots (`/usr`, `/bin`, ...) runs, as does any executable in a writable root or read-only mount (no `noexec`). | Command allowlisting needs a separate layer (seccomp filter, or wrapper that execs only approved binaries). |
+| Exec by name (`PATH`) | **Limited** | Synthetic `PATH` holds only approved tools; other names fail `ENOENT`/exit 127. It is a lookup convenience, not a boundary. | Do not rely on it for security. |
+| Network, Network Off | **Limited** | `--unshare-net`: own namespace with only its own loopback. TCP/UDP to host loopback and LAN, DNS, and *abstract* unix sockets (host D-Bus, X11) are unreachable. Covers tools with their own network stack, since it is the namespace, not a library. | None needed. |
+| Network, Network On | **Not limited** | Full host network namespace: loopback services, LAN, abstract unix sockets, raw egress. Names do not resolve because `/etc` is not mounted (IP literals work); a `readOnly` mount of resolver files would enable DNS. | Egress filtering belongs to the host (nftables/cgroup-matched rules, network namespace with a proxy). Prefer Network Off. |
+| Filesystem unix sockets (daemons, D-Bus session bus, ssh-agent) | **Partially** | A socket path that is not mounted is `ENOENT`, and the usual locating variables are cleared. A socket under any mounted path, including the project and `readOnly` mounts (read-only does not stop `connect`), is connectable even with Network Off. | Never mount or keep sockets inside the project or in `readOnly` folders; run daemons outside those paths. |
+| Process visibility and signals | **Limited** | `--unshare-pid`, no `/proc`: host pids are `ESRCH` for `kill`; `ptrace` of host pids is `ESRCH`. | None needed. |
+| `ptrace` inside | **Not limited** | Only processes inside the sandbox are reachable (host pids are not). | seccomp can deny it if wanted. |
+| Devices | **Limited** | `--dev`: minimal set (`null`, `zero`, `full`, `random`, `urandom`, `tty`, `ptmx`, `pts`, `shm`, std fds). GPU (`kfd`, `dri`), DRM, disks, `fuse`, `kvm`, `mem` are absent. | None needed. |
+| Controlling tty | **Limited** | `--new-session`: `/dev/tty` open fails `ENXIO`. | None needed. |
+| setuid, capabilities | **Limited** | Same uid, `no_new_privs` set, effective capabilities empty. | None needed. |
+| New user namespaces inside | **Not limited** | `unshare(CLONE_NEWUSER)` succeeds; it grants nothing on the host but exposes kernel attack surface. | seccomp denying `unshare`/`clone` namespace flags, or the host sysctl that disables unprivileged user namespaces for the launcher's descendants. |
+| IPC (SysV shm, POSIX mq) | **Not limited** | No `--unshare-ipc`: host segments and queues are attachable by id/name subject to normal permissions. | Launch with an IPC namespace (`unshare --ipc`, systemd `PrivateIPC=`). |
+| Kernel keyring (`keyctl`) | **Not limited** | Keys of the calling user are readable by id as permissions allow. | seccomp denying `keyctl`/`add_key`/`request_key`; or a separate uid or session keyring per launch. |
+| Resources: CPU, memory, processes, wall time | **Not limited** | No cgroups, no rlimits set: limits are inherited from the launcher unchanged. A fork bomb or busy loop affects the host; the pid namespace does not cap counts. | `systemd-run --user -p MemoryMax= -p CPUQuota= -p TasksMax=` (cgroups), `ulimit`/`prlimit`, and a timeout on every launch. |
+| Resources: disk | **Not limited** | Writable roots are the host filesystem (project, git dirs, caches); private `/tmp` is a tmpfs with the kernel default size. | Filesystem quotas or a size-capped scratch mount; a `tmpfs` size option for private `/tmp`; `RLIMIT_FSIZE`. |
+| Time, hostname, uid | **Not limited** | No time/UTS namespace; uid is the caller's. | Observable only; `unshare --uts` hides the hostname if wanted. |
+| Environment | **Limited** | `--clearenv`: only `PATH`, `HOME`, `LANG`, `LC_ALL`, `TERM`, `TMPDIR`, `TZ` and `env.allow` names. Anything in `env.allow` is deliberately visible. | Keep `env.allow` minimal. |
+| Inherited file descriptors | **Not limited** | bubblewrap does not close descriptors above 2: an fd the launcher leaves open is usable (even a file outside the allow set). | Launcher must open children with close-on-exec and an explicit fd table (`stdio` only). |
+| Clipboard, X11, Wayland | **Limited** | Filesystem sockets are not mounted, the host `/tmp` is hidden, abstract sockets (X11) need Network On, and the display variables are cleared. With Network On an abstract X11 socket is reachable. | Keep Network Off for untrusted work; use a separate display/session for sandboxed GUI work. |
+| Approved tool's config | **Partially** | Every file in an approved config path is readable by the whole sandbox, not just by the tool. The secret detector refuses a config entry whose files match a pattern (the entry is not bound). | List single files rather than directories; keep secrets out of approved config. |
+
+Notes:
+
+- *Fail-safe reading*: for unlisted paths the observable error is `ENOENT`, so a refused path cannot be told apart from a
+  missing one.
+- *Foreign mount points*: bubblewrap cannot withdraw access it did not remove; anything you add with `readOnly`, `bind`,
+  `config`, the project or a symlink is fully reachable, including executables and sockets there.
+- *Resource limits* are the largest gap. Wrap the launcher in a cgroup (for example a transient `systemd-run` scope or
+  service) and a timeout; this is a host decision, not a package setting.
+- Probes and the observed values behind this table are re-checked by the test file; set
+  `PI_SANDBOX_LIMITS_DUMP=1` to print them.
 
 ## Local Permission Diagnostics
 
