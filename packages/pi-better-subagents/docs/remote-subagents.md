@@ -95,24 +95,42 @@ exec setsid -w systemd-run --user --scope ... -p MemoryMax=... -- sh -c '<scope 
 ```
 
 - **One scope for the run.** The process that becomes pi, and every child, grandchild and detached sleeper,
-  runs in that one transient scope (a scoped confined launch is the exception, see below), so the bound is shared (the sum of all of them, not per process). The scope
-  is created by the launch itself and ends when its last process ends.
+  runs in that one transient scope, so the bound is shared (the sum of all of them, not per process). Two
+  exceptions are described below: a confined launch that has its own `resources.command` scope, and anything that
+  leaves the scope. The scope is created by the launch itself and ends when its last process ends.
 - **setsid, pid file and stop are unchanged.** `systemd-run --scope` registers the calling process in the scope
   and then replaces itself with the command, so the pid in `<root>/<run id>/pid` is still the session leader that
   became pi, and the stop script (TERM, then KILL of every member of that session) still reaches everything the
-  run started and leaves no process behind. When the last process dies the scope is gone: `subagent_stop`
-  leaves neither a process nor a scope. As before, a process that starts yet another session itself is out of
-  the stop script's reach; it stays inside the scope's bounds and `runtimeMaxSec` ends it with the scope.
-- **Confined launches inside the remote pi.** When the remote pi's own sandbox policy also sets
-  `resources.command` (see the pi-better-sandbox README), each confined launch starts its own
-  `systemd-run --user --scope`. systemd creates that scope beside the session scope, not inside it (a nested
-  `systemd-run --user --scope` lands in a sibling scope of the user manager's `app.slice`). Such a launch is bounded by
-  its command limits and **not** by the session scope's memory, task or CPU limits; the session bound is then shared
-  only by the remote pi and by children that are not scoped launches. This is how the scopes combine today, not a
-  tuned guarantee: if confined launches must be bounded, set `resources.command` in that policy.
+  run started and leaves no process behind, with one exception: a confined launch that is running when the run
+  is stopped (see "Confined launches inside the remote pi" below). When the last process of a scope dies the
+  scope is gone. As before, a process that starts yet another session itself is out of the stop script's reach; it
+  stays inside its scope's bounds, and `runtimeMaxSec` ends it with that scope.
+- **Confined launches inside the remote pi.** What bounds a confined launch (one the remote pi's sandbox runs
+  through bubblewrap) depends on the remote pi's own sandbox policy:
+  - **`resources.command` not set in that policy:** the launch starts no scope of its own. It is an ordinary child
+    of the remote pi, runs in the session scope and is bounded by the session limits like any other child.
+  - **`resources.command` set in that policy:** each confined launch starts its own
+    `systemd-run --user --scope`. systemd creates that scope beside the session scope (a sibling under the user
+    manager's default slice), not inside it; a nested `systemd-run --user --scope` does not stay in the scope that
+    started it. The launch is then bounded by its own `resources.command` limits and **not** by the session
+    scope's memory, task or CPU limits, and the session `runtimeMaxSec` does not end it. The session bound is
+    shared only by the remote pi and by the children that are not scoped launches, so `resources.session` no
+    longer caps the total of the run (each launch has its own `resources.command` bound instead).
+  - **Known limit: stop does not reach a running confined launch.** The stop script signals the members of
+    the run's session. bubblewrap runs the sandboxed command under its own `--unshare-pid --new-session`, and the
+    launch does not use `--die-with-parent`, so the sandbox's init process and the command under it are in a
+    session of their own. In a local reproduction with a stand-in pi (no ssh), `subagent_stop`'s script ended
+    pi and the outer bubblewrap process and printed `gone`, while the inner bubblewrap and its command kept
+    running (their parent became a process outside the run), and their scope stayed: the launch's own scope when
+    `resources.command` was set, the session scope when it was not. A confined launch still running when a
+    run is stopped can therefore outlive the stop, together with its scope, until the command ends on its
+    own or a `runtimeMaxSec` ends the scope it is in (the session's, or the policy's `resources.command` one).
+    With neither set, nothing ends it but the command itself. That reproduction did not signal the children from
+    the pi stand-in, so it does not show whether the real remote pi ends its running confined launches when it is
+    stopped; the stop script itself does not signal it.
 - **`runtimeMaxSec`** makes systemd stop the scope (SIGTERM, then SIGKILL after the user manager's stop
-  timeout) when the time is up, which ends pi and everything in it; the bridge then records the exit as for any
-  remote pi that ends.
+  timeout) when the time is up, which ends pi and everything in that scope; the bridge then records the exit as for any
+  remote pi that ends. A confined launch in its own `resources.command` scope is not in it.
 - **The scope carries only the configured properties.** The memory limit is a hard cap: a scope that exceeds
   `memoryMax` has its processes killed by the kernel's OOM killer, not paused.
 
