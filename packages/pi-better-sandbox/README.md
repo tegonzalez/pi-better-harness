@@ -378,6 +378,12 @@ at load time and block launches (fail closed). Path entries are absolute, `~/…
 | `secretDetector.useDefaults` / `patterns[]` / `maxScanBytes` / `maxScanFiles` | Config entries whose files match a pattern (private-key headers, common token shapes, `_authToken=`, `password=…`) are refused, not bound. Defaults also match URL userinfo (`://user:pw@`), `Authorization:` headers and short `password=` values. A file larger than `maxScanBytes` is refused, not truncated. `(?i)` prefix = case-insensitive. | defaults on |
 | `caches.persistentDir` | Base for `cachePersistent` caches: `<dir>/<agent>/<tool>-<hash>`. | unset (persistent caches skipped) |
 | `syntheticPathMount` | Where the PATH directory appears in the sandbox. | `/run/pi-confined/bin` |
+| `hardening.ipc` | Private SysV/POSIX IPC namespace (`--unshare-ipc`): host shared-memory segments and message queues are not reachable. `false` removes only this measure. | `true` |
+| `hardening.uts` | Private UTS namespace with a fixed hostname (`--unshare-uts --hostname`), so the host's name is not visible. | `true` |
+| `hardening.hostname` | The hostname inside the sandbox when `uts` is on: 1-64 letters, digits, dots or hyphens. | `sandbox` |
+| `hardening.userns` | The confined child cannot create user namespaces (`--unshare-user --uid <uid> --gid <gid> --disable-userns`; the launching user's ids are mapped to themselves, so file ownership and git behave as before; `unshare(CLONE_NEWUSER)` fails with `ENOSPC`). | `true` |
+| `hardening.keyring` | `keyctl`, `add_key` and `request_key` fail with `EPERM` (a seccomp filter generated in `sandbox-core`, passed to bubblewrap with `--seccomp`; x86_64 and aarch64 only, any other architecture makes the measure unavailable). | `true` |
+| `hardening.fds` | The confined child inherits only descriptors 0, 1 and 2 (plus the filter's own, which bubblewrap closes after loading it): the launcher closes every other inherited descriptor before bubblewrap starts. | `true` |
 | `planTtlMs` | **Removed.** The plan is never recomputed during a session; the key is rejected so stale policies are noticed. | — |
 
 At launch the planner resolves the launching `PATH`, takes the realpath of each approved
@@ -451,6 +457,26 @@ covered: their `config`, `hooks` and `.git` are ordinary writable files, and a h
 The sandbox also gets `--clearenv` (only `env.allow` names, taken from the launching process when each
 command is built, reach the child; the task runtime's own env passthrough is filtered the same way),
 `--unshare-pid` (the child cannot signal host processes; `/proc` is not mounted) and `--new-session`.
+
+#### Hardening of every confined launch
+
+On top of those, each confined launch gets the measures below. Each is **on by default** and has its own switch in the
+policy's `hardening` object (see the key table), so `{"hardening": {"keyring": false}}` removes the keyring filter and
+nothing else. Unknown `hardening` keys are refused at load time, and the switches are part of `policyHash`.
+
+| Measure | Switch | Mechanism |
+| --- | --- | --- |
+| Private IPC | `ipc` | `--unshare-ipc` |
+| Private hostname | `uts`, `hostname` | `--unshare-uts --hostname <name>` (default name `sandbox`) |
+| No nested user namespaces | `userns` | `--unshare-user --uid <uid> --gid <gid> --disable-userns` |
+| No kernel keyring | `keyring` | `--seccomp <fd>` with a classic-BPF program generated in `sandbox-core` (`keyringSeccompProgram`): it checks `seccomp_data.arch`, denies `keyctl`, `add_key` and `request_key` with `EPERM` on x86_64 and aarch64, allows every other call, and kills a process that uses any other ABI (x32, 32-bit compat) |
+| Only stdio inherited | `fds` | a launcher script, in a private per-user directory outside every writable root, that closes every descriptor above 2 and opens the seccomp program on descriptor 9 before it `exec`s bubblewrap |
+
+The launcher takes bubblewrap's own arguments, so `command.file` is the launcher (not `bwrap`) only when `fds` or
+`keyring` is on; with every switch off the launch is exactly the pre-hardening one. **A measure that is on but cannot be
+applied fails the launch closed** and is reported as unavailable with its reason: a bubblewrap without the needed flag,
+a CPU architecture the seccomp program does not cover, no `/proc/self/fd`, or no usable directory for the launcher. The
+remedy is to fix the cause or switch that one measure off in the policy.
 Approved tools whose real path is under a writable root are refused (the agent could replace them).
 
 ### Audit and machine-readable status
@@ -469,6 +495,7 @@ can read it with RPC `get_entries` and refuse to prompt unless `active` is `true
 | `planHash` | SHA-256 of the audit. |
 | `hash`, `audit` | (active only) legacy alias of `planHash`, and the full audit: binds with reasons, denied and skipped entries with reasons, symlink mounts, the synthetic `PATH`, the policy source and hash. |
 | `reason` | (inactive only) why the plan is not in force or failed. |
+| `audit.hardening` | The state of each hardening measure: `ipc`, `uts`, `userns`, `keyring`, `fds` are each `{ "state": "on" }`, `{ "state": "off" }` (switched off by policy) or `{ "state": "unavailable", "reason": … }`, plus the `hostname`. An unavailable measure makes the entry inactive (`reason` names it) and every launch fails closed. Also in the inactive entry as `hardening`. |
 
 An entry is appended once per change, not per announcement. A session with no configured policy
 writes no entry. `/sandbox diagnostics confinement` prints the latest plan. Secret values are never recorded.
@@ -488,7 +515,8 @@ The owner can check what a confined worker can read and write from a separate pi
 
    Main must be enabled with Outside project = Off in that agent dir (the same permissions the worker uses).
 2. `/sandbox workspace` (also the first block of `/sandbox diagnostics confinement`) shows the working folder, agent
-   dir, policy path, `policyHash` and `planHash`, and whether the confinement is `active`.
+   dir, policy path, `policyHash` and `planHash`, whether the confinement is `active`, and each hardening measure as
+   `on`, `off by policy` or `unavailable` with its reason.
 3. `/sandbox check <path>` reports read, write and exec for a path with the reason (the mount that grants it, or
    "not mounted"). It uses the same evaluator as the in-process tools, whose allow set is the kernel mount plan. Relative
    paths resolve against the working folder; symlinks are decided on their realpath. `/tmp` is the sandbox's private,
