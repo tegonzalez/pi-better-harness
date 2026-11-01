@@ -6,8 +6,8 @@
  */
 import { describeDefaultLaunchCapabilities, formatModelEffort, LEGACY_CAPABILITY_CONTROLS, type LaunchEnricher, type LaunchEnrichment } from "./agent-inspection.ts";
 import { resolveSelection, type EffectiveDefinition } from "./catalog-resolver.ts";
-import { defaultUserRoot, loadCatalog, type CatalogSnapshot } from "./catalog-store.ts";
-import { loadConfig, type SubagentConfig } from "./config.ts";
+import { defaultUserRoot, loadCatalog, SOURCE_PRECEDENCE, type CatalogSnapshot } from "./catalog-store.ts";
+import { loadConfig, loadLaunchConfig, type SubagentConfig } from "./config.ts";
 import {
     assessCatalog,
     assessSelection,
@@ -22,7 +22,7 @@ import {
 import { allocateCatalogLabel } from "./catalog-identity.ts";
 import { resolveRoleAssignment, type RoleAssignment } from "./role-assignment.ts";
 import { configureTierPolicy, DEFAULT_TIER_POLICY, type TierPolicy, type TierSpec } from "./tier-policy.ts";
-import { canonicalAgentId, canonicalRoleId, shortRoleName, type Diagnostic, type ThinkingLevel } from "./catalog-schema.ts";
+import { canonicalAgentId, canonicalRoleId, DiagnosticCodes, shortRoleName, type Diagnostic, type ThinkingLevel } from "./catalog-schema.ts";
 import { withAgentSessionSettings, type AgentSessionOverrides } from "./agent-session-settings.ts";
 import { currentSandboxPermissions } from "./permission-policy.ts";
 
@@ -296,6 +296,35 @@ export function catalogDefaultNote(
     return `model ${actual} (${causes.join("; ")})`;
 }
 
+/** Load diagnostics for a catalog file whose definition id could not be read. */
+const UNATTRIBUTED_LOAD_FAILURES: ReadonlySet<string> = new Set([
+    DiagnosticCodes.ioError,
+    DiagnosticCodes.parserLimit,
+    DiagnosticCodes.malformedFrontmatter,
+    DiagnosticCodes.duplicateKey,
+    DiagnosticCodes.invalidSchema,
+    DiagnosticCodes.invalidKind,
+    DiagnosticCodes.invalidId,
+]);
+
+/**
+ * Files that failed to load or parse before their id was known. Any of them
+ * could hold a definition that shadows the selection, so a catalog launch must
+ * not silently continue with a lower-priority source. Failures in a scope below
+ * the selected definition's scope cannot shadow it and are ignored.
+ */
+export function catalogLoadFailures(snapshot: Pick<CatalogSnapshot, "diagnostics">, selectedScope?: string): Diagnostic[] {
+    const rank = (scope: string | undefined) => {
+        const index = SOURCE_PRECEDENCE.indexOf(scope as (typeof SOURCE_PRECEDENCE)[number]);
+        return index < 0 ? -1 : index;
+    };
+    const selected = selectedScope === undefined ? Number.POSITIVE_INFINITY : rank(selectedScope);
+    // A file whose id was still read is attributed (for example invalid-shadow) and blocks only that id.
+    const attributed = new Set(snapshot.diagnostics.filter((item) => item.id && item.path).map((item) => item.path));
+    return snapshot.diagnostics.filter((item) => !item.id && item.path && !attributed.has(item.path)
+        && UNATTRIBUTED_LOAD_FAILURES.has(item.code) && rank(item.scope) <= selected);
+}
+
 /** Model sources that mean the default could not be used, not that the caller chose another model. */
 const FALLBACK_SOURCES: ReadonlySet<string> = new Set(["tier-candidate", "foreground", "configured-default"]);
 const FALLBACK_LABELS: Record<string, string> = {
@@ -326,11 +355,14 @@ export async function prepareCatalogJob(snapshot: CatalogSnapshot, job: CatalogJ
     }
     const selector = agent ? { agentId: agent } : { roleId: roles[0]! };
     const resolved = resolveSelection(snapshot, selector);
+    const loadFailures = catalogLoadFailures(snapshot, resolved.effective?.source?.scope);
+    const loadMessage = loadFailures.length === 0 ? "" : `The agent catalog failed to load: ${loadFailures.map((item) => item.path && !item.message.includes(item.path) ? `${item.path}: ${item.message.trim()}` : item.message.trim()).join(" ")} A definition in that file could replace ${agent ?? roles[0]}, so the launch was refused instead of using another definition. Repair or remove the file, then retry. No child was started.`;
     if (!resolved.effective || resolved.status === "clarification-needed" || resolved.status === "not-found" || !resolved.launchable) {
-        const message = resolved.diagnostics.map((item) => item.message).join(" ") || "Catalog selection is not launchable. No child was started.";
-        return { status: "blocked", message, diagnostics: resolved.diagnostics };
+        const message = [resolved.diagnostics.map((item) => item.message).join(" ") || "Catalog selection is not launchable. No child was started.", loadMessage].filter(Boolean).join(" ");
+        return { status: "blocked", message, diagnostics: [...resolved.diagnostics, ...loadFailures] };
     }
-    const config = loadConfig();
+    if (loadFailures.length > 0) return { status: "blocked", message: loadMessage, diagnostics: loadFailures };
+    const config = loadLaunchConfig();
     const decision = resolveModel({
         ...resolutionContext(host, config),
         effective: resolved.effective,

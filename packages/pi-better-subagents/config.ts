@@ -97,11 +97,14 @@ let cachedIdentity: string | undefined;
 let configOverrideForTests = false;
 let configPathForTests: string | undefined;
 let bundledConfigPathForTests: string | undefined;
+/** Why the last loadConfig fell back (invalid saved settings or shipped config.json). */
+let loadError: Error | undefined;
 
 /** Test seam. Pass undefined to reload config.json on the next loadConfig call. */
 export function setConfigForTests(next: SubagentConfig | undefined): void {
     cached = next;
     cachedIdentity = undefined;
+    loadError = undefined;
     configOverrideForTests = next !== undefined;
 }
 
@@ -169,17 +172,49 @@ export function loadConfig(): SubagentConfig {
     if (configOverrideForTests) return cached!;
     const identity = configIdentity();
     if (cached && cachedIdentity === identity) return cached;
-    // The shared resolver (also used by the sandbox's remote-spawn guard); unreadable saved data retains the package fallback.
+    // The shared resolver (also used by the sandbox's remote-spawn guard); unreadable saved data retains the package fallback
+    // for readers, but the failure is recorded so launches refuse it (loadLaunchConfig) and load reports it.
+    loadError = bundledConfigError();
     try {
         cached = resolveHarnessSection<SubagentConfig>("subagents", {
             seams: configSeams(), migrate: true, bundledPaths: [bundledConfigPath()].filter((path): path is string => path !== undefined),
             ...(configPathForTests ? {} : { legacy: { path: legacyExtensionConfigPath("pi-better-subagents", configSeams()), parse: parseConfig } }),
         });
-    } catch { cached = bundledConfig(); }
+    } catch (error) {
+        loadError = new Error(`Saved subagent settings (piBetterHarness.subagents in ${configPath()}) could not be read: ${error instanceof Error ? error.message : String(error)}`);
+        cached = bundledConfig();
+    }
     // Keep the pre-read identity: migration or a concurrent replacement must
     // trigger another read rather than label an older value with a newer stat.
     cachedIdentity = identity;
     return cached;
+}
+
+function bundledConfigError(): Error | undefined {
+    const path = bundledConfigPath();
+    if (!path) return undefined;
+    try {
+        readConfig(path);
+        return undefined;
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+        return new Error(`Shipped subagent config ${path} could not be parsed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+}
+
+/** The failure behind the last loadConfig fallback, if any. */
+export function configLoadError(): Error | undefined {
+    loadConfig();
+    return loadError;
+}
+
+/** Config for a launch: refuses to run on a silent fallback when a config file failed to load. */
+export function loadLaunchConfig(): SubagentConfig {
+    const config = loadConfig();
+    if (loadError) {
+        throw new Error(`Subagent config failed to load. ${loadError.message.replace(/\.?$/, ".")} Saved defaults (defaultModel, tierPolicy, tools) would be ignored, so no child was started. Fix or remove the invalid settings, then retry.`);
+    }
+    return config;
 }
 
 /** Save the navigator's mode-only default without replacing the saved cap. */

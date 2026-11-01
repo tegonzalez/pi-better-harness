@@ -35,7 +35,7 @@ import {
 import { spawnDetached, type SpawnResult } from "./spawn.ts";
 import { parseRun, readRunTranscript, resetParseRunCursor, type Usage } from "./parse.ts";
 import { finalizeRun as finalizeRunCore } from "./finalization.ts";
-import { loadConfig, writeDelegationMode, writeSubagentSettings, isConcurrencyCap, normalizeConcurrencyCap, normalizeTools, resolveExtensionPath, selfDir, SAFE_DEFAULT_TOOLS, SAFE_CLEAN_TOOLS } from "./config.ts";
+import { configLoadError, loadConfig, loadLaunchConfig, writeDelegationMode, writeSubagentSettings, isConcurrencyCap, normalizeConcurrencyCap, normalizeTools, resolveExtensionPath, selfDir, SAFE_DEFAULT_TOOLS, SAFE_CLEAN_TOOLS } from "./config.ts";
 import { createSubagentSettingsPage } from "./settings-page.ts";
 import { effectiveSubagentSettings, formatSubagentSettingsMessage, stableSubagentSettings, subagentDelegationSystemPrompt,
     subagentSettingsTool, SUBAGENT_SETTINGS_CONTEXT } from "./effective-settings.ts";
@@ -1739,7 +1739,7 @@ export default function (pi: ExtensionAPI) {
     }> {
         assertThinkingLevel(p.thinking);
         const permissionPlan = resolveSubagentPermissions(pi, p.sandbox);
-        const cfg = loadConfig();
+        const cfg = loadLaunchConfig();
         // Harness-owned timing (soft deadline, ceiling, stuck window); validated before any side effect.
         resolveRunTiming({ params: p, settings: cfg, env: process.env, startedAt: 0 });
         let model: string | undefined;
@@ -2250,7 +2250,7 @@ export default function (pi: ExtensionAPI) {
                 jobs: raw.jobs.map((job) => omitBlankOptionalStrings(job, ["prompt"])),
             };
 
-            const cfg = loadConfig();
+            const cfg = loadLaunchConfig();
             const launchAvailable = p.onCapacity === "launch-available";
             // Shared with single-spawn. Reservations count against maxConcurrent so a
             // concurrent single spawn cannot take a slot the batch already admitted.
@@ -2588,7 +2588,14 @@ export default function (pi: ExtensionAPI) {
         agentSessionSettings.restore(ctx);
         restoreDelegationMode(ctx);
         uiCtx = ctx;
-        try { noteCatalogHost(catalogHostFrom(ctx)); } catch { /* catalog inspection stays undecided */ }
+        try { noteCatalogHost(catalogHostFrom(ctx)); } catch (error) {
+            // Catalog inspection stays undecided, but the failure is reported rather than swallowed.
+            try { ctx.ui.notify(`Subagents: catalog host setup failed: ${error instanceof Error ? error.message : String(error)}`, "warning"); } catch { /* no UI */ }
+        }
+        const configProblem = configLoadError();
+        if (configProblem) {
+            try { ctx.ui.notify(`Subagent config failed to load; launches are refused until it is fixed. ${configProblem.message}`, "error"); } catch { /* no UI */ }
+        }
         try { mainAgentStartedAt = ctx.isIdle() ? undefined : Date.now(); }
         catch { mainAgentStartedAt = undefined; }
         mainAgentTools.clear();

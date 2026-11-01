@@ -84,7 +84,7 @@ Precedence is project, then personal, then bundled. The higher source replaces t
 
 Project files are read and written only when the host sets `projectTrusted` from `ctx.isProjectTrusted()`. Otherwise the project catalog is reported as suppressed and personal/bundled definitions are used. Create/save defaults to the personal root. `scope: "project"` is explicit. Writes are atomic (temp file, fsync, rename) and refuse symlink escapes inside the catalog root.
 
-Same-scope duplicate ids produce a diagnostic and no filesystem-order winner. That duplicate blocks lower sources for the same id. An invalid higher-priority file that still has a readable id also blocks that id. A broken file that has no id does not hide valid siblings. `.codex/agents` is not scanned.
+Same-scope duplicate ids produce a diagnostic and no filesystem-order winner. That duplicate blocks lower sources for the same id. An invalid higher-priority file that still has a readable id also blocks that id. A broken file that has no readable id, or a file or directory that cannot be read, still loads its valid siblings for inspection. Launching a role or agent is refused while such a failure sits in the same or a higher-priority source, because the unreadable file could replace the selection; the error names the file. Repair or remove it, then retry. Failures in a lower-priority source do not block. `.codex/agents` is not scanned.
 
 Role references use the same precedence. A missing or unusable role leaves the agent listed and not launchable.
 
