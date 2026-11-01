@@ -21,6 +21,8 @@ process.env.TMPDIR = (await import("node:fs")).mkdtempSync(
 import {
     BATCH_JOB_NAME_DEFAULT,
     assignBatchJobNames,
+    batchLaunchOutputSchema,
+    batchLaunchResult,
     formatBatchLaunchResponse,
     mergeJobOptions,
     planBatchLaunches,
@@ -407,6 +409,56 @@ describe("planBatchLaunches", () => {
 });
 
 describe("formatBatchLaunchResponse", () => {
+    it("lists every job outcome on its own line with its position, reason, and launch warning", () => {
+        const receipt = {
+            batchId: "batch_mixed",
+            launched: [
+                { job: 1, name: "alice", id: "sa_1", warning: "NOTE: no extension mapped for lint — this tool will NOT exist in the child." },
+                { job: 3, name: "carol", id: "sa_3" },
+            ],
+            failed: [
+                { job: 2, name: "bob", reason: "Role role.architect default model openai/gpt-6-astra is not usable" },
+                { job: 4, name: "dave", reason: "not launched due to earlier job failure in reject mode" },
+            ],
+            skipped: [{ job: 5, name: "erin", reason: "capacity full" }],
+        };
+        const result = batchLaunchResult(receipt);
+        const text = result.content[0].text;
+        assert.match(text, /^• #1 alice → sa_1 · NOTE: no extension mapped for lint/m);
+        assert.match(text, /^• #3 carol → sa_3$/m);
+        assert.match(text, /^Failed \(2\):$/m);
+        assert.match(text, /^• #2 bob: Role role\.architect default model openai\/gpt-6-astra is not usable$/m);
+        assert.match(text, /^• #4 dave: not launched due to earlier job failure in reject mode$/m);
+        assert.match(text, /^Skipped \(1\):$/m);
+        assert.match(text, /^• #5 erin: capacity full$/m);
+        assert.equal(result.details.status, "partial");
+        assert.deepEqual(result.details.launched.map(({ job }) => job), [1, 3]);
+        assert.match(result.details.launched[0].warning, /will NOT exist/);
+        assert.deepEqual(result.details.failed.map(({ job, reason }) => [job, reason.slice(0, 4)]), [[2, "Role"], [4, "not "]]);
+        assert.deepEqual(result.details.skipped, [{ job: 5, name: "erin", reason: "capacity full" }]);
+        assert.deepEqual(result.structuredContent, result.details);
+        // The codemode output schema is closed (additionalProperties: false); every field must be declared.
+        for (const list of ["launched", "failed", "skipped"]) {
+            const item = batchLaunchOutputSchema.properties[list].items;
+            for (const entry of result.details[list]) {
+                for (const key of Object.keys(entry)) assert.ok(key in item.properties, `${list}.${key} is not in the output schema`);
+                for (const key of item.required) assert.ok(key in entry, `${list}.${key} is required`);
+            }
+        }
+    });
+
+    it("names every failure when nothing launched", () => {
+        const text = formatBatchLaunchResponse({
+            batchId: "batch_none",
+            launched: [],
+            failed: [{ job: 1, name: "a", reason: "boom" }, { job: 2, name: "b", reason: "not launched due to earlier job failure in reject mode" }],
+            skipped: [],
+        });
+        assert.match(text, /^Batch batch_none: no jobs launched\.$/m);
+        assert.match(text, /^• #1 a: boom$/m);
+        assert.match(text, /^• #2 b: not launched/m);
+    });
+
     it("appends a job's model note and leaves other lines bare", () => {
         const text = formatBatchLaunchResponse({
             batchId: "batch_note",
@@ -446,7 +498,7 @@ describe("formatBatchLaunchResponse", () => {
 
         assert.match(text, /Batch batch_xyz launched 1 subagent\(s\):/);
         assert.match(text, /• alice → sa_1/);
-        assert.match(text, /Skipped \(capacity\): bob, carol/);
+        assert.match(text, /^Skipped \(2\):\n• bob: capacity full\n• carol: capacity full$/m);
     });
 
     it("formats the zero-launched case clearly", () => {
@@ -456,7 +508,7 @@ describe("formatBatchLaunchResponse", () => {
             skipped: [{ name: "only" }],
         });
 
-        assert.equal(text, "Batch batch_empty: no jobs launched — capacity full.\nSkipped (capacity): only");
+        assert.equal(text, "Batch batch_empty: no jobs launched — capacity full.\nSkipped (1):\n• only: capacity full");
     });
 
     it("formats a launch with failed jobs", () => {
@@ -469,7 +521,7 @@ describe("formatBatchLaunchResponse", () => {
 
         assert.match(text, /Batch batch_fail launched 1 subagent\(s\):/);
         assert.match(text, /• alice → sa_1/);
-        assert.match(text, /Failed \(1\): bob: spawn exited with status 1/);
-        assert.match(text, /Skipped \(capacity\): carol/);
+        assert.match(text, /^Failed \(1\):\n• bob: spawn exited with status 1$/m);
+        assert.match(text, /^Skipped \(1\):\n• carol: capacity full$/m);
     });
 });

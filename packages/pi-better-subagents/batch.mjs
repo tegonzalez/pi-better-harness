@@ -25,7 +25,7 @@ export const batchLaunchOutputSchema = {
             type: "array",
             items: {
                 type: "object",
-                properties: { job: { type: "integer", minimum: 1 }, name: { type: "string" }, id: { type: "string" }, modelNote: { type: "string" } },
+                properties: { job: { type: "integer", minimum: 1 }, name: { type: "string" }, id: { type: "string" }, modelNote: { type: "string" }, warning: { type: "string" } },
                 required: ["job", "name", "id"],
                 additionalProperties: false,
             },
@@ -43,8 +43,8 @@ export const batchLaunchOutputSchema = {
             type: "array",
             items: {
                 type: "object",
-                properties: { job: { type: "integer", minimum: 1 }, name: { type: "string" } },
-                required: ["job", "name"],
+                properties: { job: { type: "integer", minimum: 1 }, name: { type: "string" }, reason: { type: "string" } },
+                required: ["job", "name", "reason"],
                 additionalProperties: false,
             },
         },
@@ -261,36 +261,37 @@ export function planBatchLaunches({
 }
 
 /**
- * Format the launch response for subagent_spawn_batch.
+ * Format the launch response for subagent_spawn_batch. Every job gets its own
+ * line with its 1-based position, so a failed, skipped, or degraded job is
+ * never hidden in a summary.
  */
 export function formatBatchLaunchResponse({ batchId, batchName, launched, skipped, failed }) {
     const lines = [];
     const label = batchName ? `${batchName} (${batchId})` : batchId;
+    const position = (entry) => (entry.job !== undefined ? `#${entry.job} ` : "");
+    const oneLine = (value) => String(value).replace(/\s*\n\s*/g, " ").trim();
 
     if (launched.length === 0) {
-        const reason = skipped.length ? " — capacity full" : "";
+        const reason = skipped.length && !failed?.length ? " — capacity full" : "";
         lines.push(`Batch ${label}: no jobs launched${reason}.`);
     } else {
         lines.push(
             `Batch ${label} launched ${launched.length} subagent(s):`,
         );
-        for (const { name, id, modelNote } of launched) {
-            lines.push(`• ${name} → ${id}${modelNote ? ` · ${modelNote}` : ""}`);
+        for (const entry of launched) {
+            const notes = [entry.modelNote, entry.warning].filter(Boolean).map(oneLine);
+            lines.push(`• ${position(entry)}${entry.name} → ${entry.id}${notes.length ? ` · ${notes.join(" · ")}` : ""}`);
         }
     }
 
     if (failed?.length) {
-        lines.push(
-            `Failed (${failed.length}): ${failed
-                .map((f) => `${f.name}: ${f.reason}`)
-                .join("; ")}`,
-        );
+        lines.push(`Failed (${failed.length}):`);
+        for (const entry of failed) lines.push(`• ${position(entry)}${entry.name}: ${oneLine(entry.reason)}`);
     }
 
     if (skipped.length) {
-        lines.push(
-            `Skipped (capacity): ${skipped.map((j) => j.name).join(", ")}`,
-        );
+        lines.push(`Skipped (${skipped.length}):`);
+        for (const entry of skipped) lines.push(`• ${position(entry)}${entry.name}: ${oneLine(entry.reason ?? "capacity full")}`);
     }
 
     return lines.join("\n");

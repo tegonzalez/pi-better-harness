@@ -679,8 +679,8 @@ fi
         const ids = [...text.matchAll(/\bsa_[a-z0-9_]+/g)].map((match) => match[0]);
         assert.equal(ids.length, 2);
         // Both jobs name their own defaults explicitly, so neither launch line carries a note.
-        assert.match(text, /• Payments Developer → sa_[a-z0-9_]+$/m);
-        assert.match(text, /• Review Agent → sa_[a-z0-9_]+$/m);
+        assert.match(text, /^• #1 Payments Developer → sa_[a-z0-9_]+$/m);
+        assert.match(text, /^• #2 Review Agent → sa_[a-z0-9_]+$/m);
         const metas = ids.map((id) => JSON.parse(readFileSync(join(runtimeTmp, "pi-better-subagents", "runs", id, "meta.json"), "utf8")));
         assert.equal(metas[0].catalog.snapshotDigest, metas[1].catalog.snapshotDigest);
         assert.equal(metas[0].model, "openai/gpt-6.1-sol");
@@ -733,10 +733,10 @@ fi
         const text = textOf(result);
         const lines = text.split("\n").filter((line) => line.startsWith("• "));
         assert.equal(lines.length, 3, text);
-        assert.match(lines[0], /^• \S*dev-a\S* → sa_[a-z0-9_]+ · model openai\/gpt-6-astra@high \(role developer default openai\/gpt-6\.1-sol@high\)$/);
-        assert.match(lines[1], /^• \S*dev-b\S* → sa_[a-z0-9_]+ · model openai\/gpt-6-astra@high \(role developer default openai\/gpt-6\.1-sol@high\)$/);
+        assert.match(lines[0], /^• #1 \S*dev-a\S* → sa_[a-z0-9_]+ · model openai\/gpt-6-astra@high \(role developer default openai\/gpt-6\.1-sol@high\)$/);
+        assert.match(lines[1], /^• #2 \S*dev-b\S* → sa_[a-z0-9_]+ · model openai\/gpt-6-astra@high \(role developer default openai\/gpt-6\.1-sol@high\)$/);
         // The reviewer default is astra@medium, so the shared model changes nothing there.
-        assert.match(lines[2], /^• \S*rev\S* → sa_[a-z0-9_]+$/);
+        assert.match(lines[2], /^• #3 \S*rev\S* → sa_[a-z0-9_]+$/);
     });
 
     it("treats a blocked catalog job as a batch failure and does not start that child", async () => {

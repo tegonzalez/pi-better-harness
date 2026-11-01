@@ -2313,9 +2313,9 @@ export default function (pi: ExtensionAPI) {
 
             const names = assignBatchJobNames(p.jobs);
             const batchId = nextBatchId();
-            const launched: { job: number; name: string; id: string; modelNote?: string }[] = [];
+            const launched: { job: number; name: string; id: string; modelNote?: string; warning?: string }[] = [];
             const failed: { job: number; name: string; reason: string }[] = [];
-            const skipped: { job: number; name: string }[] = [];
+            const skipped: { job: number; name: string; reason: string }[] = [];
             // How many reject-mode reserved slots are still held (not yet committed/released).
             let reservedRemaining = launchAvailable ? 0 : p.jobs.length;
 
@@ -2329,7 +2329,7 @@ export default function (pi: ExtensionAPI) {
                 if (launchAvailable) {
                     if (!gate.tryReserve(1, activeConcurrencyCap())) {
                         for (let j = i; j < p.jobs.length; j++) {
-                            skipped.push({ job: j + 1, name: names[j] });
+                            skipped.push({ job: j + 1, name: names[j], reason: "capacity full" });
                         }
                         break;
                     }
@@ -2351,10 +2351,12 @@ export default function (pi: ExtensionAPI) {
                             name = prepared.assign.name;
                         }
                     }
-                    const { id, modelNote } = await spawnSubagentRun(ctx, { ...merged, name }, { batchId, batchName: p.batchName });
+                    const { id, modelNote, warn } = await spawnSubagentRun(ctx, { ...merged, name }, { batchId, batchName: p.batchName });
                     gate.commit(1);
                     if (!launchAvailable) reservedRemaining -= 1;
-                    launched.push({ job: i + 1, name, id, ...(modelNote ? { modelNote } : {}) });
+                    // The same disabled/unmapped-tool warning a single spawn prints; a batch must not drop it.
+                    const warning = warn.trim().replace(/\s*\n\s*/g, " ");
+                    launched.push({ job: i + 1, name, id, ...(modelNote ? { modelNote } : {}), ...(warning ? { warning } : {}) });
                 } catch (err) {
                     gate.release(1);
                     if (!launchAvailable) reservedRemaining -= 1;

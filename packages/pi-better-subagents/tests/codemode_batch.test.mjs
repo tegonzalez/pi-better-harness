@@ -124,7 +124,7 @@ test('native Pi codemode batch receipts', { skip: !supported && 'native codemode
             onCapacity: 'launch-available', jobs: [{ prompt: 'admit', name: 'admit' }, { prompt: 'skip', name: 'skip' }] }));
         assert.equal(partial.status, 'partial');
         assert.deepEqual(partial.launched.map(({ job, name }) => ({ job, name })), [{ job: 1, name: 'admit' }]);
-        assert.deepEqual(partial.skipped, [{ job: 2, name: 'skip' }]);
+        assert.deepEqual(partial.skipped, [{ job: 2, name: 'skip', reason: 'capacity full' }]);
         assert.deepEqual(partial.failed, []);
         assert.equal(registry.readMeta(partial.launched[0].id).batchId, partial.batchId);
         const last = running('occupied-last');
@@ -132,7 +132,7 @@ test('native Pi codemode batch receipts', { skip: !supported && 'native codemode
         const full = await script(tool, spawn({ shared: { tools: 'read,bash', sandbox: false },
             onCapacity: 'launch-available', jobs: [{ prompt: 'blocked', name: 'blocked' }] }));
         assert.equal(full.status, 'not-launched');
-        assert.deepEqual([full.launched, full.failed, full.skipped], [[], [], [{ job: 1, name: 'blocked' }]]);
+        assert.deepEqual([full.launched, full.failed, full.skipped], [[], [], [{ job: 1, name: 'blocked', reason: 'capacity full' }]]);
         assert.equal(metas().length, before);
         for (const id of [...fillers, last]) registry.writeMeta({ ...registry.readMeta(id), status: 'completed' });
     });

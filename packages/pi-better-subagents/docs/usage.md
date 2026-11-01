@@ -187,13 +187,15 @@ text(receipt);
 |-------|---------|
 | `status` | `launched`: every effective job launched; `partial`: some launched and some failed or were skipped; `not-launched`: none launched; `clarification-needed`: selection needs a human decision and nothing launched. These are launch outcomes, never completion outcomes. |
 | `batchId`, `batchName` | Assigned batch identity and optional label. No batch ID is assigned for clarification. |
-| `launched` | `{ job, name, id, modelNote? }` for each created run. |
+| `launched` | `{ job, name, id, modelNote?, warning? }` for each created run. `warning` carries the same disabled or unmapped tool notice a single `subagent_spawn` prints. |
 | `failed` | `{ job, name, reason }` for launch failures, including later jobs not attempted after a reject-mode launch failure. |
-| `skipped` | `{ job, name }` for jobs omitted because capacity was full in `launch-available` mode. |
+| `skipped` | `{ job, name, reason }` for jobs omitted because capacity was full in `launch-available` mode (`reason: "capacity full"`). |
 | `message`, `choices` | Explanation and selection options on a clarification receipt. |
 
 `job` is a 1-based position in the effective batch order, after any confirmed
-role split. All three job lists are always present. Invalid input and whole-batch
+role split. The tool text lists every job on its own line with the same
+position (`• #2 name: reason`), under `Failed (n):` and `Skipped (n):` headings, so
+no job outcome is reduced to a summary. All three job lists are always present. Invalid input and whole-batch
 capacity rejection still throw, so codemode callers must catch those errors.
 Returned partial or no-launch receipts do not throw; inspect `status` and every
 list instead of treating a fulfilled promise as complete success.
