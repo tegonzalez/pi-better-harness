@@ -72,6 +72,10 @@ Each issue row shows where it is between code and delivery: `●` while it is be
 
 The binding records the active workflow's name, which is shown in the plan view. A different active workflow cannot read or update that binding; a new invocation invalidates it. After ownership release, the prior binding remains available for read-only inspection but cannot authorize writes. The skill name is not an allowlist: explicit binding opts a workflow into the shared schema and transition rules, while path confinement to `.resolve-issues/rush/<run-id>/task-plan.json`, run identity, size limits, and revision checks still apply. Workflows using other schemas or storage locations retain their own planning and must not bind incompatible state.
 
+## Model Context and Prompt Caching
+
+The plan never enters the system prompt, which only gains the fixed Harness execution policy, so plan progress does not invalidate the provider's cached prefix. Instead, at the start of a run the plan adds one hidden `pi-better-plan-context` message holding the steps, ready steps, and guidance for the active delegation mode. It adds one only when the plan revision or delegation mode differs from the latest such message in the branch's model context, and never moves or rewrites earlier ones, so earlier history stays byte-stable. When the plan is cleared, or a workflow takes over planning, one message says no generic plan is active. Changes made by `update_plan` within a run reach the model through the tool call and its result.
+
 ## Plan Display
 
 Native and workflow-synced plans share a `plan` heading, completion counts, aligned identifiers and titles, and status colors. Completed rows use `✓`, active rows `●`, pending rows `○`, and blocked rows `!`. Active and blocked rows also carry text labels; failed workflow rows use `×` and `failed` rather than an active indicator.

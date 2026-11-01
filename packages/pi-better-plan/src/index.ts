@@ -82,6 +82,27 @@ const UpdatePlanSchema = Type.Object({
 type WorkflowPlanInput = Omit<RushPlanUpdate, "event"> & { path?: string; event?: string };
 
 const LEGACY_PLAN_NAV_STATUS_KEY = "pi-better-plan-nav";
+/** Custom message type for plan snapshots in the model context. */
+export const PLAN_CONTEXT = "pi-better-plan-context";
+const INACTIVE_PLAN_REVISION = "none";
+const INACTIVE_PLAN_PROMPT = "No generic structured execution plan is active. Earlier structured execution plan messages are superseded.";
+
+function planContextRevision(plan: PlanSnapshot, mode: DelegationMode): string {
+  return `${plan.planId}:${plan.revision}:${mode}`;
+}
+
+/** Revision of the latest plan message in the compaction-aware context of the current branch. */
+function contextPlanRevision(ctx: ExtensionContext): string | undefined {
+  const entries = ctx.sessionManager?.buildContextEntries?.();
+  if (!Array.isArray(entries)) return undefined;
+  for (let index = entries.length - 1; index >= 0; index--) {
+    const entry = entries[index]!;
+    if (entry.type !== "custom_message" || entry.customType !== PLAN_CONTEXT) continue;
+    const revision = (entry.details as { revision?: unknown } | undefined)?.revision;
+    return typeof revision === "string" ? revision : undefined;
+  }
+  return undefined;
+}
 const DELEGATION_MODE_REQUEST = "pi-better-subagents:delegation-mode-request";
 type DelegationMode = "manual" | "adaptive" | "coordinator";
 
@@ -550,13 +571,28 @@ export default function planExtension(pi: ExtensionAPI): void {
   pi.on("session_tree", async (_event, ctx) => {
     restore(ctx);
   });
+  // The system prompt carries only deterministic text, so plan progress never invalidates the
+  // provider's cached prefix. The plan reaches the model as a persisted message, added once per
+  // plan revision or delegation mode and never moved, so earlier history stays byte-stable too.
   pi.on("before_agent_start", async (event, ctx) => {
     const systemPrompt = appendExecutionPolicy(event.systemPrompt);
-    if (workflowPlanOwner(ctx) || workflowBinding(ctx.sessionManager.getBranch()) || !currentPlan) {
-      return systemPrompt === event.systemPrompt ? undefined : { systemPrompt };
+    const result = systemPrompt === event.systemPrompt ? {} : { systemPrompt };
+    const active = workflowPlanOwner(ctx) || workflowBinding(ctx.sessionManager.getBranch()) ? null : currentPlan;
+    const mode = active ? activeDelegationMode(pi) : null;
+    const revision = active && mode ? planContextRevision(active, mode) : INACTIVE_PLAN_REVISION;
+    const previous = contextPlanRevision(ctx);
+    // Nothing to supersede when no plan message is in context and no plan is active.
+    if (revision === previous || (revision === INACTIVE_PLAN_REVISION && previous === undefined)) {
+      return "systemPrompt" in result ? result : undefined;
     }
     return {
-      systemPrompt: `${systemPrompt}\n\n${planPrompt(currentPlan, activeDelegationMode(pi))}`,
+      ...result,
+      message: {
+        customType: PLAN_CONTEXT,
+        content: active && mode ? planPrompt(active, mode) : INACTIVE_PLAN_PROMPT,
+        display: false,
+        details: { revision },
+      },
     };
   });
   pi.on("session_shutdown", async (_event, ctx) => {
@@ -605,7 +641,7 @@ function planPrompt(plan: PlanSnapshot, mode: DelegationMode): string {
       ? "Coordinator delegation mode: consult agents_catalog and delegate nontrivial role-owned milestones according to current role descriptions. Keep orchestration, cross-role decisions, unowned or ambiguous work, integration, and final verification in the foreground."
       : "Adaptive delegation mode: identify substantial independent work before implementation. Delegate a bounded task when useful and available while continuing unblocked foreground work; keep tightly coupled work in the foreground.";
   return [
-    "Current structured execution plan:",
+    "Current structured execution plan (supersedes earlier plan messages; later update_plan calls supersede it):",
     ...plan.steps.map(stepLine),
     ...(plan.steps.some((item) => item.dependsOn?.length)
       ? [`Ready pending steps: ${planProgress(plan).readyIndices.map((index) => plan.steps[index]!.step).join(", ") || "none"}. Start only steps whose prerequisites are complete.`]

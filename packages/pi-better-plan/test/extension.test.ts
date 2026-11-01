@@ -7,11 +7,22 @@ import type { AutocompleteItem } from "@earendil-works/pi-tui";
 
 import extension, { planArgumentCompletions } from "../src/index.js";
 import { planSetEntry, replacePlan } from "../src/plan-state.js";
+import type { PlanStepInput } from "../src/types.js";
 
 interface SessionEntry {
   type: string;
   customType?: string;
   data?: unknown;
+}
+
+type PromptUpdate = {
+  systemPrompt?: string;
+  message?: { customType: string; content: string; display?: boolean; details?: unknown };
+} | undefined;
+
+/** Everything the plan extension adds to one model run: system prompt plus any plan message. */
+function planContext(update: PromptUpdate): string {
+  return [update?.systemPrompt ?? "", update?.message?.content ?? ""].join("\n");
 }
 
 interface CommandDefinition {
@@ -123,10 +134,13 @@ test("plan tools persist progress without taking over editor navigation", async 
   assert.equal((result.details as any).progress.completed, 1);
   assert.equal((result.details as any).plan.steps[1].status, "in_progress");
 
-  const promptUpdate = await handlers.get("before_agent_start")?.({ systemPrompt: "base prompt" }, ctx) as { systemPrompt?: string };
-  assert.match(promptUpdate.systemPrompt ?? "", /Adaptive delegation mode/);
-  assert.match(promptUpdate.systemPrompt ?? "", /Mark distinct foreground and delegated milestones in_progress concurrently/);
-  assert.match(promptUpdate.systemPrompt ?? "", /inspected, integrated/);
+  const promptUpdate = await handlers.get("before_agent_start")?.({ systemPrompt: "base prompt" }, ctx) as PromptUpdate;
+  assert.doesNotMatch(promptUpdate?.systemPrompt ?? "", /Current structured execution plan/, "plan state stays out of the system prompt");
+  assert.equal(promptUpdate?.message?.customType, "pi-better-plan-context");
+  assert.equal(promptUpdate?.message?.display, false);
+  assert.match(planContext(promptUpdate), /Adaptive delegation mode/);
+  assert.match(planContext(promptUpdate), /Mark distinct foreground and delegated milestones in_progress concurrently/);
+  assert.match(planContext(promptUpdate), /inspected, integrated/);
 });
 
 test("active delegation mode controls plan guidance without changing plan steps", async () => {
@@ -151,7 +165,7 @@ test("active delegation mode controls plan guidance without changing plan steps"
   extension(pi);
   await handlers.get("session_start")?.({}, ctx);
   await tools.get("update_plan")!.execute("plan", { plan: [{ step: "Build", status: "in_progress" }] }, undefined, undefined, ctx);
-  const prompt = async () => (await handlers.get("before_agent_start")?.({ systemPrompt: "base" }, ctx) as { systemPrompt: string }).systemPrompt;
+  const prompt = async () => planContext(await handlers.get("before_agent_start")?.({ systemPrompt: "base" }, ctx) as PromptUpdate);
   assert.match(await prompt(), /Manual delegation mode: a plan does not authorize proactive delegation/);
   assert.doesNotMatch(await prompt(), /Delegate a bounded task/);
   mode = "coordinator";
@@ -233,8 +247,8 @@ test("plan tool reports ready DAG steps and rejects premature transitions", asyn
   const result = await getPlan.execute("get", {}, undefined, undefined, ctx);
   assert.match((result.content[0] as { text: string }).text, /Integrate \(after: api, worker\)/);
   assert.match((result.content[0] as { text: string }).text, /Ready: Build worker/);
-  const prompt = await handlers.get("before_agent_start")?.({ systemPrompt: "base" }, ctx) as { systemPrompt: string };
-  assert.match(prompt.systemPrompt, /Ready pending steps: Build worker/);
+  const prompt = await handlers.get("before_agent_start")?.({ systemPrompt: "base" }, ctx) as PromptUpdate;
+  assert.match(planContext(prompt), /Ready pending steps: Build worker/);
   const count = entries.length;
   const expectedPlan = structuredClone((updated.details as any).plan);
   await assert.rejects(updatePlan.execute("early", { plan: steps.map((item) =>
@@ -268,8 +282,8 @@ test("skill-owned workflow suppresses the generic plan and its update tool", asy
   entries.push({ type: "custom", customType: "pi-better-workflow", data: {
     version: 1, kind: "set", owner: { name: "fixture", planOwner: "workflow" },
   } });
-  const workflowPrompt = await handlers.get("before_agent_start")?.({ systemPrompt: "base" }, ctx) as { systemPrompt: string };
-  assert.doesNotMatch(workflowPrompt.systemPrompt, /Current structured execution plan:/);
+  const workflowPrompt = await handlers.get("before_agent_start")?.({ systemPrompt: "base" }, ctx) as PromptUpdate;
+  assert.doesNotMatch(planContext(workflowPrompt), /Current structured execution plan/);
   await assert.rejects(update.execute("owned", { plan: [{ step: "Wrong plan", status: "in_progress" }] }, undefined, undefined, ctx), /owns the task plan/);
   const owned = await tools.get("get_plan")!.execute("get", {}, undefined, undefined, ctx);
   assert.match((owned.content[0] as { text: string }).text, /fixture owns the task plan/);
@@ -305,18 +319,18 @@ test("released handoff suppresses stale generic guidance until a generic replace
     on(event: string, handler: (event: any, ctx: ExtensionContext) => unknown) { handlers.set(event, handler); },
   } as unknown as ExtensionAPI);
   await handlers.get("session_start")!({}, ctx);
-  const handoffPrompt = await handlers.get("before_agent_start")!({ systemPrompt: "base" }, ctx) as { systemPrompt: string };
-  assert.doesNotMatch(handoffPrompt.systemPrompt, /Stale generic/,
+  const handoffPrompt = await handlers.get("before_agent_start")!({ systemPrompt: "base" }, ctx) as PromptUpdate;
+  assert.doesNotMatch(planContext(handoffPrompt), /Stale generic/,
     "an unavailable handoff is not permission to resume the stale generic checklist");
   await tools.get("update_plan")!.execute("replace", {
     plan: [{ step: "New generic", status: "in_progress" }],
   }, undefined, undefined, ctx);
-  const prompt = await handlers.get("before_agent_start")!({ systemPrompt: "base" }, ctx) as { systemPrompt: string };
-  assert.match(prompt.systemPrompt, /New generic/);
-  assert.doesNotMatch(prompt.systemPrompt, /Stale generic/);
+  const prompt = await handlers.get("before_agent_start")!({ systemPrompt: "base" }, ctx) as PromptUpdate;
+  assert.match(planContext(prompt), /New generic/);
+  assert.doesNotMatch(planContext(prompt), /Stale generic/);
   await handlers.get("session_tree")!({}, ctx);
-  const restoredPrompt = await handlers.get("before_agent_start")!({ systemPrompt: "base" }, ctx) as { systemPrompt: string };
-  assert.match(restoredPrompt.systemPrompt, /New generic/);
+  const restoredPrompt = await handlers.get("before_agent_start")!({ systemPrompt: "base" }, ctx) as PromptUpdate;
+  assert.match(planContext(restoredPrompt), /New generic/);
 });
 
 test("a completed plan clears durably after 30 seconds and replacement cancels the deadline", async () => {
@@ -411,3 +425,92 @@ test("a completed plan clears durably after 30 seconds and replacement cancels t
     Date.now = realDateNow;
   }
 });
+test("plan context keeps the system prompt and earlier history byte-stable across turns", async () => {
+  const entries: Array<SessionEntry & { content?: string; details?: unknown }> = [];
+  const tools = new Map<string, ToolDefinition>();
+  const handlers = new Map<string, (event: any, ctx: ExtensionContext) => unknown>();
+  const events = new EventEmitter();
+  let mode = "adaptive";
+  events.on("pi-better-subagents:delegation-mode-request", (request: { mode?: string }) => { request.mode = mode; });
+  const ctx = {
+    mode: "print", hasUI: false,
+    sessionManager: {
+      getBranch: () => entries,
+      buildContextEntries: () => entries.filter((entry) => entry.type === "custom_message"),
+    },
+    ui: { setWidget() {}, setStatus() {} },
+  } as unknown as ExtensionContext;
+  extension({
+    events,
+    appendEntry(customType: string, data: unknown) { entries.push({ type: "custom", customType, data }); },
+    registerTool(tool: ToolDefinition) { tools.set(tool.name, tool); },
+    registerCommand() {},
+    on(event: string, handler: (event: any, ctx: ExtensionContext) => unknown) { handlers.set(event, handler); },
+  } as unknown as ExtensionAPI);
+  await handlers.get("session_start")!({}, ctx);
+
+  // Simulates one model request per run: pi persists a returned message, then sends system + history.
+  const requests: string[] = [];
+  const run = async (): Promise<{ systemPrompt: string; message: string | undefined }> => {
+    const result = await handlers.get("before_agent_start")!({ systemPrompt: "base" }, ctx) as
+      { systemPrompt?: string; message?: { customType: string; content: string; details?: unknown } } | undefined;
+    const systemPrompt = result?.systemPrompt ?? "base";
+    if (result?.message) {
+      entries.push({ type: "custom_message", customType: result.message.customType,
+        content: result.message.content, details: result.message.details });
+    }
+    const request = [systemPrompt, ...entries.filter((entry) => entry.type === "custom_message").map((entry) => entry.content)]
+      .join("\u0000");
+    const previous = requests.at(-1);
+    if (previous !== undefined) assert.ok(request.startsWith(previous), "each request starts with the previous one unchanged");
+    requests.push(request);
+    return { systemPrompt, message: result?.message?.content };
+  };
+  const update = (plan: PlanStepInput[]) => tools.get("update_plan")!.execute("u", { plan }, undefined, undefined, ctx);
+
+  const empty = await run();
+  assert.equal(empty.message, undefined, "no plan, no plan message");
+  await update([{ id: "a", step: "Build", status: "in_progress" }, { id: "b", step: "Ship", status: "pending", dependsOn: ["a"] }]);
+  const first = await run();
+  assert.equal(first.systemPrompt, empty.systemPrompt, "creating a plan does not change the system prompt");
+  assert.match(first.message ?? "", /Current structured execution plan[\s\S]*\[in_progress\] Build/);
+  assert.match(first.message ?? "", /Adaptive delegation mode/);
+
+  const unchanged = await run();
+  assert.equal(unchanged.systemPrompt, first.systemPrompt, "same plan: system prompt is byte-identical");
+  assert.equal(unchanged.message, undefined, "same plan: no new plan message");
+
+  await update([{ id: "a", step: "Build", status: "completed" }, { id: "b", step: "Ship", status: "in_progress", dependsOn: ["a"] }]);
+  const progressed = await run();
+  assert.equal(progressed.systemPrompt, first.systemPrompt, "plan progress does not change the system prompt");
+  assert.match(progressed.message ?? "", /\[completed\] Build/);
+  assert.equal((await run()).message, undefined);
+
+  mode = "manual";
+  const manual = await run();
+  assert.equal(manual.systemPrompt, first.systemPrompt);
+  assert.match(manual.message ?? "", /Manual delegation mode/);
+  assert.equal((await run()).message, undefined);
+
+  await clearByCompletion(update);
+  const cleared = await run();
+  assert.equal(cleared.systemPrompt, first.systemPrompt);
+  assert.match(cleared.message ?? "", /No generic structured execution plan is active/);
+  assert.equal((await run()).message, undefined);
+});
+
+async function clearByCompletion(update: (plan: PlanStepInput[]) => Promise<unknown>): Promise<void> {
+  // A completed plan clears itself after a delay; capture and fire that timer.
+  const realSetTimeout = globalThis.setTimeout;
+  let fire: (() => void) | undefined;
+  globalThis.setTimeout = ((callback: () => void) => {
+    fire = callback;
+    return { unref() {} } as unknown as ReturnType<typeof setTimeout>;
+  }) as typeof setTimeout;
+  try {
+    await update([{ id: "a", step: "Build", status: "completed" }, { id: "b", step: "Ship", status: "completed", dependsOn: ["a"] }]);
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+  }
+  fire?.();
+}
