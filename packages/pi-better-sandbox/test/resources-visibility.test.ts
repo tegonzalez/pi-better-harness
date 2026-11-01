@@ -1,5 +1,5 @@
 /**
- * D5 visibility: the configured `resources.command` limits and `resources.tmpSize` are recorded in the audit entry
+ * Visibility of resource limits: the configured `resources.command` limits and `resources.tmpSize` are recorded in the audit entry
  * `pi-better-sandbox-read-confinement`, shown by `/sandbox workspace` and `/sandbox diagnostics confinement`, and
  * covered by `policyHash` (the hash the real policy loader computes for the policy file).
  *

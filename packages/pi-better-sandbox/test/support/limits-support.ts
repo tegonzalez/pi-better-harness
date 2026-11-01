@@ -1,6 +1,6 @@
 /**
- * Shared helpers for the resource-limit acceptance tests (decision D5, command limits and private /tmp size:
- * the read-confinement policy's optional `resources.command` and `resources.tmpSize`).
+ * Shared helpers for the resource-limit tests (command limits and private /tmp size: the read-confinement
+ * policy's optional `resources.command` and `resources.tmpSize`).
  *
  * Everything launches through the package's own controller, frozen plan and argument builder
  * (`buildSandboxCommand` / the foreground shell operations); nothing hand-writes bubblewrap or systemd-run
@@ -32,6 +32,8 @@ export const controllerWith = (fx: Fixture, resources?: Resources, overrides: Pa
  * Why real `systemd-run --user --scope` cases cannot run here, or false. The probe starts a scope with all five
  * properties and reads the cgroup files the kernel enforces them through, so a missing user manager and a missing
  * delegated controller (cpu, memory, pids) are both detected by what they do.
+ * These skips are deliberately NOT turned into failures by PI_SANDBOX_REQUIRE_BACKEND: that variable names sandbox
+ * backends (docs/development-and-release.md, "Sandbox confinement lanes"), and a systemd user manager is not one.
  */
 export function systemdSkip(): string | false {
     if (process.platform !== "linux") return "Linux systemd only";

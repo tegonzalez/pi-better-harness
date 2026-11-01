@@ -1,5 +1,5 @@
 /**
- * Shared test support for the remote session-limit tests (`resources.session`, decision D5).
+ * Shared test support for the remote session-limit tests (`resources.session`).
  * Generic: no host, user, path, model or site value.
  */
 import { existsSync, readFileSync } from "node:fs";
@@ -12,7 +12,7 @@ export const sessionFixtures = join(here, "fixtures", "remote-session");
 export const stubBin = join(sessionFixtures, "bin");
 export const piStub = join(sessionFixtures, "pi-stub.sh");
 
-/** Frozen interface: the five session keys and the systemd property each maps to. */
+/** The interface: the five session keys and the systemd property each maps to. */
 export const SESSION_KEYS = {
     memoryMax: "MemoryMax",
     memorySwapMax: "MemorySwapMax",

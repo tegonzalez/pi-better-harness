@@ -1,5 +1,5 @@
 /**
- * D5 command limits and private /tmp size (parser half): the read-confinement policy's optional `resources`
+ * Command limits and private /tmp size (parser half): the read-confinement policy's optional `resources`
  * object, with optional `resources.command` (keys `memoryMax`, `memorySwapMax`, `tasksMax`, `cpuQuota`,
  * `runtimeMaxSec`) and optional `resources.tmpSize`. Every key is optional; any other key, form or value is
  * refused at load (fail closed); every value is part of `policyHash`.

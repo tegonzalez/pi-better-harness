@@ -1,10 +1,10 @@
 /**
- * Remote session limits (`resources.session`, decision D5, wave P1.3): target parser and generated
+ * Remote session limits (`resources.session`): target parser and generated
  * launch script. Pure unit tests plus runs of the generated script against stand-in `systemd-run`
  * and pi executables (no real systemd here; see remote_session_limits_run.test.mjs for that).
  *
- * Expectations derive from the plan (dc-doc-plan.md: limit keys table, AC-02) and from systemd
- * semantics, not from product output. "Unset changes nothing" is checked against the launch and stop
+ * Expectations derive from the five documented limit keys (memoryMax, memorySwapMax, tasksMax,
+ * cpuQuota, runtimeMaxSec) and from systemd semantics, not from product output. "Unset changes nothing" is checked against the launch and stop
  * scripts and run record as they were at the baseline commit b853864 (read with `git show`).
  *
  * // @level unit

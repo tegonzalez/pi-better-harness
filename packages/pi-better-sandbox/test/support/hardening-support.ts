@@ -1,7 +1,11 @@
 /**
- * Shared helpers for the confined-launch hardening acceptance tests (decision D4: private IPC and UTS
- * namespaces, no nested user namespaces, no kernel keyring, no inherited descriptors, and the `hardening`
- * switches of the read-confinement policy).
+ * Shared helpers for the confined-launch hardening tests (private IPC and UTS namespaces, no nested user
+ * namespaces, no kernel keyring, no inherited descriptors, and the `hardening` switches of the
+ * read-confinement policy).
+ *
+ * Skip convention for real-kernel suites: a missing or unusable bubblewrap skips the suite, except when
+ * `PI_SANDBOX_REQUIRE_BACKEND` is set (see "Sandbox confinement lanes" in docs/development-and-release.md),
+ * where it throws instead. `environmentSkip` and `requireOrSkip` below apply that rule.
  *
  * Everything here launches through the package's own controller, plan and argument builder (the foreground
  * shell operations); nothing hand-writes bubblewrap arguments. Expected results are derived from kernel and
@@ -10,7 +14,7 @@
  */
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { defaultSandboxPermissions } from "../../permissions.ts";
@@ -36,14 +40,28 @@ export const syscalls = SYSCALLS[process.arch];
 
 export const hostLibc = (code: string, args: string[] = []) => spawnSync(PYTHON, ["-c", code, ...args], { encoding: "utf8" });
 
-/** Why the real-bubblewrap tests cannot run here, or false. */
+/**
+ * A skip reason for a missing or unusable bubblewrap. When `PI_SANDBOX_REQUIRE_BACKEND` is set the lane must
+ * prove its backend, so the reason becomes a thrown error (the same rule `realBackendSkip` applies).
+ */
+export function requireOrSkip(reason: string): string {
+    const required = process.env.PI_SANDBOX_REQUIRE_BACKEND;
+    if (required) throw new Error(`PI_SANDBOX_REQUIRE_BACKEND=${required} but ${reason}`);
+    return reason;
+}
+
+/** Why the real-bubblewrap tests cannot run here, or false. Throws instead of skipping when a backend is required. */
 export function environmentSkip(): string | false {
-    if (process.platform !== "linux") return "Linux bubblewrap only";
+    // Checked first: a required Linux backend on a platform without it must fail, not skip as "not Linux".
     const backend = realBackendSkip();
     if (backend) return backend;
-    const probe = spawnSync("bwrap", ["--unshare-pid", "--unshare-net", "--ro-bind", "/usr", "/usr", "--ro-bind", "/lib", "/lib",
+    if (process.platform !== "linux") return "Linux bubblewrap only";
+    if (!existsSync(PYTHON)) return `${PYTHON} is required for the in-sandbox probes`;
+    // The probe runs the executable the product itself selected (never a PATH lookup: the product ignores PATH).
+    const support = describeSandboxSupport();
+    const probe = spawnSync(support.supported ? support.executable : "bwrap", ["--unshare-pid", "--unshare-net", "--ro-bind", "/usr", "/usr", "--ro-bind", "/lib", "/lib",
         "--ro-bind", "/bin", "/bin", "--ro-bind", "/lib64", "/lib64", "--", PYTHON, "-c", "print(1)"], { encoding: "utf8" });
-    if (probe.status !== 0) return `bubblewrap with --unshare-pid/--unshare-net and ${PYTHON} unavailable: ${(probe.stderr || probe.error?.message || "").trim()}`;
+    if (probe.status !== 0) return requireOrSkip(`bubblewrap with --unshare-pid/--unshare-net and ${PYTHON} unavailable: ${(probe.stderr || probe.error?.message || "").trim()}`);
     return false;
 }
 

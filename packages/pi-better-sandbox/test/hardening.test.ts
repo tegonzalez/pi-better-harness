@@ -1,16 +1,17 @@
 /**
- * D4 acceptance with real bubblewrap: a confined launch gets a private IPC namespace and a private UTS
+ * Confined-launch hardening with real bubblewrap: a confined launch gets a private IPC namespace and a private UTS
  * namespace (fixed or policy-named hostname), cannot create user namespaces, cannot use the kernel keyring,
  * and each `hardening` switch set to `false` removes exactly its own measure (the old behaviour returns while
  * the other measures stay in force). Launches go through the package's own controller, frozen plan and
  * argument builder (the foreground shell operations); nothing hand-writes bubblewrap arguments.
  *
- * Remediation rows covered here: ipc-uts, userns, keyring, switches (real-bubblewrap half).
+ * Covers the private IPC and hostname, user-namespace, keyring and per-switch behaviour (the real-bubblewrap half of the switch proof).
  * Expected results come from kernel and bubblewrap semantics (a SysV id of another IPC namespace is EINVAL,
  * `--disable-userns` makes CLONE_NEWUSER fail, a seccomp filter makes keyctl/add_key/request_key fail with
  * EPERM or ENOSYS), not from the product's output.
  *
- * Skips cleanly without bubblewrap, a working user namespace, python3, or a non-scratch fixture base.
+ * Skips cleanly without bubblewrap, a working user namespace, python3, or a non-scratch fixture base; with
+ * PI_SANDBOX_REQUIRE_BACKEND set, a missing or unusable bubblewrap fails instead of skipping.
  * Host resources created (a SysV segment, a POSIX queue, a user key) are removed afterwards.
  * @level kernel
  */

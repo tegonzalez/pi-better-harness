@@ -1,5 +1,5 @@
 /**
- * AC-02, command cases (decision D5): `resources.command` bounds every confined launch with its own transient
+ * Command limits: `resources.command` bounds every confined launch with its own transient
  * `systemd-run --user --scope` (memoryMax, memorySwapMax, tasksMax, cpuQuota, runtimeMaxSec); `resources.tmpSize`
  * sizes the private /tmp tmpfs. REAL `systemd-run --user` and real bubblewrap, launched through the package's own
  * controller, frozen plan and argument builder, with small capped values and bounded loops (never an unbounded
@@ -8,10 +8,12 @@
  * Fail closed: a configured limit with no reachable user manager is refused with a recorded reason (inactive audit
  * entry, shown by /sandbox workspace and /sandbox diagnostics confinement) and the command never runs; unset limits
  * change nothing (no systemd-run, the launch works with no user manager). The "missing controller" half of the
- * fail-closed clause has no portable seam and is listed as an open evidence obligation in the commit report.
+ * fail-closed clause has no portable seam and is not covered here.
  *
  * Skips cleanly, with a reason, without bubblewrap / a non-scratch fixture base (all cases), and without a
  * reachable systemd user manager that delegates the cpu, memory and pids controllers (real-scope cases).
+ * With PI_SANDBOX_REQUIRE_BACKEND set, a missing or unusable bubblewrap fails instead of skipping; a missing
+ * systemd user manager still skips, because that variable names sandbox backends and systemd is not one.
  * @level kernel
  */
 import assert from "node:assert/strict";
