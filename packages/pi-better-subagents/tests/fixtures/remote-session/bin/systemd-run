@@ -1,0 +1,27 @@
+#!/bin/sh
+# Test stand-in for `systemd-run` (session-limit tests only; never used with real systemd).
+# Records each invocation (flags, -p properties, command) to $STUB_SYSTEMD_LOG, then either fails like a
+# missing user manager (STUB_SYSTEMD_FAIL set) or runs the command in place, as `systemd-run --scope` does.
+: "${STUB_SYSTEMD_LOG:?}"
+tmp="$STUB_SYSTEMD_LOG.$$"
+: > "$tmp"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --user) printf 'FLAG\tuser\n' >> "$tmp"; shift;;
+    --scope) printf 'FLAG\tscope\n' >> "$tmp"; shift;;
+    -p|--property) printf 'PROP\t%s\n' "$2" >> "$tmp"; shift 2;;
+    --property=*) printf 'PROP\t%s\n' "${1#--property=}" >> "$tmp"; shift;;
+    --unit|--slice|--description|--setenv|--working-directory|-E|-u|-d) printf 'OPT\t%s %s\n' "$1" "$2" >> "$tmp"; shift 2;;
+    --) shift; break;;
+    -*) printf 'OPT\t%s\n' "$1" >> "$tmp"; shift;;
+    *) break;;
+  esac
+done
+printf 'CMD\t%s\n' "$*" >> "$tmp"
+printf 'END\n' >> "$tmp"
+cat "$tmp" >> "$STUB_SYSTEMD_LOG"; rm -f "$tmp"
+if [ -n "$STUB_SYSTEMD_FAIL" ]; then
+  echo "Failed to connect to user scope bus: stand-in for a missing user manager" >&2
+  exit 1
+fi
+exec "$@"
