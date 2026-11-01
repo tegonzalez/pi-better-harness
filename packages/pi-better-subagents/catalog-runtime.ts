@@ -473,6 +473,7 @@ function resolutionContext(host: CatalogHost, config: SubagentConfig): ModelReso
         tiers: host.tiers ?? tiersForLaunch(config),
         foregroundModel: host.foregroundModel,
         configuredDefaultModel: host.configuredDefaultModel !== undefined ? host.configuredDefaultModel : config.defaultModel,
+        ...(host.userRoot ? { userRoot: host.userRoot } : {}),
     };
 }
 

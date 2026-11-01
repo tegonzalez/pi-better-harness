@@ -604,7 +604,9 @@ fi
             sandbox: false,
         }, null, null, host), (error) => {
             assert.match(error.message, /Role role\.developer default model openai\/gpt-6\.1-sol is not usable/);
-            assert.match(error.message, /set an available defaults\.model for role\.developer in the personal role file ~\/\.pi\/agent\/agents\/roles\/role\.developer\.md or with \/agents/);
+            // role.developer is shipped: the fix names the personal file under PI_CODING_AGENT_DIR that would replace it.
+            const personal = join(fx.userRoot, "agents", "roles", "role.developer.md");
+            assert.ok(error.message.includes(`set an available defaults.model for role.developer in the personal role file ${personal} or with /agents`), error.message);
             assert.match(error.message, /listed in that tier's members/);
             assert.match(error.message, /crossProvider: true/);
             assert.doesNotMatch(error.message.split("Fix:")[1], /role role\.developer/i);

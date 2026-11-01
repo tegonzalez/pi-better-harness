@@ -13,7 +13,9 @@
  */
 
 import { resolveSelection, type EffectiveDefinition, type FieldValue } from "./catalog-resolver.ts";
-import type { CatalogSnapshot } from "./catalog-store.ts";
+import { homedir } from "node:os";
+import { join, sep } from "node:path";
+import { defaultUserRoot, userCatalogPaths, type CatalogSnapshot } from "./catalog-store.ts";
 import type { Diagnostic } from "./catalog-schema.ts";
 import { THINKING_LEVELS, parseModelThinking, type ThinkingLevel } from "./thinking.ts";
 import {
@@ -87,6 +89,8 @@ export interface ModelResolutionContext {
     /** Existing subagent `defaultModel`. Used only when the catalog has no model preference. */
     configuredDefaultModel?: string | null;
     effortSupport?: (model: ResolvableModel) => readonly ThinkingLevel[];
+    /** Personal catalog root, named when a fix belongs in a personal role file. Default: `defaultUserRoot()` (honours `PI_CODING_AGENT_DIR`). */
+    userRoot?: string;
 }
 
 export interface ResolveModelInput extends ModelResolutionContext {
@@ -255,6 +259,7 @@ export function assessSelection(
         foregroundModel: context.foregroundModel,
         configuredDefaultModel: context.configuredDefaultModel,
         effortSupport: context.effortSupport,
+        userRoot: context.userRoot,
     });
     return {
         id,
@@ -592,7 +597,7 @@ function fallbackPreference(
         requested,
         requestedSource,
         message: `${ownerLabel(effective)} default model ${requested} is not usable (${unusableBecause(located)}). ${tierReason}`,
-        setDefault: `${setDefaultHint(effective)}; or add an ordered same-tier candidate under tierPolicy in config to opt into a fallback (${candidateRules(requested)})`,
+        setDefault: `${setDefaultHint(effective, input.userRoot)}; or add an ordered same-tier candidate under tierPolicy in config to opt into a fallback (${candidateRules(requested)})`,
     });
 }
 
@@ -605,15 +610,32 @@ function candidateRules(requested: string): string {
     return `the candidate must also be listed in that tier's members, and ${cross}`;
 }
 
-/** Where the owner of an unavailable default can set a working one. */
-function setDefaultHint(effective: EffectiveDefinition): string {
+/**
+ * Where the owner of an unavailable default can set a working one. A project or personal role
+ * is named by the file it was loaded from; a shipped role by the personal file that would replace it.
+ */
+function setDefaultHint(effective: EffectiveDefinition, userRoot: string | undefined): string {
     const roleId = effective.kind === "agent" ? effective.roleId : effective.id;
+    const roleSource = effective.kind === "agent" ? effective.roleSource : effective.source;
     const roleDefault = roleId
-        ? `defaults.model for ${roleId} in the personal role file ~/.pi/agent/agents/roles/${roleId}.md or with /agents`
+        ? `defaults.model for ${roleId} in ${roleFileHint(roleId, roleSource, userRoot)} or with /agents`
         : "its role's defaults.model with /agents";
     return effective.kind === "agent"
         ? `set an available model override for ${effective.id}, or an available ${roleDefault}`
         : `set an available ${roleDefault}`;
+}
+
+function roleFileHint(roleId: string, source: EffectiveDefinition["source"], userRoot: string | undefined): string {
+    if (source?.scope === "project") return `the project role file ${displayPath(source.path)}`;
+    if (source?.scope === "user") return `the personal role file ${displayPath(source.path)}`;
+    const personal = join(userCatalogPaths(userRoot ?? defaultUserRoot()).roles, `${roleId}.md`);
+    return `the personal role file ${displayPath(personal)}`;
+}
+
+/** Abbreviates the home directory to `~` so the hint reads like the documented location. */
+function displayPath(path: string): string {
+    const home = homedir();
+    return home && path.startsWith(`${home}${sep}`) ? `~${path.slice(home.length)}` : path;
 }
 
 function ownerLabel(effective: EffectiveDefinition): string {
