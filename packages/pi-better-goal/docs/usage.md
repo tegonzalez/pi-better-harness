@@ -11,7 +11,7 @@ It ships one extension that:
 - pauses the active goal on `escape` by default (while still interrupting a running agent turn), keeps it paused while you talk to the agent, resumes it on a clear go-ahead, and never pokes a paused goal
 - tells the agent, right after a blocking `ask_user_question` is answered, which background work finished while the question was pending
 - publishes a typed activity snapshot on `pi.events`
-- adds goal-aware prompt context while background work is active, so foreground idleness is not confused with goal completion
+- adds goal-aware prompt context about background work, so foreground idleness is not confused with goal completion; the system prompt holds only fixed guidance, and the live background summary is a hidden status message added to the history once per change, so the cached prompt prefix stays byte-stable across runs
 - sends a hidden follow-up when active background work drains to zero, including `callback:false` subagent runs
 - provides a `/better-activity` command and `get_background_activity` tool for inspection
 
@@ -186,10 +186,12 @@ callback batches are follow-ups that wait for the entire run. When a question
 that started while background work was running is answered, the extension
 steers one hidden message into the same turn listing the work that finished
 while the question was pending, so the agent harvests it together with the
-answer instead of after the rest of the run. When background
-work is running at the start of a turn, the prompt context also tells the
-agent to harvest finished results before asking and to ask only when the
-answer is needed.
+answer instead of after the rest of the run. The goal's
+system prompt also tells the agent that, while background work is running, it
+should harvest finished results before asking and ask only when the answer is
+needed. That guidance is fixed text; whether work is running, and which, comes
+from the latest hidden `pi-better-goal-background` status message, which is
+added at the start of a run only when the background summary has changed.
 
 ## Goal Clock
 

@@ -2254,6 +2254,53 @@ test("running background work warns the agent that a blocking question holds com
   assert.match(update.systemPrompt ?? "", /Harvest finished background results before asking/);
 });
 
+test("the goal system prompt stays byte-stable while background activity changes between runs", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval", "setTimeout"] });
+  const { commands, handlers, ctx, events } = createContinuationHarness();
+  // Messages a run attaches join the session context, as Pi persists them.
+  const contextEntries: Array<{ type: string; customType?: string; content?: unknown; details?: unknown }> = [];
+  (ctx.sessionManager as unknown as { buildContextEntries(): unknown[] }).buildContextEntries = () => contextEntries;
+  let items: Array<{ id: string; label?: string; status: string; active: boolean }> = [];
+  events.emit("pi-better-goal:register-provider", { id: "fixture", getActivity: () => ({ providerId: "fixture", items }) });
+  await handlers.get("session_start")?.({}, ctx);
+  await commands.get("goal")?.handler("keep watching", ctx);
+
+  type Update = { systemPrompt: string; message?: { customType: string; content: string; display: boolean; details: { revision: string } } };
+  const run = async (): Promise<Update> => {
+    const update = await handlers.get("before_agent_start")?.({ systemPrompt: "base" }, ctx) as Update;
+    if (update.message) contextEntries.push({ type: "custom_message", ...update.message });
+    return update;
+  };
+
+  const idle = await run();
+  assert.equal(idle.message, undefined, "no background status before any background work");
+  items = [{ id: "sa_1", label: "developer", status: "running", active: true }];
+  const first = await run();
+  const same = await run();
+  items = [{ id: "sa_1", label: "developer", status: "completed", active: false }, { id: "sa_2", status: "running", active: true }];
+  const changed = await run();
+  items = [];
+  const drained = await run();
+
+  for (const update of [first, same, changed, drained]) {
+    assert.equal(update.systemPrompt, idle.systemPrompt, "background activity never changes the system prompt");
+  }
+  assert.match(idle.systemPrompt, /keep any structured plan current/);
+  assert.match(idle.systemPrompt, /inspected and integrated/);
+  assert.match(idle.systemPrompt, /ask_user_question\) holds this whole turn/);
+  assert.doesNotMatch(idle.systemPrompt, /sa_1|developer/, "live background details stay out of the system prompt");
+
+  assert.equal(first.message?.display, false);
+  assert.match(first.message?.content ?? "", /developer \(sa_1\): running/);
+  assert.match(first.message?.content ?? "", /Foreground idleness alone is not goal completion/);
+  assert.equal(same.message, undefined, "unchanged background state adds nothing to the history");
+  assert.match(changed.message?.content ?? "", /sa_2: running/);
+  assert.doesNotMatch(changed.message?.content ?? "", /sa_1/);
+  assert.match(drained.message?.content ?? "", /No delegated background work is running/);
+  assert.equal(contextEntries.length, 3, "one status message per background change");
+  await handlers.get("session_shutdown")?.({}, ctx);
+});
+
 const abortedOutcome = { messages: [{ role: "assistant", content: [], stopReason: "aborted" }] };
 const answeredOutcome = { messages: [{ role: "assistant", content: [{ type: "text", text: "Here is the answer." }], stopReason: "stop" }] };
 const networkFailureOutcome = { messages: [{ role: "assistant", content: [], stopReason: "error", errorMessage: "fetch failed" }] };

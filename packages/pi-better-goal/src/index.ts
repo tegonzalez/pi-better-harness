@@ -117,6 +117,48 @@ function pausedGoalPrompt(goal: GoalSnapshot, conversationalResume: boolean, inc
 
 const BLOCKING_QUESTION_TOOLS: ReadonlySet<string> = new Set(["ask_user_question"]);
 
+/**
+ * Background activity changes between runs without any Goal change. Pi sends a returned system
+ * prompt as the provider's cached prefix, so the prompt carries only fixed guidance and the live
+ * summary joins the history as a status message, once per change.
+ */
+export const BACKGROUND_STATUS_CONTEXT = "pi-better-goal-background";
+const BACKGROUND_COMPLETION_GUIDANCE =
+  " Whenever the latest Goal background status reports delegated background work running, foreground idleness alone is not goal completion; keep any structured plan current and do not mark verification, the plan, or the goal complete until every relevant delegated task reaches a terminal state and its result or failure has been inspected and integrated.";
+const BACKGROUND_QUESTION_GUIDANCE =
+  "While background work is running, a blocking user question (ask_user_question) holds this whole turn until the user answers, and background completions wait behind it. Harvest finished background results before asking, and ask only when the answer is needed to proceed.";
+const BACKGROUND_IDLE_REVISION = "idle";
+
+function backgroundStatusRevision(snapshot: ActivitySnapshot): string {
+  return snapshot.backgroundRunning ? `running:${summarizeActiveBackground(snapshot)}` : BACKGROUND_IDLE_REVISION;
+}
+
+function backgroundStatusContent(snapshot: ActivitySnapshot): string {
+  return snapshot.backgroundRunning
+    ? `Goal background status: delegated background work is running (${summarizeActiveBackground(snapshot)}). Foreground idleness alone is not goal completion. get_background_activity reports live activity.`
+    : "Goal background status: No delegated background work is running. get_background_activity reports live activity.";
+}
+
+/** Revision of the latest background status message in the compaction-aware context, or null when unavailable. */
+function contextBackgroundRevision(ctx: ExtensionContext): string | undefined | null {
+  const sessionManager = ctx.sessionManager as { buildContextEntries?: () => unknown } | undefined;
+  if (typeof sessionManager?.buildContextEntries !== "function") return null;
+  let entries: unknown;
+  try {
+    entries = sessionManager.buildContextEntries();
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(entries)) return null;
+  for (let index = entries.length - 1; index >= 0; index--) {
+    const entry = entries[index] as { type?: unknown; customType?: unknown; details?: unknown } | undefined;
+    if (entry?.type !== "custom_message" || entry.customType !== BACKGROUND_STATUS_CONTEXT) continue;
+    const revision = (entry.details as { revision?: unknown } | undefined)?.revision;
+    return typeof revision === "string" ? revision : undefined;
+  }
+  return undefined;
+}
+
 const GOAL_ACTIONS: readonly AutocompleteItem[] = [
   { value: "pause", label: "pause", description: "Pause the active goal" },
   { value: "resume", label: "resume", description: "Resume the paused goal" },
@@ -328,6 +370,8 @@ export default function (pi: ExtensionAPI): void {
   let collectionPending = false;
   let latestSnapshot: ActivitySnapshot | null = null;
   let backgroundDrainTracker: BackgroundDrainTracker | null = null;
+  // Background status revision last attached to a run, used when the session context is unavailable.
+  let announcedBackgroundRevision: string | undefined;
   let lastAttentionSignature = "";
   let continuationQueuedFor: string | null = null;
   let idleContinuationTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1192,6 +1236,7 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    announcedBackgroundRevision = undefined;
     terminalInputUnsubscribe?.();
     terminalInputUnsubscribe = undefined;
     terminalInputIsEditor = undefined;
@@ -1320,12 +1365,19 @@ export default function (pi: ExtensionAPI): void {
       return pausedInstruction ? { systemPrompt: `${event.systemPrompt}\n\n${pausedInstruction}` } : undefined;
     }
 
-    const questionInstruction = snapshot.backgroundRunning
-      ? " A blocking user question (ask_user_question) holds this whole turn until the user answers, and background completions wait behind it. Harvest finished background results before asking, and ask only when the answer is needed to proceed."
-      : "";
+    const questionInstruction = BACKGROUND_QUESTION_GUIDANCE;
     const heldInstruction = goal?.status === "active" && currentContinuationState(ctx, goal.goalId)?.blocked
       ? "Automatic Goal continuation is held for no progress. Answer the current user message or inspect delivered background results without restarting autonomous Goal work. Only /goal resume or alt+g reopens this hold."
       : "";
+    // Attach a background status message only when it differs from the latest one in context.
+    const backgroundStatus = (): { message?: { customType: string; content: string; display: false; details: { revision: string } } } => {
+      const revision = backgroundStatusRevision(snapshot);
+      const known = contextBackgroundRevision(ctx);
+      const previous = known === null ? announcedBackgroundRevision : known;
+      if (revision === previous || (previous === undefined && revision === BACKGROUND_IDLE_REVISION)) return {};
+      announcedBackgroundRevision = revision;
+      return { message: { customType: BACKGROUND_STATUS_CONTEXT, content: backgroundStatusContent(snapshot), display: false, details: { revision } } };
+    };
 
     if (owner) {
       if (!workflowAvailable(owner)) {
@@ -1355,27 +1407,28 @@ export default function (pi: ExtensionAPI): void {
             : "") +
           (questionInstruction ? `\n\n${questionInstruction.trim()}` : "") +
           (heldInstruction ? `\n\n${heldInstruction}` : ""),
+        ...backgroundStatus(),
       };
     }
 
     if (!isPokeable(goal)) return;
-    const backgroundInstruction = snapshot.backgroundRunning
-      ? ` The goal still has delegated background work running (${summarizeActiveBackground(snapshot)}). Foreground idleness alone is not goal completion; keep any structured plan current and do not mark verification, the plan, or the goal complete until every relevant delegated task reaches a terminal state and its result or failure has been inspected and integrated.`
-      : "";
     if (harnessPresent) {
       // Harness owns the outcome text. Retain only the Goal-specific guidance
-      // that the Outcome & Todo prompt cannot replace.
-      const retained = [heldInstruction, backgroundInstruction.trim(), questionInstruction.trim(), permissionPrompt]
+      // that the Outcome & Todo prompt cannot replace. The text is fixed; the live
+      // background summary rides in the hidden status message.
+      const retained = [heldInstruction, BACKGROUND_COMPLETION_GUIDANCE.trim(), questionInstruction.trim(), permissionPrompt]
         .filter((part) => part.length > 0);
-      return retained.length > 0
-        ? { systemPrompt: `${event.systemPrompt}\n\n${retained.join("\n\n")}` }
-        : undefined;
+      return {
+        systemPrompt: `${event.systemPrompt}\n\n${retained.join("\n\n")}`,
+        ...backgroundStatus(),
+      };
     }
     return {
       systemPrompt:
         `${event.systemPrompt}\n\n` +
-        `Pi Better Goal active objective: ${goal.objective}. ${heldInstruction || "Keep working through clear low-risk next steps, and mark complete only after an evidence-backed completion audit."}${backgroundInstruction}${questionInstruction}` +
+        `Pi Better Goal active objective: ${goal.objective}. ${heldInstruction || "Keep working through clear low-risk next steps, and mark complete only after an evidence-backed completion audit."}${BACKGROUND_COMPLETION_GUIDANCE} ${questionInstruction}` +
         (permissionPrompt ? `\n\n${permissionPrompt}` : ""),
+      ...backgroundStatus(),
     };
   });
 

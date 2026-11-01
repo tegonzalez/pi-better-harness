@@ -359,3 +359,60 @@ test("an escape-paused workflow goal puts the paused instruction before, and ove
   assert.doesNotMatch(running, /pressed escape|overrides the workflow/);
   await handlers.get("session_shutdown")?.({}, ctx);
 });
+
+test("a workflow goal's system prompt stays byte-stable while background activity changes", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval", "setTimeout"] });
+  const dir = mkdtempSync(join(tmpdir(), "pi-workflow-stable-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = join(dir, "agent");
+  t.after(() => {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const skillPath = join(dir, "SKILL.md");
+  writeFileSync(skillPath, "---\nname: fixture\nmetadata:\n  workflow-role: coordinator\n---\n# Fixture\nOnly coordinate work.\n");
+  const entries: Array<{ type: string; customType?: string; data?: unknown }> = [];
+  const handlers = new Map<string, (event: any, ctx: ExtensionContext) => unknown>();
+  const commands = new Map<string, { handler(args: string, ctx: ExtensionContext): Promise<void> | void }>();
+  const events = new EventEmitter();
+  const ctx = {
+    cwd: dir,
+    hasUI: false,
+    isIdle: () => true,
+    sessionManager: { getBranch: () => entries, getSessionId: () => "workflow-stable" },
+    ui: { notify() {}, setStatus() {}, setWidget() {} },
+  } as unknown as ExtensionContext;
+  const pi = {
+    events,
+    appendEntry(customType: string, data: unknown) { entries.push({ type: "custom", customType, data }); },
+    getCommands: () => [{ name: "skill:fixture", source: "skill", sourceInfo: { path: skillPath } }],
+    sendMessage() {},
+    sendUserMessage() {},
+    registerCommand(name: string, command: { handler(args: string, ctx: ExtensionContext): Promise<void> | void }) { commands.set(name, command); },
+    registerTool() {},
+    on(event: string, handler: (event: any, ctx: ExtensionContext) => unknown) { handlers.set(event, handler); },
+  } as unknown as ExtensionAPI;
+  extension(pi);
+  let running = false;
+  events.emit("pi-better-goal:register-provider", {
+    id: "fixture",
+    getActivity: () => ({ providerId: "fixture", items: running ? [{ id: "sa_1", status: "running", active: true }] : [] }),
+  });
+  await handlers.get("session_start")?.({ reason: "startup" }, ctx);
+  await commands.get("goal")?.handler("/skill:fixture implement task", ctx);
+
+  type Update = { systemPrompt: string; message?: { content: string } };
+  const idle = await handlers.get("before_agent_start")?.({ systemPrompt: "base" }, ctx) as Update;
+  running = true;
+  const busy = await handlers.get("before_agent_start")?.({ systemPrompt: "base" }, ctx) as Update;
+  running = false;
+  const drained = await handlers.get("before_agent_start")?.({ systemPrompt: "base" }, ctx) as Update;
+  assert.match(idle.systemPrompt, /Only coordinate work/);
+  assert.equal(busy.systemPrompt, idle.systemPrompt, "starting background work leaves the system prompt unchanged");
+  assert.equal(drained.systemPrompt, idle.systemPrompt, "draining background work leaves the system prompt unchanged");
+  assert.equal(idle.message, undefined);
+  assert.match(busy.message?.content ?? "", /sa_1: running/);
+  assert.match(drained.message?.content ?? "", /No delegated background work is running/);
+  await handlers.get("session_shutdown")?.({}, ctx);
+});
