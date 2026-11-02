@@ -79,10 +79,12 @@ test("every component is a bundled dependency pinned at its workspace version", 
 
   for (const packageName of componentPackages) {
     const workspaceVersion = readJson(`packages/${packageName}/package.json`).version;
-    assert.equal(
-      harnessManifest.dependencies[packageName],
-      workspaceVersion,
-      `${packageName} is pinned at ${harnessManifest.dependencies[packageName]} but the workspace is at ${workspaceVersion}`,
+    // Either the exact workspace release, or the sibling directory itself (file:../<id>, installed with
+    // --install-links): the umbrella then ships this checkout's code, which is the workspace version.
+    const pinned = harnessManifest.dependencies[packageName];
+    assert.ok(
+      pinned === workspaceVersion || pinned === `file:../${packageName}`,
+      `${packageName} is pinned at ${pinned} but the workspace is at ${workspaceVersion}`,
     );
     const component = readJson(`packages/${packageName}/package.json`);
     for (const [dependency, version] of Object.entries(component.dependencies ?? {})) {
