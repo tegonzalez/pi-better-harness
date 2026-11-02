@@ -125,7 +125,8 @@ import {
     getSharedCapacityGate,
 } from "./capacity.mjs";
 import { buildHealthCallbackDelivery } from "./completion.ts";
-import { cancelCallbackBatch, getCallbackBatcher, setCallbackBatchContext } from "./shared-callback-batcher.ts";
+import { cancelCallbackBatch, formatUrgentCallback, getCallbackBatcher, setCallbackBatchContext } from "./shared-callback-batcher.ts";
+import { routeUrgentNotice } from "./wait-registry.ts";
 import { completionCallbackFields, failureAttentionFields, healthCallbackFields } from "./callback-fields.ts";
 import { collectRunFailures, failurePath, markFailureAttentionDelivered, pendingFailureAttention } from "./failures.ts";
 import { failureAttentionHandled, observeFailures } from "./shared-failure-observations.ts";
@@ -136,6 +137,7 @@ import {
     subagentResultTool,
     subagentStopTool,
     subagentSteerTool,
+    subagentWaitTool,
 } from "./tools.ts";
 import { stopRun, stopRunAsync } from "./stop.ts";
 import { assertRemoteOptionsSupported, selectRemoteTarget, stopRemoteProcessAsync } from "./remote.ts";
@@ -214,6 +216,7 @@ const SUBAGENT_TOOLS = [
     "subagent_stop",
     "subagent_steer",
     "subagent_result",
+    "subagent_wait",
     "agents_catalog",
 ];
 
@@ -528,6 +531,16 @@ function recoverCompletionCallbacks(pi: ExtensionAPI): void {
     }
 }
 
+type UrgentEvent = Parameters<ReturnType<typeof getCallbackBatcher>["deliverUrgent"]>[0];
+
+/**
+ * An agent blocked in subagent_wait on this run gets the notice in that call's
+ * result (and is woken to act on it); otherwise the batcher delivers it.
+ */
+function deliverUrgentFor(pi: ExtensionAPI, runId: string, event: UrgentEvent): boolean | Promise<boolean> {
+    return routeUrgentNotice(runId, event, (e) => formatUrgentCallback(e), (e) => getCallbackBatcher(pi).deliverUrgent(e));
+}
+
 function deliverFailureAttention(pi: ExtensionAPI | undefined, meta: RunMeta, now: number): void {
     if (!pi || meta.callback === false || callbackSuppressionReason(meta)) return;
     if ((meta.status === "orphaned" || meta.status === "lost") && !isHealthCallbackHandled(meta, meta.status)) return;
@@ -539,7 +552,7 @@ function deliverFailureAttention(pi: ExtensionAPI | undefined, meta: RunMeta, no
     const pending = pendingFailureAttention(state, now, { deferObservationGaps: meta.status === "running" });
     if (!pending || (meta.status !== "running" && meta.status !== "orphaned" && meta.completionCallbackPendingAt !== undefined)) return;
     // Only the pending incidents are rendered; earlier deliveries are counted, not repeated (#315).
-    void getCallbackBatcher(pi).deliverUrgent({
+    void deliverUrgentFor(pi, meta.id, {
         ...failureAttentionFields(meta, state, pending),
         isDelivered: () => failureAttentionHandled(collectRunFailures(meta.id, meta.cwd), pending.incidents),
         getSuppressionReason: () => {
@@ -738,7 +751,7 @@ function deliverHealthCallback(pi: ExtensionAPI | undefined, meta: RunMeta, stat
         writeMeta(meta);
         return;
     }
-    void getCallbackBatcher(pi).deliverUrgent({
+    void deliverUrgentFor(pi, meta.id, {
         ...healthCallbackFields(meta, status, failureState, delivery.content, attention?.incidents ?? []),
         isDelivered: () => {
             const current = readMeta(meta.id);
@@ -838,7 +851,7 @@ function deliverTimingWake(pi: ExtensionAPI | undefined, meta: RunMeta, kind: "d
         try { uiCtx?.ui.notify(content, "warning"); } catch { /* ignore */ }
     }
     if (!pi || meta.callback === false) { markHandled(Date.now()); return; }
-    void getCallbackBatcher(pi).deliverUrgent({
+    void deliverUrgentFor(pi, meta.id, {
         source: "subagent",
         id: meta.id,
         label: timingLabel(meta),
@@ -2671,10 +2684,12 @@ export default function (pi: ExtensionAPI) {
                     : resolution.specs.length
                     ? `Runtime: isolated · extensions ${resolution.specs.join(", ")}\n`
                     : `Runtime: isolated · built-in tools only\n`;
+            // allow_nested loads this extension in the child, so its own tools are not unmapped.
+            const unmapped = allowNested ? resolution.unmapped.filter((tool: string) => !SUBAGENT_TOOLS.includes(tool)) : resolution.unmapped;
             const warn = (unavailable.length ? `Task sandbox: ${unavailable.map((tool) => `${tool.name} disabled (${tool.reason})`).join("; ")}.\n` : "") +
-                (!sandboxEnabled && resolution.unmapped.length
-                ? `NOTE: no extension mapped for ${resolution.unmapped.join(", ")} — ` +
-                  `${resolution.unmapped.length > 1 ? "these tools" : "this tool"} will NOT exist in the child. ` +
+                (!sandboxEnabled && unmapped.length
+                ? `NOTE: no extension mapped for ${unmapped.join(", ")} — ` +
+                  `${unmapped.length > 1 ? "these tools" : "this tool"} will NOT exist in the child. ` +
                   `Add a toolExtensions entry in config.json.\n`
                 : "");
             const modelNote = catalogDefaultNote(resume ? undefined : p.catalog, model, thinking);
@@ -3160,6 +3175,9 @@ export default function (pi: ExtensionAPI) {
     pi.registerTool(acceptanceResultTool);
     publishAcceptanceHooks(acceptanceResultTool);
     pi.registerTool(subagentSteerTool(Type, toolSession));
+    pi.registerTool(subagentWaitTool(Type, toolSession, {
+        onCollected: (id) => markCompletionCallbackSuppressed(id, "collected by subagent_wait"),
+    }));
     const acceptanceStopTool = subagentStopTool(Type, { onStopped: (id) => {
         renderWidget();
         syncHealthTicker();

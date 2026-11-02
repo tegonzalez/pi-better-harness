@@ -16,7 +16,9 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { readMeta, listRunRecords, effectiveStatus, isFinalResultStatus, steerDirFor, type RunCallbackOrigin, type RunMeta, type RunStatus } from "./registry.ts";
-import { enqueueSteer, formatParentSteer, formatSteerLine, formatSteerShort, newSteerId, steerQueueStatus } from "./steer-queue.ts";
+import { STEER_DIR_ENV, enqueueSteer, formatParentSteer, formatSteerLine, formatSteerShort, listSteerRequests, newSteerId, readSteerReceipt, steerQueueStatus } from "./steer-queue.ts";
+import { processExists } from "./spawn.ts";
+import { registerWaiter } from "./wait-registry.ts";
 import { buildSubagentResultPayload } from "./finalization.ts";
 import { stopRunAsync } from "./stop.ts";
 import {
@@ -516,6 +518,147 @@ export function subagentResultTool(Type: TypeModule, baseSession: SubagentToolSe
                 return resultText(assembleRunningResult(p.id, meta, p, scopeKey, runningLines(meta)));
             }
             return resultText(body);
+        },
+    } as ToolDefinition;
+}
+
+// ---- subagent_wait --------------------------------------------------------
+const WAIT_DEFAULT_MINUTES = 30;
+const WAIT_MAX_MINUTES = 120;
+
+/** The wait's bound in ms: default 30 minutes, capped at 120; there is no unlimited value. */
+export function waitTimeoutMs(params: { timeout_minutes?: unknown }): number {
+    const raw = params.timeout_minutes;
+    const minutes = typeof raw === "number" && Number.isFinite(raw) ? raw : WAIT_DEFAULT_MINUTES;
+    return Math.round(Math.min(Math.max(minutes, 0), WAIT_MAX_MINUTES) * 60_000);
+}
+
+export type SubagentWaitHooks = {
+    /** A run was returned: its completion callback must not announce it again. */
+    onCollected?: (id: string) => void;
+    pollMs?: number;
+    /** How long a run whose process vanished may stay unfinalized before it is returned. */
+    exitedGraceMs?: number;
+};
+
+/** Ids of parent amendments queued for this process and not yet receipted. */
+function undeliveredSteerIds(): Set<string> {
+    const dir = process.env[STEER_DIR_ENV];
+    if (!dir) return new Set();
+    try {
+        return new Set(listSteerRequests(dir).filter((request) => !readSteerReceipt(dir, request)).map((request) => request.id));
+    } catch {
+        return new Set();
+    }
+}
+
+/**
+ * Blocks a one-shot (`pi -p`) agent on runs it started, which it otherwise
+ * loses when its single turn ends. Waiting is the agent's decision and bounded.
+ */
+export function subagentWaitTool(Type: TypeModule, baseSession: SubagentToolSession = {}, hooks: SubagentWaitHooks = {}): ToolDefinition {
+    const resultTool = subagentResultTool(Type, baseSession);
+    const pollMs = hooks.pollMs ?? 1_000;
+    const exitedGraceMs = hooks.exitedGraceMs ?? 30_000;
+    return {
+        name: "subagent_wait",
+        label: "Wait for Subagents",
+        description:
+            "Block until the listed subagent runs finish, then return each run's result. Only in a one-shot session " +
+            "(`pi -p`, e.g. you are a subagent): your session ends with your turn and stops every run you started, so " +
+            "completion callbacks never reach you. Bounded: timeout_minutes defaults to 30, max 120. Returns early when " +
+            "your parent sends an amendment or a listed run needs attention.",
+        promptSnippet: "Wait for subagents you started (one-shot sessions only)",
+        promptGuidelines: [
+            "You are in a one-shot session: when you end your turn, runs you started are stopped and their results are lost. For you, 'reported on the next turn' never happens. Before your final answer, call subagent_wait with the ids whose results you need.",
+            "Work on other things first if you can, then wait. If subagent_wait returns early (amendment, attention notice, timeout), act on what it reports, then wait again only for runs you still need.",
+            "Runs returned by subagent_wait are not announced again; use subagent_result with the returned cursor for further pages.",
+        ],
+        defaultActive: false,
+        parameters: Type.Object({
+            ids: Type.Array(Type.String(), { description: "Run ids to wait for (from subagent_spawn or subagent_spawn_batch)." }),
+            timeout_minutes: Type.Optional(Type.Number({ description: "Maximum wait in minutes (default 30, max 120)." })),
+        }),
+        renderResult(result: unknown, options: unknown, theme: unknown) {
+            return renderSubagentResultDisplay(result, options, theme);
+        },
+        async execute(_id: string, params: unknown, signal?: AbortSignal, _onUpdate?: unknown, ctx?: unknown) {
+            const c = (ctx ?? {}) as { mode?: string; hasPendingMessages?: () => boolean };
+            if (c.mode !== "print" && c.mode !== "json") {
+                throw new Error("subagent_wait runs only in a one-shot session (pi -p); this session receives completion callbacks instead.");
+            }
+            const p = params as { ids?: unknown; timeout_minutes?: unknown };
+            const ids = [...new Set(Array.isArray(p.ids) ? p.ids.map(String) : [])];
+            if (ids.length === 0) throw new Error("subagent_wait needs at least one run id in ids.");
+            const session = forCall(baseSession, ctx);
+            for (const id of ids) {
+                const access = resolveRunAccess(id, {}, session);
+                if (access.kind === "missing") throw unknownRunError(id);
+                if (access.kind !== "ok") throw new Error(`subagent_wait: ${id} is not a run of this session; it can only wait on runs it started.`);
+            }
+            // Amendments already pending are reached through pi's queue (hasPendingMessages) once
+            // child-steer hands them over; only new ones count here, so a request that never gets
+            // a receipt cannot make every later wait return at once.
+            const steerBaseline = undeliveredSteerIds();
+
+            const deadline = Date.now() + waitTimeoutMs(p);
+            let wake: () => void = () => {};
+            const waiter = registerWaiter(ids, () => wake());
+            const exitedSince = new Map<string, number>();
+            const done = new Map<string, string>(); // id -> "final" | "unfinalized" | "orphaned"
+            let reason = "";
+            try {
+                for (;;) {
+                    for (const id of ids) {
+                        if (done.has(id)) continue;
+                        const meta = readMeta(id);
+                        if (!meta) { done.set(id, "unfinalized"); continue; }
+                        if (meta.status === "orphaned") { done.set(id, "orphaned"); continue; }
+                        if (meta.status !== "running") { done.set(id, "final"); continue; }
+                        if (processExists(meta.pid)) { exitedSince.delete(id); continue; }
+                        const since = exitedSince.get(id) ?? Date.now();
+                        exitedSince.set(id, since);
+                        if (Date.now() - since >= exitedGraceMs) done.set(id, "unfinalized");
+                    }
+                    if (done.size === ids.length) break;
+                    if (waiter.notices.length) { reason = "a run you wait on needs attention (below)"; break; }
+                    if (c.hasPendingMessages?.() || [...undeliveredSteerIds()].some((sid) => !steerBaseline.has(sid))) { reason = "your parent sent an amendment; it is delivered after this call"; break; }
+                    if (signal?.aborted) { reason = "the call was aborted"; break; }
+                    const left = deadline - Date.now();
+                    if (left <= 0) { reason = "timeout reached"; break; }
+                    await new Promise<void>((resolve) => {
+                        const timer = setTimeout(finish, Math.min(pollMs, left)); // ref'd: keeps a one-shot pi alive
+                        function finish() {
+                            clearTimeout(timer);
+                            signal?.removeEventListener("abort", finish);
+                            wake = () => {};
+                            resolve();
+                        }
+                        wake = finish;
+                        signal?.addEventListener("abort", finish, { once: true });
+                    });
+                }
+            } finally {
+                waiter.dispose();
+            }
+
+            const ready = ids.filter((id) => done.get(id) === "final" || done.get(id) === "unfinalized");
+            const sections: string[] = [];
+            for (const id of ready) {
+                const result = await resultTool.execute("subagent_wait", { id }, undefined, undefined, ctx as never) as { content: Array<{ text?: string }> };
+                sections.push(result.content.map((part) => part.text ?? "").join("\n"));
+                // Only a final result replaces the completion callback; an unfinalized run keeps it.
+                const meta = readMeta(id);
+                if (done.get(id) === "final" && meta && isFinalResultStatus(meta.status)) hooks.onCollected?.(id);
+            }
+            const describe = (id: string) => ({
+                orphaned: "orphaned (its process is gone; inspect with subagent_result)",
+                unfinalized: "process ended but not finalized yet; its completion is still announced",
+            } as Record<string, string>)[done.get(id) ?? ""] ?? "still running";
+            const others = ids.filter((id) => done.get(id) !== "final").map((id) => `${id}: ${describe(id)}`);
+            const header = `subagent_wait: ${ready.length} of ${ids.length} finished${reason ? `; returned early: ${reason}` : ""}.`;
+            const body = [header, ...others, ...waiter.notices, ...sections].join("\n\n");
+            return { content: [{ type: "text" as const, text: body }], details: buildSubagentResultDisplayDetails(body) };
         },
     } as ToolDefinition;
 }
