@@ -128,7 +128,49 @@ thresholds continue to take precedence for subagent health.
 | `subagent_output` | never | Bounded current-session excerpt (default 1 KiB / 10 lines). Params: `id`, `lines` (`tail_lines` is a deprecated alias), `cursor` (a returned `nextCursor`, `statusCursor`, or `incidentCursor`), `max_bytes` (max 4 KiB; raw 16 KiB default, 64 KiB max), `mode` (`raw` pages retained log bytes), `include` (`["cost"]`, `["tools"]`, or both: opt-in spend and tool-count lines), `all` (foreign-session id). Missing/unreadable logs are gaps, not empty healthy output. |
 | `subagent_result` | never | Finished-run answer for the current session (2048-byte page). Params: `id`, `cursor` (a returned `nextCursor` continues the answer; `statusCursor` / `incidentCursor` also accepted), `max_bytes` (maximum 8192 bytes), `lines` (optional line cap per answer page), `mode` (`raw`), `include` (`["cost"]`, `["tools"]`, or both), `all` (foreign-session id). Failures and exceptional lifecycle facts come before progress; no tool-name histories. TUI folding is display-only. |
 | `subagent_stop` | never | SIGTERM a running run's process group. |
+| `subagent_wait` | **yes** | Headless sessions only (see [Nested agents](#nested-agents-waiting-in-a-headless-session)). Blocks until the listed runs finish and returns each run's first `subagent_result` page. Params: `ids` (one or more run ids), `timeout_minutes` (optional). |
 | `subagent_steer` | never | Amend a running child's instructions. Params: `id`, `message`. See [Steering a running subagent](#steering-a-running-subagent). |
+
+## Nested agents: waiting in a headless session
+
+A subagent runs as `pi -p`: it answers one prompt and exits, stopping every
+child it started. It has no next turn, so the completion callback an
+interactive session relies on never reaches it. A child launched with
+`allow_nested:true` therefore also gets `subagent_wait`: the agent calls it to
+block on the runs it needs before it writes its final answer. Waiting is the
+agent's own decision and always bounded; the harness never injects turns to
+make a child keep going (pi-dev `docs/constraints.md`).
+
+- **Where it exists.** Registered inactive (`defaultActive: false`); it becomes
+  active only when named in `--tools`, which `allow_nested` does for the
+  child (sandboxed and remote children get no nested tools). It runs only in
+  a one-shot session (`pi -p`, print or json mode, including a top-level
+  `pi -p --tools …,subagent_wait`); elsewhere it refuses, because those
+  sessions receive completion callbacks.
+- **What it returns.** It blocks until every listed run has a recorded final
+  status, then returns each run's first `subagent_result` page (read the rest
+  with `subagent_result` and the returned cursor). Runs it returned with a
+  final result are not announced again by a completion callback, so the
+  child's final answer is not replaced by a turn about work it already has. A
+  run whose process vanished without being finalized is returned after a short
+  grace period, marked as not finalized, and keeps its completion callback; an
+  `orphaned` run is listed as orphaned. It waits only on runs of its own
+  session.
+- **Bounded.** `timeout_minutes` defaults to 30 and is capped at 120; there
+  is no unlimited value. At the limit it returns, listing the runs still
+  going; the agent decides whether to wait again, stop them or answer.
+- **When it returns early.** When the call is aborted; when the parent sends
+  this child an amendment (`subagent_steer`, including a deadline wrap-up), so
+  the amendment is not held behind the wait; and when a listed run raises an
+  attention notice (failure, stall, orphaned, timing). The notice is part of
+  the result of every wait on that run instead of a separate turn, and is not
+  repeated. Notices for runs it does not wait on are delivered as before.
+- **Its own parent.** Time inside the call counts toward neither progress nor
+  the child's stuck window. A parent deadline ends the wait through its
+  wrap-up amendment; the ceiling stops the child as usual.
+- **Known gap.** If a waiting child is killed with SIGKILL (not SIGTERM), its
+  children, which run in their own process groups, are left running; the
+  parent's navigator lists them as orphaned.
 
 ## Steering a running subagent
 
@@ -398,7 +440,8 @@ an enabled human profile. Saved enabled profiles and session choices stay enable
   `/sandbox`. The fixed `process_list` adapter is available with Process access
   set to Read. Other requested tools are reported as unavailable, with the reason.
 - **No runaway recursion.** Confined children cannot spawn nested agents.
-  `allow_nested:true` loads nested-agent support only for unconfined children.
+  `allow_nested:true` loads nested-agent support, including `subagent_wait`,
+  only for unconfined children.
 
 ### Write sandbox
 
