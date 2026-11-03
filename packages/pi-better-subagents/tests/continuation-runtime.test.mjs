@@ -6,6 +6,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, wr
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { hostLikeSession } from './host-session.mjs';
 
 const root = mkdtempSync(join(tmpdir(), 'continuation-runtime-'));
 process.env.TMPDIR = root;
@@ -42,7 +43,7 @@ function fixture(name) {
   const ctx = { cwd: workspace, model: { provider: 'test', id: 'model' }, hasUI: false,
     isIdle: () => true, ui: { notify() {}, setWidget() {} },
     sessionManager: { getSessionId: () => name, getBranch: () => [] } };
-  extension(host);
+  extension(hostLikeSession(host, handlers));
   const execute = (tool, params) => tools.get(tool).execute('check', params, undefined, undefined, ctx);
   return { execute, workspace, shutdown: () => handlers.get('session_shutdown')?.({}, ctx) };
 }

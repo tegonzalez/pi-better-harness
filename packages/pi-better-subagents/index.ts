@@ -125,7 +125,7 @@ import {
     getSharedCapacityGate,
 } from "./capacity.mjs";
 import { buildHealthCallbackDelivery } from "./completion.ts";
-import { cancelCallbackBatch, formatUrgentCallback, getCallbackBatcher, setCallbackBatchContext } from "./shared-callback-batcher.ts";
+import { callbackBatchBudget, cancelCallbackBatch, formatCallbackBatch, formatUrgentCallback, getCallbackBatcher, setCallbackBatchContext } from "./shared-callback-batcher.ts";
 import { routeUrgentNotice } from "./wait-registry.ts";
 import { completionCallbackFields, failureAttentionFields, healthCallbackFields } from "./callback-fields.ts";
 import { collectRunFailures, failurePath, markFailureAttentionDelivered, pendingFailureAttention } from "./failures.ts";
@@ -139,7 +139,7 @@ import {
     subagentSteerTool,
     subagentWaitTool,
 } from "./tools.ts";
-import { stopRun, stopRunAsync } from "./stop.ts";
+import { stopRun, stopRunAsync, type StopDeps } from "./stop.ts";
 import { assertRemoteOptionsSupported, selectRemoteTarget, stopRemoteProcessAsync } from "./remote.ts";
 import { launchRemoteRun, reconcileRemoteExit } from "./remote-run.ts";
 import {
@@ -362,59 +362,154 @@ function hasSelfProcessIdentity(meta: RunMeta): boolean {
  */
 const directlySupervisedRunIds = new Set<string>();
 
+/** Upper bound on how long session shutdown waits for run stops (remote stops need ssh). */
+export const SHUTDOWN_STOP_BOUND_MS = 8_000;
+let shutdownStopBoundMs = SHUTDOWN_STOP_BOUND_MS;
+let shutdownStopDeps: StopDeps = {};
+
+/** Test seam: inject the remote stop/bridge seams and a shorter bound for the shutdown stop. */
+export function setShutdownStopForTests(deps: StopDeps | undefined, boundMs?: number): void {
+    shutdownStopDeps = deps ?? {};
+    shutdownStopBoundMs = boundMs ?? SHUTDOWN_STOP_BOUND_MS;
+}
+
+interface ShutdownOutcome {
+    /** Runs ended by the shutdown, recorded `killed` with `stoppedReason: "shutdown"`. */
+    stopped: RunMeta[];
+    /** Runs whose stop could not be confirmed in time; still running, marked interrupted. */
+    interrupted: RunMeta[];
+    /** The registry could not be listed: children may still be running, unseen and unstopped. */
+    listError?: string;
+}
+
 /**
- * Detach current-session live work instead of killing it (#625).
- *
- * Subagent children are detached process groups: they survive the foreground
- * process dying. The previous shutdown loop therefore made every controlled
- * `/reload` (and every clean quit) a silent, destructive end to in-flight work —
- * no drain, no warning, and the run recorded `killed`. Shutdown now only records
- * that this session's direct supervision ended; the child and all of its saved
- * state stay untouched, and the next session of the same pi process resumes
- * supervision and finalizes it from the child's own log.
- *
- * Returns the interrupted runs so the caller can warn the human.
+ * Record a shutdown stop: the run ended because its session ended, not because
+ * the caller or a timing policy stopped it. Nobody is listening for it, so its
+ * owed completion is suppressed durably — a stopped run never wakes a later
+ * session with a model turn; its record stays readable through subagent_result.
  */
-function interruptCurrentSessionSubagents(reason: string, ctx: ExtensionContext): RunMeta[] {
+function recordShutdownStop(id: string, reason: string, now: number): RunMeta | undefined {
+    const meta = readMeta(id);
+    if (!meta || meta.status !== "killed") return undefined;
+    meta.stoppedReason = "shutdown";
+    meta.stoppedAt = now;
+    if (meta.completionCallbackSentAt === undefined && meta.completionCallbackSuppressedAt === undefined) {
+        meta.completionCallbackSuppressedAt = now;
+        meta.completionCallbackSuppressedReason = `session ${reason} stopped the run`;
+    }
+    writeMeta(meta);
+    return meta;
+}
+
+/** A stop that could not be confirmed leaves the child running; say so durably so a later session can recover it. */
+function recordUnconfirmedStop(id: string, reason: string, now: number): RunMeta | undefined {
+    const meta = readMeta(id);
+    if (!meta || (meta.status !== "running" && meta.status !== "orphaned")) return undefined;
+    meta.supervisionInterruptedAt = now;
+    meta.supervisionInterruptedReason = reason;
+    writeMeta(meta);
+    return meta;
+}
+
+/**
+ * Stop this session's running subagent children when the session ends or
+ * reloads (quit and `/reload` alike).
+ *
+ * Subagent children are detached process groups: they would keep running, and
+ * spending, with no session left to supervise, bound or stop them (and a later
+ * process would deliver their completion into a turn nobody requested). Shutdown
+ * therefore uses the same stop path as `subagent_stop`: local runs are signalled
+ * synchronously, remote runs abort and stop their remote session through ssh
+ * concurrently, all bounded by SHUTDOWN_STOP_BOUND_MS. Whatever the stop could
+ * not confirm is left running with the interruption marker (reason recorded) so
+ * it stays discoverable instead of silently becoming an orphan.
+ */
+async function stopCurrentSessionSubagents(reason: string, ctx: ExtensionContext): Promise<ShutdownOutcome> {
     const origin = callbackOriginFromContext(ctx);
     const now = Date.now();
-    const interrupted: RunMeta[] = [];
-    for (const summary of listMetasForParent(process.pid)) {
+    const outcome: ShutdownOutcome = { stopped: [], interrupted: [] };
+    const remoteStops: Promise<void>[] = [];
+    // Only runs whose stop went through ssh can still be "in flight" at the bound.
+    const remoteIds = new Set<string>();
+    // One run's bookkeeping failing (an unwritable record, say) must neither reject
+    // the shared wait nor skip the other runs' markers and the warning: such a run is
+    // still reported as unconfirmed, durably marked or not.
+    const markUnconfirmed = (id: string): void => {
+        try {
+            const marked = recordUnconfirmedStop(id, reason, now);
+            if (marked) outcome.interrupted.push(marked);
+        } catch {
+            try {
+                const meta = readMeta(id);
+                if (meta && (meta.status === "running" || meta.status === "orphaned")) outcome.interrupted.push(meta);
+            } catch { /* nothing readable to report */ }
+        }
+    };
+    const settle = (id: string, result: ReturnType<typeof stopRun> | undefined): void => {
+        try {
+            const stopped = result?.action === "stopped" ? recordShutdownStop(id, reason, now) : undefined;
+            if (stopped) { outcome.stopped.push(stopped); return; }
+            // Finalized from its own log (finished already) or not running any more: nothing left to stop.
+            if (result && result.action !== "stopped") return;
+        } catch { /* the stop's record could not be written: treat the run as unconfirmed */ }
+        markUnconfirmed(id);
+    };
+    let summaries: ReturnType<typeof listMetasForParent> = [];
+    try { summaries = listMetasForParent(process.pid); }
+    catch (error) { outcome.listError = error instanceof Error ? error.message : String(error); }
+    for (const summary of summaries) {
         if (!ownedByThisParent(summary)) continue;
         if (summary.status !== "running" && summary.status !== "orphaned") continue;
         if (!belongsToOrigin(summary, origin)) continue;
-        // Corrupt or synthetic metadata must never point the interruption record
-        // (or any later signal) at the foreground Pi process itself.
+        // Corrupt or synthetic metadata must never point a stop signal at the
+        // foreground Pi process itself.
         if (hasSelfProcessIdentity(summary)) continue;
+        const id = summary.id;
         try {
-            // Re-read under the id: a run may have finished while shutdown ran.
-            const meta = readMeta(summary.id);
-            if (!meta || (meta.status !== "running" && meta.status !== "orphaned")) continue;
-            meta.supervisionInterruptedAt = now;
-            meta.supervisionInterruptedReason = reason;
-            writeMeta(meta);
-            interrupted.push(meta);
-        } catch { /* a failed marker must never kill or block the child */ }
-        spendCache.delete(summary.id);
-        healthLogCache.delete(summary.id);
-        resetChildEventLogCursor(summary.id);
+            if (readMeta(id)?.remote) {
+                remoteIds.add(id);
+                remoteStops.push(stopRunAsync(id, shutdownStopDeps).then((result) => settle(id, result), () => settle(id, undefined)));
+            } else {
+                settle(id, stopRun(id, shutdownStopDeps));
+            }
+        } catch { settle(id, undefined); }
+        spendCache.delete(id);
+        healthLogCache.delete(id);
+        resetChildEventLogCursor(id);
     }
-    return interrupted;
+    if (remoteStops.length > 0) {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const bound = new Promise<void>((resolve) => { timer = setTimeout(resolve, shutdownStopBoundMs); timer.unref?.(); });
+        await Promise.race([Promise.all(remoteStops), bound]);
+        if (timer) clearTimeout(timer);
+        // A remote stop still in flight at the bound is unconfirmed: mark it so it is
+        // discoverable. Scoped to the ids sent to a remote stop: a local run whose
+        // child already exited but whose record still says running was judged by its own
+        // stop result above and is not "possibly still running".
+        const settled = new Set([...outcome.stopped, ...outcome.interrupted].map((meta) => meta.id));
+        for (const id of remoteIds) {
+            if (!settled.has(id)) markUnconfirmed(id);
+        }
+    }
+    return outcome;
 }
 
-/** Warn the human that a shutdown/reload left delegated work running (#625). */
-function warnInterruptedSubagents(ctx: ExtensionContext, interrupted: RunMeta[], reason: string): void {
-    if (interrupted.length === 0) return;
-    const count = interrupted.length;
-    const label = count === 1 ? "1 subagent run is" : `${count} subagent runs are`;
-    const ids = interrupted.slice(0, 3).map((meta) => meta.id).join(", ") + (count > 3 ? ", …" : "");
+/** Tell the human what a shutdown/reload did to delegated work. */
+function warnShutdownSubagents(ctx: ExtensionContext, outcome: ShutdownOutcome, reason: string): void {
     const verb = reason === "reload" ? "reload" : "session shutdown";
-    const guidance = reason === "reload"
-        ? "The reloaded session resumes supervision and reports the result; use subagent_stop to end it instead."
-        : "They keep running detached and stay readable with subagent_result/subagent_output; use subagent_stop to end one.";
-    try {
-        ctx.ui.notify(`Subagent ${label} still running (${ids}) — ${verb} no longer kills delegated work. ${guidance}`, "warning");
-    } catch { /* no UI available (print/RPC/quit) */ }
+    const ids = (metas: RunMeta[]) => metas.slice(0, 3).map((meta) => meta.id).join(", ") + (metas.length > 3 ? ", …" : "");
+    const parts: string[] = [];
+    if (outcome.listError !== undefined) {
+        parts.push(`Could not list this session's subagent runs to stop them (${outcome.listError}); runs may still be running — check subagent_list and end them with subagent_stop.`);
+    }
+    if (outcome.stopped.length > 0) {
+        parts.push(`${outcome.stopped.length} subagent run${outcome.stopped.length === 1 ? "" : "s"} stopped by ${verb} (${ids(outcome.stopped)}); results so far stay readable with subagent_result/subagent_output.`);
+    }
+    if (outcome.interrupted.length > 0) {
+        parts.push(`${outcome.interrupted.length} subagent run${outcome.interrupted.length === 1 ? "" : "s"} could not be confirmed stopped (${ids(outcome.interrupted)}) and may still be running; use subagent_stop to end ${outcome.interrupted.length === 1 ? "it" : "them"}.`);
+    }
+    if (parts.length === 0) return;
+    try { ctx.ui.notify(parts.join(" "), outcome.interrupted.length > 0 || outcome.listError !== undefined ? "warning" : "info"); } catch { /* no UI available (print/RPC/quit) */ }
 }
 
 /**
@@ -425,6 +520,105 @@ function warnInterruptedSubagents(ctx: ExtensionContext, interrupted: RunMeta[],
  * no longer has a session.
  */
 let sessionTornDown = false;
+/** Why the session ended (`session_shutdown` reason); names the stop a launch that lost the race to it records. */
+let sessionTornDownReason = "shutdown";
+/**
+ * Counts session teardowns of this instance. A launch captures it on entry and
+ * refuses to proceed (or stops what it started) if a teardown happened meanwhile,
+ * even when a later `session_start` has already cleared the latch: that launch
+ * belongs to a session lifetime that has ended.
+ */
+let sessionEpoch = 0;
+
+function sessionEndedSince(epoch: number): boolean {
+    return sessionTornDown || sessionEpoch !== epoch;
+}
+
+function launchRefusedAfterSessionEnd(): Error {
+    return new Error("Subagent launch refused: the session that asked for it has ended (shutdown, reload or session switch). Nothing was started.");
+}
+
+/**
+ * A remote launch resolved after its session ended: the child is already running
+ * on the remote host, past `stopCurrentSessionSubagents`' sweep. Stop it through
+ * the same bounded path (the record is already written, so a stop that cannot be
+ * confirmed stays discoverable with the interruption marker) and report whether
+ * the stop was confirmed.
+ */
+async function stopLaunchAfterSessionEnd(id: string): Promise<boolean> {
+    const reason = sessionTornDownReason;
+    const now = Date.now();
+    // The run was never allowlisted (its launch epoch had ended), so its notices are quiet
+    // in this process whatever the stop's bookkeeping does or a later `session_start`
+    // does to the teardown latch. Mark it durably BEFORE the stop starts too, so every
+    // other reader sees an interrupted run.
+    const markedAt = markOutlivedBeforeStop(id, reason, now);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const bound = new Promise<undefined>((resolve) => { timer = setTimeout(() => resolve(undefined), shutdownStopBoundMs); timer.unref?.(); });
+    try {
+        const result = await Promise.race([stopRunAsync(id, shutdownStopDeps).catch(() => undefined), bound]);
+        if (result?.action === "stopped" && recordShutdownStop(id, reason, now)) { retireOutlivedMarker(id, markedAt); return true; }
+        if (result && result.action !== "stopped") {
+            // Finished on its own before the stop: nobody is listening for its completion.
+            const meta = readMeta(id);
+            if (meta && meta.completionCallbackSentAt === undefined && meta.completionCallbackSuppressedAt === undefined) {
+                meta.completionCallbackSuppressedAt = now;
+                meta.completionCallbackSuppressedReason = `session ${reason} ended while the run was starting`;
+                writeMeta(meta);
+            }
+            retireOutlivedMarker(id, markedAt);
+            return true;
+        }
+    } catch { /* unconfirmed below */ } finally { if (timer) clearTimeout(timer); }
+    try { recordUnconfirmedStop(id, reason, now); } catch { /* nothing more to record */ }
+    return false;
+}
+
+/**
+ * The ALLOWLIST of runs that may start a model turn: ids of the runs launched by the
+ * CURRENT session lifetime of THIS extension instance (added at launch, only when the
+ * lifetime had not already ended; cleared at `session_start` and at shutdown). Pi loads
+ * extensions with a fresh module on reload, `/new`, `/resume` and fork, so a new
+ * instance starts with an empty set: every run it did not launch itself (a previous
+ * instance's, a previous process's, a late launch that lost the race to a teardown, a
+ * run found `running`, `lost` or completed at `session_start`) is quiet by default and
+ * can never be woken by a missing marker. Durable markers stay (dedupe, previous-process
+ * notices) but are never the only guard.
+ */
+const runsOfCurrentLifetime = new Set<string>();
+
+/**
+ * True when a notice about this run may start a model turn: the current lifetime of this
+ * live instance launched it. A record that carries the shutdown interruption marker is
+ * additionally never woken for (the marker can only narrow the allowlist, never widen it).
+ */
+function mayStartTurn(id: string | undefined, meta?: Pick<RunMeta, "supervisionInterruptedAt">): boolean {
+    return !sessionTornDown && id !== undefined && runsOfCurrentLifetime.has(id) && meta?.supervisionInterruptedAt === undefined;
+}
+
+/** Durable interruption marker, written before the stop (history for other readers; the allowlist is what quiets this process). Returns the marker time when this call wrote it. */
+function markOutlivedBeforeStop(id: string, reason: string, now: number): number | undefined {
+    try {
+        const meta = readMeta(id);
+        if (!meta || (meta.status !== "running" && meta.status !== "orphaned") || meta.supervisionInterruptedAt !== undefined) return undefined;
+        meta.supervisionInterruptedAt = now;
+        meta.supervisionInterruptedReason = reason;
+        writeMeta(meta);
+        return now;
+    } catch { return undefined; /* the in-memory set still quiets this process */ }
+}
+
+/** A stop that was confirmed leaves no interruption marker (the record says `killed` or finished). */
+function retireOutlivedMarker(id: string, markedAt: number | undefined): void {
+    if (markedAt === undefined) return;
+    try {
+        const meta = readMeta(id);
+        if (!meta || meta.supervisionInterruptedAt !== markedAt) return;
+        delete meta.supervisionInterruptedAt;
+        delete meta.supervisionInterruptedReason;
+        writeMeta(meta);
+    } catch { /* a leftover marker is history; it only ever quiets */ }
+}
 
 /**
  * "The rightful conversation is not the active one", not "this notification is
@@ -464,6 +658,82 @@ function markCompletionCallbackSent(id: string, now: number): void {
     writeMeta(meta);
 }
 
+const QUIET_NOTICE_PREFIX = "(from a subagent run whose session has ended; this notice does not ask you to continue) ";
+
+/** The batcher's per-message byte cap, less a fixed lead-in, so a quiet notice stays inside the same bound as a triggering one. */
+function quietNoticeBudget(leadIn: string): number {
+    return Math.max(256, callbackBatchBudget() - Buffer.byteLength(leadIn));
+}
+
+/** Notices whose non-triggering handoff is still in flight, so a retry cannot duplicate one. */
+const quietNoticesInFlight = new Set<string>();
+
+/**
+ * Deliver an urgent notice (deadline, stuck, orphaned, lost, failure attention)
+ * for a run that outlived its session as a non-triggering message. It keeps the
+ * batcher's gates: delivered and suppressed notices are not repeated, an
+ * unreadable record defers, and the receipt is written only after the host
+ * accepted the handoff, so a failed one is retried by the next supervision tick.
+ */
+function deliverQuietUrgent(pi: ExtensionAPI, event: UrgentEvent): boolean | Promise<boolean> {
+    const key = `${event.customType}\u0000${event.id}\u0000${event.status}`;
+    if (quietNoticesInFlight.has(key)) return false;
+    try { if (event.isDelivered?.()) return true; } catch { return false; }
+    try {
+        const reason = event.getSuppressionReason?.();
+        if (reason) {
+            try { event.onSuppressed?.(reason, Date.now()); } catch { /* best-effort durable suppression */ }
+            return true;
+        }
+    } catch { return false; }
+    quietNoticesInFlight.add(key);
+    const acknowledge = (): boolean => {
+        try { event.onDelivered?.(Date.now()); return true; } catch { return false; }
+    };
+    try {
+        const handoff = pi.sendMessage(
+            { customType: event.customType, content: QUIET_NOTICE_PREFIX + formatUrgentCallback(event, { maxBytes: quietNoticeBudget(QUIET_NOTICE_PREFIX) }), display: true },
+            { triggerTurn: false },
+        ) as unknown;
+        if (handoff && typeof (handoff as PromiseLike<unknown>).then === "function") {
+            return Promise.resolve(handoff).then(acknowledge, () => false).finally(() => quietNoticesInFlight.delete(key));
+        }
+        const acknowledged = acknowledge();
+        quietNoticesInFlight.delete(key);
+        return acknowledged;
+    } catch {
+        quietNoticesInFlight.delete(key);
+        return false;
+    }
+}
+
+/**
+ * Deliver the completion of a run whose session ended (a previous Pi process,
+ * or this process's session that has since shut down) as a non-triggering notice
+ * (`triggerTurn: false`): it is appended to the conversation and readable with
+ * subagent_result, and starts nothing. The receipt is written only after the
+ * host accepted it, so a failed handoff is retried by the next recovery.
+ */
+function deliverRecoveredCompletionNotice(pi: ExtensionAPI, meta: RunMeta, fields: ReturnType<typeof completionCallbackFields>, previousProcess: boolean): void {
+    const key = `completion\u0000${meta.id}`;
+    if (quietNoticesInFlight.has(key)) return;
+    const origin = previousProcess ? "from a previous Pi process" : "from a session that has since ended";
+    const leadIn = `Subagent finished while its session was not running (${origin}; this notice does not ask you to continue). `;
+    const content = leadIn + formatCallbackBatch([{ ...fields, callback: true }], { maxBytes: quietNoticeBudget(leadIn) });
+    quietNoticesInFlight.add(key);
+    try {
+        const handoff = pi.sendMessage(
+            { customType: "subagent-restart-notice", content, display: true },
+            { triggerTurn: false },
+        ) as unknown;
+        const done = () => { try { markCompletionDelivered(meta.id, meta.cwd, Date.now()); } catch { /* left pending; the next recovery retries */ } };
+        if (handoff && typeof (handoff as PromiseLike<unknown>).then === "function") {
+            void (handoff as Promise<unknown>).then(done, () => { /* left pending; the next recovery retries */ })
+                .finally(() => quietNoticesInFlight.delete(key));
+        } else { done(); quietNoticesInFlight.delete(key); }
+    } catch { quietNoticesInFlight.delete(key); /* left pending; the next recovery retries */ }
+}
+
 /** Queue one durable ordinary terminal event on the host-shared batch. */
 function enqueueCompletionCallback(pi: ExtensionAPI, id: string): void {
     const meta = readMeta(id);
@@ -475,6 +745,20 @@ function enqueueCompletionCallback(pi: ExtensionAPI, id: string): void {
     const state = collectRunFailures(id, meta.cwd, true);
     // Lifecycle, current actionability, and retained history are separate facts (#315).
     const due = pendingFailureAttention(state, Date.now(), { terminal: true });
+    // Only a run launched by the current lifetime of this instance may start a turn. A run
+    // of a previous Pi process, of an earlier instance or lifetime (reload, /new, /resume,
+    // fork, quit), or one already finished when this lifetime began, finished outside any
+    // turn this session was asked to take. Telling the conversation is fine; waking the
+    // model (and spending) on its own is not, so those never trigger a turn.
+    const previousProcess = !ownedByThisParent(meta);
+    if (previousProcess || !mayStartTurn(id, meta)) {
+        // Same conversation gate as the batcher path: another conversation records the
+        // reason (or, for an interrupted run, keeps the obligation) and gets nothing.
+        const why = callbackSuppressionReason(meta);
+        if (why) { markCompletionCallbackSuppressed(meta.id, why); return; }
+        deliverRecoveredCompletionNotice(pi, meta, completionCallbackFields(meta, state, due?.incidents ?? []), previousProcess);
+        return;
+    }
     getCallbackBatcher(pi).enqueue({
         ...completionCallbackFields(meta, state, due?.incidents ?? []),
         callback: true,
@@ -488,17 +772,20 @@ function enqueueCompletionCallback(pi: ExtensionAPI, id: string): void {
             if (!current) throw new Error("Subagent metadata is unavailable; defer completion");
             return callbackSuppressionReason(current);
         },
-        onDelivered: (at) => {
-            const state = collectRunFailures(id, meta.cwd, true);
-            const due = pendingFailureAttention(state, at, { terminal: true });
-            if (due) {
-                markFailureAttentionDelivered(failurePath(id), due, at);
-                if (due.incidents.some((incident) => pendingFailureAttention(collectRunFailures(id, meta.cwd, true), at, { terminal: true })?.incidents.includes(incident))) return;
-            }
-            markCompletionCallbackSent(id, at);
-        },
+        onDelivered: (at) => markCompletionDelivered(id, meta.cwd, at),
         onSuppressed: (reason, at) => markCompletionCallbackSuppressed(id, reason, at),
     });
+}
+
+/** Receipt for a handed-off completion: its terminal incidents are delivered once, then the completion is sent. */
+function markCompletionDelivered(id: string, cwd: string, at: number): void {
+    const state = collectRunFailures(id, cwd, true);
+    const due = pendingFailureAttention(state, at, { terminal: true });
+    if (due) {
+        markFailureAttentionDelivered(failurePath(id), due, at);
+        if (due.incidents.some((incident) => pendingFailureAttention(collectRunFailures(id, cwd, true), at, { terminal: true })?.incidents.includes(incident))) return;
+    }
+    markCompletionCallbackSent(id, at);
 }
 
 /**
@@ -513,6 +800,9 @@ function enqueueCompletionCallback(pi: ExtensionAPI, id: string): void {
  * path never takes a live pi's terminal callback (#625, DEV-226 criterion 5).
  */
 function recoverCompletionCallbacks(pi: ExtensionAPI): void {
+    // Called at session_start, when the allowlist is empty: whatever is pending now
+    // finished before this lifetime started (the reload case: same session id,
+    // completion still in the old batch window), so it is delivered quietly.
     for (const meta of listMetasForParent(process.pid)) {
         if (!ownedByThisParent(meta)) continue;
         enqueueCompletionCallback(pi, meta.id);
@@ -538,7 +828,12 @@ type UrgentEvent = Parameters<ReturnType<typeof getCallbackBatcher>["deliverUrge
  * result (and is woken to act on it); otherwise the batcher delivers it.
  */
 function deliverUrgentFor(pi: ExtensionAPI, runId: string, event: UrgentEvent): boolean | Promise<boolean> {
-    return routeUrgentNotice(runId, event, (e) => formatUrgentCallback(e), (e) => getCallbackBatcher(pi).deliverUrgent(e));
+    // Allowlist: only a run launched by the current lifetime may wake the model; any other
+    // notice (including one for an unreadable or unknown record) is non-triggering.
+    let quiet = !mayStartTurn(runId);
+    if (!quiet) { try { quiet = !mayStartTurn(runId, readMeta(runId)); } catch { /* unreadable: the batcher defers it */ } }
+    return routeUrgentNotice(runId, event, (e) => formatUrgentCallback(e),
+        (e) => quiet ? deliverQuietUrgent(pi, e) : getCallbackBatcher(pi).deliverUrgent(e));
 }
 
 function deliverFailureAttention(pi: ExtensionAPI | undefined, meta: RunMeta, now: number): void {
@@ -1156,10 +1451,9 @@ function syncHealthTicker(): void {
 
 /** Start the reconciliation loop if it isn't already running. */
 function ensureHealthTicker(): void {
-    // Not gated on `sessionTornDown`: a spawn always means the current session is
-    // doing new work. Only `syncHealthTicker` — the path a late child finalizer
-    // takes — stays closed in a replaced instance.
-    if (healthTicker) return;
+    // Closed once this instance is torn down, whoever asks (a late spawn or a late
+    // finalizer): a new session lifetime re-arms supervision through `session_start`.
+    if (sessionTornDown || healthTicker) return;
     healthTicker = setInterval(reconcileHealth, HEALTH_TICK_MS);
     healthTicker.unref?.(); // never keep the process alive on our account
 }
@@ -2207,6 +2501,8 @@ export default function (pi: ExtensionAPI) {
         p: SpawnParams,
         batchInfo?: { batchId: string; batchName?: string },
         resume?: ContinuationPlan,
+        /** The session epoch the calling tool call began in, captured before its first await. */
+        epoch?: number,
     ): Promise<{
         id: string;
         meta: RunMeta;
@@ -2217,6 +2513,14 @@ export default function (pi: ExtensionAPI) {
         /** Set only when a catalog run's model or effort differs from its role or agent default. */
         modelNote?: string;
     }> {
+        // A launch belongs to the session lifetime that asked for it. After that
+        // lifetime's teardown nothing may start (session_start, not a spawn, reopens
+        // an instance), and a launch in flight across the teardown is stopped below.
+        // The caller captures `epoch` when its tool call begins, before any await, so a
+        // call that began in an ended lifetime and resumes after a later session_start
+        // is still refused here rather than adopted by the new lifetime.
+        const launchEpoch = epoch ?? sessionEpoch;
+        if (sessionEndedSince(launchEpoch)) throw launchRefusedAfterSessionEnd();
         assertThinkingLevel(p.thinking);
         // A continuation re-applies the CURRENT mandatory human permissions to its
         // frozen confinement intent. Historical metadata can never widen authority,
@@ -2309,6 +2613,7 @@ export default function (pi: ExtensionAPI) {
                 const gone = await stopRemoteProcessAsync(resumeSource.remote);
                 if (!gone.verified) throw new Error(`resume: the earlier remote process for ${resumeSource.id} could not be verified stopped: ${gone.reason}`);
             }
+            if (sessionEndedSince(launchEpoch)) throw launchRefusedAfterSessionEnd();
             const maxConcurrent = activeConcurrencyCap();
             if (countRunning() >= maxConcurrent) {
                 throw new Error(`Max concurrent subagents (${maxConcurrent}) reached. Stop or let some finish first.`);
@@ -2351,7 +2656,9 @@ export default function (pi: ExtensionAPI) {
             };
             // This instance holds the exit observer for the run it started (#625).
             directlySupervisedRunIds.add(id);
-            sessionTornDown = false;
+            // A lifetime that already ended (the teardown happened while the remote launch was
+            // awaited) never allowlists the run: its notices stay non-triggering.
+            if (!sessionEndedSince(launchEpoch)) runsOfCurrentLifetime.add(id);
             // A dropped bridge with no marker may leave the remote running: reconcileRemoteExit stops it
             // (verified) or keeps the run unfinalized for health reconciliation and subagent_stop.
             void spawned.exit.then(async (code) => {
@@ -2360,6 +2667,14 @@ export default function (pi: ExtensionAPI) {
             });
             writeMeta(meta);
             clearLaunchAttempt(id);
+            // The session ended while the remote launch was awaited: the shutdown sweep
+            // could not see this run. It must not spend on, or arm supervision for, a
+            // session that is gone, so stop it now and refuse the launch.
+            if (sessionEndedSince(launchEpoch)) {
+                const confirmed = await stopLaunchAfterSessionEnd(id);
+                throw new Error(`Subagent launch refused: the session ended while remote run ${id} was starting. ` +
+                    (confirmed ? "The run was stopped." : `The run could not be confirmed stopped and may still be running; use subagent_stop ${id}.`));
+            }
             uiCtx = ctx;
             ensureTicker();
             ensureHealthTicker();
@@ -2582,6 +2897,9 @@ export default function (pi: ExtensionAPI) {
             // Reservations prevent competing admissions, but do not grandfather
             // unstarted work after a cap reduction. No await separates this live
             // occupancy check, child creation, and the running metadata below.
+            // Last check before the child exists; nothing below awaits, so a teardown
+            // cannot interleave between it and the recorded run.
+            if (sessionEndedSince(launchEpoch)) throw launchRefusedAfterSessionEnd();
             const maxConcurrent = activeConcurrencyCap();
             if (countRunning() >= maxConcurrent) {
                 throw new Error(`Max concurrent subagents (${maxConcurrent}) reached. Stop or let some finish first.`);
@@ -2658,11 +2976,8 @@ export default function (pi: ExtensionAPI) {
             // This instance holds the exit observer for a run it actually
             // started; only it can finalize on the exit event (#625).
             directlySupervisedRunIds.add(id);
-            // A launch is live work of the current session, so an earlier
-            // teardown of this instance no longer applies. Without this the
-            // teardown latch would keep supervision from ever settling again
-            // for a run started after it (#625).
-            sessionTornDown = false;
+            // Nothing awaited since the last session-end check above, so this lifetime is live.
+            if (!sessionEndedSince(launchEpoch)) runsOfCurrentLifetime.add(id);
             // Register exit supervision before any fallible post-spawn publication.
             // A failed metadata write must not strand a running child without a close
             // handler; the lease stays held until that child has actually exited.
@@ -2783,6 +3098,8 @@ export default function (pi: ExtensionAPI) {
             // Empty optional strings (agent: "", model: "", ...) mean omitted, except the
             // conversation selectors: a blank session_id/session_name is a caller trying to
             // continue a saved conversation, which must be rejected, never turned into a fresh run.
+            // A launch belongs to the session lifetime that asked for it: capture it before any await.
+            const launchEpoch = sessionEpoch;
             const p = omitBlankOptionalStrings(params as SpawnParams, SPAWN_KEPT_BLANK_FIELDS);
             p.session_id = requestedSessionId(p, ctx.cwd);
             if (p.prompt.trim() === "") throw new Error("prompt is empty.");
@@ -2822,7 +3139,7 @@ export default function (pi: ExtensionAPI) {
                         stuck_minutes: p.stuck_minutes,
                     };
                     const { id, spawned, runtime, warn, sandboxDir, modelNote } = await spawnSubagentRun(
-                        ctx, continuation, undefined, plan,
+                        ctx, continuation, undefined, plan, launchEpoch,
                     );
                     gate.commit(1);
                     reserved = 0;
@@ -2864,7 +3181,7 @@ export default function (pi: ExtensionAPI) {
                     reserved += extra;
                     const launched: { name?: string; id: string; modelNote?: string }[] = [];
                     for (const job of catalog.jobs) {
-                        const { id, modelNote } = await spawnSubagentRun(ctx, job);
+                        const { id, modelNote } = await spawnSubagentRun(ctx, job, undefined, undefined, launchEpoch);
                         gate.commit(1);
                         reserved -= 1;
                         launched.push({ name: job.name, id, modelNote });
@@ -2875,7 +3192,7 @@ export default function (pi: ExtensionAPI) {
                     };
                 }
                 Object.assign(p, catalog.jobs[0]);
-                const { id, meta, spawned, runtime, warn, sandboxDir, modelNote } = await spawnSubagentRun(ctx, p);
+                const { id, meta, spawned, runtime, warn, sandboxDir, modelNote } = await spawnSubagentRun(ctx, p, undefined, undefined, launchEpoch);
                 gate.commit(1);
                 reserved = 0;
                 return {
@@ -2977,6 +3294,8 @@ export default function (pi: ExtensionAPI) {
         }),
 
         async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+            // A launch belongs to the session lifetime that asked for it: capture it before any await.
+            const launchEpoch = sessionEpoch;
             const raw = params as {
                 batchName?: string;
                 shared?: Partial<SpawnParams>;
@@ -3119,7 +3438,7 @@ export default function (pi: ExtensionAPI) {
                             launch as unknown as Record<string, unknown>, plan.recipe, `Job ${i + 1}: `, { includeName: false },
                         );
                     }
-                    const { id, meta, modelNote, warn } = await spawnSubagentRun(ctx, { ...launch, name }, { batchId, batchName: p.batchName }, plan);
+                    const { id, meta, modelNote, warn } = await spawnSubagentRun(ctx, { ...launch, name }, { batchId, batchName: p.batchName }, plan, launchEpoch);
                     gate.commit(1);
                     if (!launchAvailable) reservedRemaining -= 1;
                     // The same disabled/unmapped-tool warning a single spawn prints; a batch must not drop it.
@@ -3385,6 +3704,8 @@ export default function (pi: ExtensionAPI) {
         // switch), so the previous session's teardown no longer applies: the
         // replacing session owns this instance's supervision loops (#625).
         sessionTornDown = false;
+        // A new lifetime has launched nothing yet (see runsOfCurrentLifetime).
+        runsOfCurrentLifetime.clear();
         setCallbackBatchContext(pi, ctx);
         agentSessionSettings.restore(ctx);
         restoreDelegationMode(ctx);
@@ -3445,22 +3766,40 @@ export default function (pi: ExtensionAPI) {
     // Tear down the timer and clear the widget when the session ends.
     pi.on("session_shutdown", async (event, ctx) => {
         if (typeof unsubscribeSettingsRequest === "function") unsubscribeSettingsRequest();
-        // #625: subagent children are detached process groups that outlive this
-        // foreground session. A controlled reload or quit must not destroy
-        // delegated work: record the interruption durably, warn the human, and
-        // leave the child, its log, and its saved state untouched. The next
-        // session of this pi process resumes supervision and finalizes the run
-        // from the child's own log.
+        // Subagent children are detached process groups that would outlive this
+        // foreground session and keep spending with nobody to supervise, bound
+        // or stop them. Quit and /reload therefore stop this session's running
+        // children through the same path as subagent_stop (bounded), record them
+        // `killed` with stoppedReason "shutdown", and suppress their completion
+        // so no later session is woken by it.
         const reason = typeof event?.reason === "string" ? event.reason : "shutdown";
-        try {
-            const interrupted = interruptCurrentSessionSubagents(reason, ctx);
-            warnInterruptedSubagents(ctx, interrupted, reason);
-        } catch { /* shutdown cleanup must never block the session teardown */ }
-        // Late finalizers of surviving children must not restart supervision
-        // loops in this replaced instance.
+        // Close delivery BEFORE the (possibly slow, ssh-bound) stop wait. Pi runs this
+        // handler before it invalidates the extension, so until the wait ends the batcher
+        // could flush a completion with triggerTurn: true and the health ticker could send
+        // a deadline/stuck/lost/failure notice that starts a turn, all for a session that
+        // is ending. Pending markers stay on disk; whichever session owns the run next
+        // recovers them (as non-triggering notices: completions pending at a
+        // session_start never use the triggering batcher).
         sessionTornDown = true;
-        // Children keep running; their finalizers (if this instance still holds
-        // one) must not reach for a ctx that Pi invalidates once the session is
+        sessionTornDownReason = reason;
+        sessionEpoch += 1;
+        // Whatever this instance launched belongs to the lifetime that is ending, even if
+        // the stop below cannot list, stop or mark it: nothing is allowlisted any more.
+        runsOfCurrentLifetime.clear();
+        if (typeof unsubscribeDelegationRequest === "function") unsubscribeDelegationRequest();
+        cancelCallbackBatch(pi);
+        stopTicker();
+        stopHealthTicker();
+        try {
+            const outcome = await stopCurrentSessionSubagents(reason, ctx);
+            warnShutdownSubagents(ctx, outcome, reason);
+        } catch (error) {
+            // Shutdown cleanup must never block the session teardown, but a failed
+            // stop is reported: running children may be left behind unstopped.
+            try { ctx.ui.notify(`Subagent shutdown stop failed (${error instanceof Error ? error.message : String(error)}); runs may still be running — check subagent_list and end them with subagent_stop.`, "warning"); } catch { /* no UI available */ }
+        }
+        // The stopped children exit after this handler returns; their finalizers
+        // must not reach for a ctx that Pi invalidates once the session is
         // replaced.
         uiCtx = undefined;
         agentSessionSettings.clear();
@@ -3471,10 +3810,10 @@ export default function (pi: ExtensionAPI) {
         // the origin is dropped and the pending marker is left for whichever
         // session owns the run next.
         if (reason !== "reload") activeCallbackOrigin = undefined;
-        if (typeof unsubscribeDelegationRequest === "function") unsubscribeDelegationRequest();
-        cancelCallbackBatch(pi);
         mainAgentStartedAt = undefined;
         mainAgentTools.clear();
+        // Late finalizers cannot have re-armed the tickers (syncHealthTicker is closed
+        // once torn down); stop again in case anything armed them during the wait.
         stopTicker();
         stopHealthTicker();
         spendCache.clear();

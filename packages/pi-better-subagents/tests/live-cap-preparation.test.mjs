@@ -5,6 +5,7 @@ import { register } from "node:module";
 import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { hostLikeSession } from "./host-session.mjs";
 
 const root = mkdtempSync(join(tmpdir(), "live-admission-"));
 const original = { PATH: process.env.PATH, TMPDIR: process.env.TMPDIR, PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR };
@@ -54,14 +55,14 @@ function harness(t) {
     const handlers = {};
     const entries = [];
     const events = new EventEmitter();
-    extension({
+    extension(hostLikeSession({
         events,
         registerTool(tool) { tools[tool.name] = tool; },
         registerCommand(name, command) { commands[name] = command; },
         appendEntry(customType, data) { entries.push({ type: "custom", customType, data }); },
         on(name, handler) { handlers[name] = handler; },
         sendMessage() {},
-    });
+    }, handlers));
     const model = { provider: "local", id: "fixture", reasoning: true };
     const ctx = { cwd: root, model, hasUI: false, isProjectTrusted: () => false,
         sessionManager: { getBranch: () => entries }, modelRegistry: { getAvailable: () => [model] },

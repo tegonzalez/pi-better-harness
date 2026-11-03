@@ -28,6 +28,7 @@ import { register } from "node:module";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, appendFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { hostLikeSession } from "./host-session.mjs";
 
 register(new URL("./pi_host_stub_hooks.mjs", import.meta.url));
 
@@ -73,7 +74,7 @@ function makeHarness({ cwd, sessionId, idle = () => true, sent = [] } = {}) {
         model: undefined,
         sessionManager: { getSessionId: () => sessionId },
     };
-    betterSubagents(pi);
+    betterSubagents(hostLikeSession(pi, handlers));
     return {
         pi, tools, handlers, sent, notes, ctx,
         shutdown: () => handlers.get("session_shutdown")?.({}, ctx),
@@ -93,6 +94,8 @@ async function waitFor(fn, { timeoutMs = 5000, intervalMs = 20 } = {}) {
 }
 
 const completionMessages = (sent) => sent.filter((entry) => entry.message.customType === "background-completion-batch");
+/** A completion that was pending when a session lifetime began is told as a non-triggering notice. */
+const restartNotices = (sent) => sent.filter((entry) => entry.message.customType === "subagent-restart-notice");
 
 /** One row per run id: the batcher renders exactly one `- source=` line per completion. */
 function rowsFor(sent, id) {
@@ -184,17 +187,23 @@ describe("#624 one completion per terminal run", () => {
             assert.equal(stopped.completionCallbackSentAt, undefined);
             assert.equal(completionMessages(firstSent).length, 0, "the stopping instance never delivers into the busy turn");
 
-            // The resuming instance recovers the pending record exactly once.
+            // The resuming instance recovers the pending record exactly once. The run
+            // ended before this session lifetime began, so it is told to the conversation
+            // as a non-triggering notice: recovery never starts a model turn.
             const second = makeHarness({ cwd, sessionId, sent: secondSent });
             await second.start();
-            assert.equal(await waitFor(() => completionMessages(secondSent).length), 1);
+            assert.equal(await waitFor(() => restartNotices(secondSent).length), 1);
             assert.equal(rowsFor(secondSent, id).length, 1);
-            assert.match(completionMessages(secondSent)[0].message.content, /status=killed/);
+            assert.match(restartNotices(secondSent)[0].message.content, /status=killed/);
+            assert.equal(restartNotices(secondSent)[0].options.triggerTurn, false);
+            assert.deepEqual(secondSent.filter((entry) => entry.options?.triggerTurn === true), [], "recovery starts no turn");
+            assert.equal(completionMessages(secondSent).length, 0, "a recovered completion never enters the triggering batcher");
             assert.ok(readMeta(id).completionCallbackSentAt > 0);
 
             await second.start();
             await getCallbackBatcher(second.pi).flush();
-            assert.equal(completionMessages(secondSent).length, 1, "a second session_start must not re-deliver");
+            assert.equal(restartNotices(secondSent).length, 1, "a second session_start must not re-deliver");
+            assert.equal(completionMessages(secondSent).length, 0);
             assert.equal(completionMessages(firstSent).length, 0);
             killProcessTree(pid, "SIGKILL");
             second.shutdown();
@@ -205,18 +214,11 @@ describe("#624 one completion per terminal run", () => {
         await withFakeClock(async () => {
             let idle = false;
             const h = makeHarness({ cwd: mkdtempSync(join(HERMETIC, "dup-cwd-")), sessionId: "dup-session", idle: () => idle });
-            const id = nextRunId();
+            let id;
             const keeper = nextRunId();
-            dirOnly.push(id, keeper);
+            dirOnly.push(keeper);
             try {
-                mkdirSync(runDir(id), { recursive: true });
                 mkdirSync(runDir(keeper), { recursive: true });
-                writeMeta({ id, status: "completed", pid: DEAD_PID, spawnPid: process.pid, cwd: h.ctx.cwd,
-                    callbackOrigin: { cwd: h.ctx.cwd, sessionId: "dup-session" }, promptPreview: "done",
-                    startedAt: Date.now() - 60_000, endedAt: Date.now(), exitCode: 0,
-                    logPath: logPathFor(id), sessionId: id, callback: true, completionCallbackPendingAt: Date.now() });
-                writeFileSync(logPathFor(id), `${JSON.stringify({ type: "message_end",
-                    message: { role: "assistant", content: [{ type: "text", text: "finished" }] } })}\n`);
                 // Another monitored run keeps supervision ticking; callback:false keeps it silent.
                 writeMeta({ id: keeper, status: "orphaned", pid: process.pid, spawnPid: process.pid, cwd: h.ctx.cwd,
                     callbackOrigin: { cwd: h.ctx.cwd, sessionId: "dup-session" }, promptPreview: "keeper",
@@ -224,8 +226,19 @@ describe("#624 one completion per terminal run", () => {
                     logPath: logPathFor(keeper), sessionId: keeper, callback: false });
                 writeFileSync(logPathFor(keeper), "");
 
+                // The completion arrives during the live session lifetime, from a run this
+                // lifetime launched, so it uses the batcher; a record this lifetime did not
+                // launch (or one already pending at session_start) is a non-triggering notice.
                 await h.start();
                 const batcher = getCallbackBatcher(h.pi);
+                assert.equal(batcher.pendingCount(), 0);
+                const { id: launched, pid } = await spawnRun(h, { cwd: h.ctx.cwd });
+                id = launched;
+                await h.tools.get("subagent_stop").execute("tc", { id }, undefined, undefined, h.ctx);
+                assert.equal(readMeta(id).status, "killed");
+                killProcessTree(pid, "SIGKILL");
+                mock.timers.tick(HEALTH_TICK_MS);
+                await new Promise((resolve) => setImmediate(resolve));
                 assert.equal(batcher.pendingCount(), 1, "the pending completion is queued while the caller is busy");
 
                 // The child log gains an unreadable row: the status snapshot gains an observation gap.
@@ -270,9 +283,13 @@ describe("#624 one completion per terminal run", () => {
             assert.equal(meta.status, "completed");
             assert.ok(meta.completionCallbackPendingAt > 0, "log-evidence finalization owes one completion");
 
-            assert.equal(await waitFor(() => completionMessages(h.sent).length), 1);
+            // The run was not launched by this lifetime (its record was left by an earlier
+            // one), so its completion is told to the conversation and never starts a turn.
+            assert.equal(await waitFor(() => restartNotices(h.sent).length), 1);
             assert.equal(rowsFor(h.sent, id).length, 1);
-            assert.match(completionMessages(h.sent)[0].message.content, /status=completed/);
+            assert.match(restartNotices(h.sent)[0].message.content, /status=completed/);
+            assert.deepEqual(restartNotices(h.sent)[0].options, { triggerTurn: false });
+            assert.deepEqual(completionMessages(h.sent), [], "a run of an earlier lifetime never enters the triggering batcher");
             assert.ok(readMeta(id).completionCallbackSentAt > 0);
         } finally { h.shutdown(); }
     });

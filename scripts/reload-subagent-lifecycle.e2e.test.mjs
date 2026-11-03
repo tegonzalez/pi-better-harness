@@ -1,21 +1,20 @@
 /**
- * #625 — a real `/reload` must not destroy in-flight subagent work.
+ * A real `/reload` stops the session's in-flight subagent children and never
+ * starts a turn because of it.
  *
- * A real Pi AgentSession loads the subagents extension from its package entry
- * file, the way `pi -e` does, and `session.reload()` is the same call Pi's
- * `/reload` command makes: session_shutdown, a fresh extension load (jiti with
- * no module cache, so no in-memory state survives), then session_start. Before
- * this fix the shutdown handler SIGTERM'd every current-session child, so a
- * reload silently killed delegated work and recorded `killed`.
- *
- * The two journeys here prove the replacement contract end to end:
- * 1. a child that is alive across the reload keeps running and keeps its
- *    durable record, then finishes and delivers exactly one completion to the
- *    reloaded session (the old instance's late exit observer is not a second
- *    authority);
+ * Detached children would otherwise outlive their session and keep spending
+ * with nobody left to supervise, bound or stop them. A real Pi AgentSession
+ * loads the subagents extension from its package entry file, the way `pi -e`
+ * does, and `session.reload()` is the same call Pi's `/reload` command makes:
+ * session_shutdown, a fresh extension load (jiti with no module cache, so no
+ * in-memory state survives), then session_start. The journeys prove:
+ * 1. a child alive at the reload is stopped (process gone), its record says
+ *    `killed` with `stoppedReason: "shutdown"`, no completion is delivered and
+ *    the model is never asked anything because of it;
  * 2. a run whose exit observer is gone (its record says supervision was
- *    interrupted) is finalized from the child's own coherent log by the
- *    reloaded session instead of being reported `lost`.
+ *    interrupted, e.g. a stop that could not be confirmed) is finalized from
+ *    the child's own coherent log by the reloaded session instead of being
+ *    reported `lost`.
  *
  * `pi` on PATH is a fake child that streams the same NDJSON events a real
  * `pi -p --mode json` child writes and waits for a release marker, so no model
@@ -156,59 +155,49 @@ async function openSession(project) {
       return result.content.map((part) => part.text ?? "").join("\n");
     },
     completions: (id) => sent.filter((m) => m.customType === "background-completion-batch" && String(m.content).includes(id)),
+    notices: (id) => sent.filter((m) => m.customType === "subagent-restart-notice" && String(m.content).includes(id)),
   };
 }
 
-test("a real /reload keeps a live subagent child running and delivers its completion once", async () => {
+test("a real /reload stops a live subagent child and delivers nothing that could start a turn", async () => {
   process.env.PATH = `${fakeBin}:${originalPath}`;
   process.env.PI_BETTER_CALLBACK_BATCH_MS = "50";
   const project = dir("live-project");
   const host = await openSession(project);
+  let pid;
   try {
     await host.start();
-    const spawned = await host.call("subagent_spawn", { prompt: "reload survives", clean: true, sandbox: false, cwd: project });
+    const spawned = await host.call("subagent_spawn", { prompt: "reload stops", clean: true, sandbox: false, cwd: project });
     const id = spawned.match(/id=(\S+)/)?.[1];
-    const pid = Number(spawned.match(/\(pid (\d+)\)/)?.[1]);
+    pid = Number(spawned.match(/\(pid (\d+)\)/)?.[1]);
     assert.ok(id && pid);
     await waitFor("the child to start writing", () => {
       try { return readFileSync(registry.logPathFor(id), "utf8").includes("reload-survives answer"); } catch { return false; }
     });
     assert.equal(registry.readMeta(id).status, "running");
+    const requestsBefore = host.requests.length;
 
     await host.session.reload();
 
-    // The reload did not kill the child, and the record survives with a durable
-    // interruption marker instead of a `killed` verdict.
-    assert.equal(childAlive(pid), true, "the detached child must survive the reload");
-    const reloaded = registry.readMeta(id);
-    assert.equal(reloaded.status, "running", "reload must not close in-flight delegated work");
-    assert.equal(typeof reloaded.supervisionInterruptedAt, "number", "the interruption is recorded durably");
-    assert.equal(reloaded.supervisionInterruptedReason, "reload");
-    assert.match(await host.call("subagent_result", { id }), /still running|running/i);
+    await waitFor("the child to be stopped", () => !childAlive(pid));
+    const stopped = registry.readMeta(id);
+    assert.equal(stopped.status, "killed", "reload stops delegated work instead of leaving it detached");
+    assert.equal(stopped.stoppedReason, "shutdown");
+    assert.equal(stopped.supervisionInterruptedAt, undefined, "a confirmed stop leaves no interruption marker");
+    assert.equal(typeof stopped.completionCallbackSuppressedAt, "number", "a run stopped by shutdown owes no completion");
 
-    // The child finishes after the reload: one truthful terminal record and one
-    // completion handed to the reloaded session.
-    writeFileSync(release, "");
-    await waitFor("the child's terminal record", () => {
-      const meta = registry.readMeta(id);
-      return meta && meta.status !== "running" && meta.status !== "orphaned" ? meta : undefined;
-    });
-    const done = registry.readMeta(id);
-    assert.equal(done.status, "completed", `reload-survives run ended ${done.status} (${done.lifecycleClassification})`);
-    assert.equal(done.lifecycleClassification, "complete");
-    await waitFor("the completion callback", () => host.completions(id).length > 0);
-    assert.equal(host.completions(id).length, 1);
-    assert.ok(registry.readMeta(id).completionCallbackSentAt > 0);
-    assert.match(await host.call("subagent_result", { id }), /reload-survives answer/);
-
-    // A second reload finds the receipt: the completion is not delivered twice.
+    // Nothing is delivered for it, in this session or after another reload, and no turn runs.
+    await delay(600);
     await host.session.reload();
     await delay(600);
-    assert.equal(host.completions(id).length, 1, "the completion receipt survives another reload");
-    assert.equal(registry.readMeta(id).status, "completed");
+    assert.deepEqual(host.sent.filter((m) => String(m.content).includes(id)), [], "no completion or notice is delivered");
+    assert.equal(host.requests.length, requestsBefore, "the model was never asked anything because of the stop");
+    assert.equal(registry.readMeta(id).status, "killed");
+    assert.match(await host.call("subagent_result", { id }), /killed|stopped/i);
     assert.deepEqual(host.errors, []);
   } finally {
     try { writeFileSync(release, ""); } catch { /* ignore */ }
+    if (pid) { try { process.kill(-pid, "SIGKILL"); } catch { /* gone */ } }
     host.session.dispose();
     process.env.PATH = originalPath;
   }
@@ -238,6 +227,7 @@ test("a real /reload finalizes interrupted work from the child's own log, not as
       supervisionInterruptedAt: Date.now() - 2_000, supervisionInterruptedReason: "reload",
     });
 
+    const requestsBefore = host.requests.length;
     await host.start();
     await host.session.reload();
 
@@ -250,8 +240,14 @@ test("a real /reload finalizes interrupted work from the child's own log, not as
     const done = registry.readMeta(seededId);
     assert.equal(done.lifecycleClassification, "complete");
     assert.equal(done.exitCode, null, "no exit code is invented after the observer is gone");
-    await waitFor("the recovered completion", () => host.completions(seededId).length > 0);
-    assert.equal(host.completions(seededId).length, 1);
+    // The run was started by a session that has since shut down: its completion is a
+    // notice appended to the conversation, never a turn-triggering batch.
+    await waitFor("the recovered completion notice", () => host.notices(seededId).length > 0);
+    await delay(300);
+    assert.equal(host.notices(seededId).length, 1);
+    assert.equal(host.notices(seededId)[0].options?.triggerTurn, false, "the notice starts no turn");
+    assert.deepEqual(host.completions(seededId), [], "nothing goes through the turn-triggering batch");
+    assert.equal(host.requests.length, requestsBefore, "the model was never asked anything because of the notice");
     assert.match(await host.call("subagent_result", { id: seededId }), /recovered-after-reload answer/);
     assert.ok(existsSync(registry.logPathFor(seededId)));
     assert.deepEqual(host.errors, []);

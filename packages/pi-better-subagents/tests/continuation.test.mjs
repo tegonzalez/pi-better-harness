@@ -54,6 +54,7 @@ import { EventEmitter, once } from "node:events";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { hostLikeSession } from "./host-session.mjs";
 
 const PACKAGE_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
 const REPO_ROOT = dirname(dirname(PACKAGE_DIR));
@@ -200,7 +201,7 @@ function makeHarness(options = {}) {
         ui: { notify() {}, setWidget() {} },
         sessionManager: { getSessionId: () => options.sessionId ?? "owner-session", getBranch: () => [] },
     };
-    betterSubagents(pi);
+    betterSubagents(hostLikeSession(pi, handlers));
     return {
         pi, tools, handlers, sent, ctx,
         publishPolicy(next) { snapshot = next; events.emit(SANDBOX_POLICY_CHANNEL, next); },

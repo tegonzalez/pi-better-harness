@@ -17,6 +17,7 @@ import { register } from "node:module";
 import { mkdtempSync, writeFileSync, appendFileSync, chmodSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { hostLikeSession } from "./host-session.mjs";
 
 register(new URL("./pi_host_stub_hooks.mjs", import.meta.url));
 
@@ -58,11 +59,13 @@ function makeHarness(options = {}) {
     const ctx = {
         cwd: tmpdir(),
         hasUI: false,
+        // A host context always answers isIdle(); session_start binds the callback batcher to it.
+        isIdle: () => true,
         ui: { notify: (msg, level) => notes.push({ msg, level }), setWidget: () => {} },
         model: undefined,
         sessionManager: { getSessionId: () => options.sessionId ?? "timing-session" },
     };
-    betterSubagents(pi);
+    betterSubagents(hostLikeSession(pi, handlers));
     const shutdown = () => handlers.get("session_shutdown")?.({}, ctx);
     return { pi, tools, handlers, sent, notes, ctx, shutdown };
 }

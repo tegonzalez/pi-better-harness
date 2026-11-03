@@ -190,6 +190,14 @@ export interface RunMeta {
     supervisionInterruptedAt?: number;
     /** Pi's `session_shutdown` reason that interrupted supervision (`reload`, `quit`, …). */
     supervisionInterruptedReason?: string;
+    /**
+     * Why the harness (not the caller or a timing policy) stopped this run:
+     * `shutdown` = the owning session quit or reloaded. Such a run is `killed`
+     * and owes no completion message.
+     */
+    stoppedReason?: "shutdown";
+    /** When the run was stopped for `stoppedReason`. */
+    stoppedAt?: number;
     model?: string;
     /** Reasoning effort passed to the child via Pi's --thinking option. */
     effort?: string;

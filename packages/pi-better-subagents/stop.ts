@@ -203,12 +203,33 @@ function finishRemoteStop(meta: RunMeta, status: string, result: RemoteStopResul
         }], now);
         throw new Error(`Remote stop not verified for ${meta.id}: ${result.reason}. The run was left ${status}; retry subagent_stop.`);
     }
+    // The abort wait and the ssh stop were awaited, and the local bridge's exit may have
+    // finalized the run meanwhile (writing a status, a pending/sent completion marker, an
+    // exit code). Settle against the record as it is NOW and never write the snapshot read
+    // when the stop began back over it: that would erase those fields.
+    const current = readMeta(meta.id);
+    // The record is gone (a concurrent purge removed it while the remote stop ran): the remote
+    // work is verified over, and writing the stale snapshot back would resurrect a retired run.
+    if (!current) return { action: "purged", id: meta.id };
+    if (current.status !== "running" && current.status !== "orphaned" && current.status !== meta.status) {
+        if (current.status === "killed") return { action: "stopped", id: meta.id };
+        const stopsRunningRun = status === "running" || status === "orphaned";
+        // A genuine completion recorded meanwhile is never turned into a kill. Any other
+        // terminal status of a run we were stopping is the bridge ending because of this
+        // stop: it becomes `killed`, merged into the current record.
+        if (!stopsRunningRun || current.status === "completed") {
+            if (current.status === "completed" || current.status === "failed" || current.status === "lost") {
+                return { action: "finalized", id: meta.id, status: current.status };
+            }
+            return { action: "not-running", id: meta.id, status: current.status };
+        }
+    }
     if (status === "running" || status === "orphaned") {
-        terminateRelatedWork(meta);
-        return recordKilled(meta, now);
+        terminateRelatedWork(current);
+        return recordKilled(current, now);
     }
     if (status === "lost") return { action: "finalized", id: meta.id, status: "lost" };
-    return finalizeOrphanedWithoutProcess(meta, now);
+    return finalizeOrphanedWithoutProcess(current, now);
 }
 
 /**

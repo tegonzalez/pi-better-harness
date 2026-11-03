@@ -15,7 +15,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { parseRemoteTarget, parseRemoteTargets, selectRemoteTarget, buildLaunchScript, buildEnvPayload, buildStopScript, wrapRemoteScript, stopRemoteProcess, assertRemoteOptionsSupported, effectiveRemoteCwd } from "../remote.ts";
+import { parseRemoteTarget, parseRemoteTargets, selectRemoteTarget, buildLaunchScript, buildEnvPayload, buildStopScript, wrapRemoteScript, stopRemoteProcess, stopRemoteProcessAsync, assertRemoteOptionsSupported, effectiveRemoteCwd } from "../remote.ts";
 import { handleRemoteExit, launchRemoteRun, reconcileRemoteExit, readRemoteFailure, remoteWorkspaceLine } from "../remote-run.ts";
 import { subagentResultTool } from "../tools.ts";
 import { nonTempFixtureBase } from "./fixture-base.mjs";
@@ -409,6 +409,22 @@ describe("non-blocking stop and exited runs (review #19)", () => {
         assert.ok(ticks >= 10, `event loop kept ticking (${ticks})`);
         assert.equal(readMeta(id).status, "killed");
         await exit;
+    });
+
+    it("a record purged while the remote stop runs is not resurrected by the stop", async () => {
+        const { id, exit } = await start("hang stubborn persist until stopped");
+        await until(() => parseRun(id).lastActivity.includes("working"), "run active");
+        const outcome = await stopRunAsync(id, {
+            remoteStopAsync: async (remote) => {
+                const result = await stopRemoteProcessAsync(remote);
+                rmSync(join(runDir(id), "meta.json"), { force: true }); // a concurrent purge retires the record
+                return result;
+            },
+        });
+        assert.deepEqual(outcome, { action: "purged", id });
+        assert.equal(readMeta(id), undefined, "the stale snapshot read when the stop began was not written back");
+        await exit;
+        assert.equal(readMeta(id), undefined, "and nothing recreated it afterwards");
     });
 
     it("stopping a settled, exited run needs no ssh", async () => {

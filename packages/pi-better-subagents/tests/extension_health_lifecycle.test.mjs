@@ -58,10 +58,10 @@ register(new URL("./pi_host_stub_hooks.mjs", import.meta.url));
 const HERMETIC_TMPDIR = mkdtempSync(join(tmpdir(), "subagent-ext-health-"));
 process.env.TMPDIR = HERMETIC_TMPDIR;
 
-const { default: betterSubagents, setIdentityProbeForTests, isHealthTickerActive } = await import("../index.ts");
+const { default: betterSubagents, setIdentityProbeForTests, isHealthTickerActive, setShutdownStopForTests } = await import("../index.ts");
 const { getCallbackBatcher } = await import("../shared-callback-batcher.ts");
 const { readMeta, writeMeta, nextRunId, runDir, baseDir, recordTaskRuntimeProvenance, removeRunDirectory, taskRuntimeProvenancePath,
-    discardFailedLaunch, sessionsDir, taskWorkspaceDir, processStartToken } = await import("../registry.ts");
+    discardFailedLaunch, sessionsDir, taskWorkspaceDir, processStartToken, setMetaWriteBarrierForTests } = await import("../registry.ts");
 const { realProcessProbe, OLD_METADATA_LOST_CONFIRM_TICKS } = await import("../health.ts");
 const { killProcessTree } = await import("../spawn.ts");
 const { renderRegisteredWorkDetail } = await import("../shared-navigator.ts");
@@ -93,6 +93,12 @@ process.env.PATH = `${binDir}:${originalPath}`;
 const liveRuns = []; // { id, pid } — children to reap and dirs to remove
 const dirOnly = []; // ids with no child (metadata-only fixtures)
 
+// The extension's teardown latch is module state, and only `session_start` reopens
+// it (a spawn no longer does). Every harness here shares the module, so a harness
+// that shut down leaves the next one torn down until its session starts, exactly as
+// a host always starts a session before a model can call a tool.
+let moduleTornDown = false;
+
 function makeHarness(options = {}) {
     const tools = new Map();
     const handlers = new Map();
@@ -102,7 +108,7 @@ function makeHarness(options = {}) {
     const sessionId = options.sessionId ?? "test-session";
     const pi = {
         registerTool: (def) => tools.set(def.name, def),
-        on: (event, fn) => handlers.set(event, fn),
+        on: (event, fn) => handlers.set(event, event === "session_start" ? (...args) => { moduleTornDown = false; return fn(...args); } : fn),
         sendMessage: (message, sendOptions) => {
             if (options.sendMessage) return options.sendMessage(message, sendOptions, sent);
             sent.push({ message, options: sendOptions });
@@ -117,11 +123,13 @@ function makeHarness(options = {}) {
         sessionManager: { getSessionId: () => sessionId },
     };
     betterSubagents(pi);
-    const shutdown = (event = {}) => handlers.get("session_shutdown")?.(event, ctx);
+    const shutdown = (event = {}) => { moduleTornDown = true; return handlers.get("session_shutdown")?.(event, ctx); };
     return { pi, tools, handlers, sent, notes, ctx, shutdown };
 }
 
-async function spawnRun({ tools, ctx }, overrides = {}) {
+async function spawnRun(h, overrides = {}) {
+    const { tools, ctx } = h;
+    if (moduleTornDown) await h.handlers.get("session_start")?.({}, ctx);
     const res = await tools.get("subagent_spawn").execute(
         "tc", { prompt: "lifecycle test task", clean: true, sandbox: false, cwd: tmpdir(), ...overrides },
         undefined, undefined, ctx,
@@ -338,11 +346,13 @@ describe("#315 child tool failures and parent wakes", () => {
             observeFailures(failurePath(id), [{ id: "watch:earlier", operation: "earlier-check", kind: "failure", category: "exit", summary: "EARLIER_DELIVERED_SUMMARY" },
                 { id: "delivered:earlier", operation: "attention-delivery", kind: "delivered", incidents: ["watch:earlier"] },
                 { id: "exit:1", operation: "child-exit", kind: "failure", category: "exit", summary: "Child exited with code 1" }]);
+            // Pending at session_start: the run finished before this session lifetime, so its
+            // completion (with its incidents) is a non-triggering notice, never a batch turn.
             await h.handlers.get("session_start")({}, h.ctx);
-            const batcher = getCallbackBatcher(h.pi);
-            assert.equal(await batcher.flush(), true);
-            const batches = h.sent.filter((x) => x.message.customType === "background-completion-batch");
+            assert.equal(h.sent.filter((x) => x.message.customType === "background-completion-batch").length, 0);
+            const batches = h.sent.filter((x) => x.message.customType === "subagent-restart-notice");
             assert.equal(batches.length, 1);
+            assert.equal(batches[0].options.triggerTurn, false);
             const text = batches[0].message.content;
             assert.match(text, /status=completed; action required/);
             assert.match(text, /Child exited with code 1/);
@@ -351,8 +361,8 @@ describe("#315 child tool failures and parent wakes", () => {
             assert.doesNotMatch(text, /EARLIER_DELIVERED_SUMMARY|HTTP 401|no output/, "delivered and unclassified incidents are not re-listed");
             assert.equal(pendingFailureAttention(readRunFailures(id), Date.now(), { terminal: true }), undefined, "every incident is receipted once");
             await h.handlers.get("session_start")({}, h.ctx);
-            await batcher.flush();
-            assert.equal(h.sent.filter((x) => x.message.customType === "background-completion-batch").length, 1);
+            assert.equal(h.sent.filter((x) => x.message.customType === "subagent-restart-notice").length, 1, "delivered once");
+            assert.equal(h.sent.filter((x) => x.message.customType === "background-completion-batch").length, 0);
             assert.equal(failureWakes(h).length, 0);
         } finally { h.shutdown(); }
     });
@@ -405,6 +415,7 @@ describe("#325 failed launches", () => {
         const list = (dir) => { try { return readdirSync(dir).sort(); } catch { return []; } };
         const before = { runs: list(runsRoot), provenance: list(provenanceRoot) };
         try {
+            if (moduleTornDown) await h.handlers.get("session_start")({}, h.ctx);
             // A working directory that does not exist: the OS refuses the spawn after the run directory was prepared.
             await assert.rejects(() => h.tools.get("subagent_spawn").execute("tc",
                 { prompt: "x", clean: true, sandbox: false, cwd: join(tmpdir(), `no-such-dir-${process.pid}`) }, undefined, undefined, h.ctx), /Failed to spawn/);
@@ -568,10 +579,12 @@ describe("AC1 — subagent_spawn persists process identity into meta.json", () =
     });
 });
 
-describe("session_shutdown child ownership (#625)", () => {
-    for (const reason of ["reload", "quit"]) {
-        it(`keeps current-session running subagents alive across a ${reason} and records the interruption`, async () => {
-            const h = makeHarness({ cwd: tmpdir(), sessionId: `interrupt-${reason}` });
+describe("session_shutdown child ownership (stop at shutdown)", () => {
+    // Detached children outlive their session and keep spending with nobody to
+    // supervise them, so quit and /reload stop them through the subagent_stop path.
+    for (const reason of ["reload", "quit", "new", "resume", "fork"]) {
+        it(`stops current-session running subagents on ${reason} and records them stopped by shutdown`, async () => {
+            const h = makeHarness({ cwd: tmpdir(), sessionId: `stop-${reason}` });
             let id;
             let pid;
             try {
@@ -579,17 +592,20 @@ describe("session_shutdown child ownership (#625)", () => {
                 assert.equal(readMeta(id).status, "running");
                 await h.shutdown({ reason });
                 const meta = readMeta(id);
-                assert.equal(meta.status, "running", `${reason} must not kill current-session delegated work`);
-                assert.equal(meta.lifecycleClassification, undefined, "no terminal verdict is recorded");
-                assert.equal(typeof meta.supervisionInterruptedAt, "number", "the interruption is durable");
-                assert.equal(meta.supervisionInterruptedReason, reason);
-                assert.equal(realProcessProbe.pidExists(pid), true, `${reason} must leave the detached child running`);
-                const warnings = h.notes.filter((n) => n.level === "warning");
-                assert.equal(warnings.length, 1, "the human is warned that live work survived");
-                assert.match(warnings[0].msg, /still running/);
-                assert.ok(warnings[0].msg.includes(id), "the warning names the run");
-                assert.ok(/reload|session shutdown/.test(warnings[0].msg));
-                await reapRun({ id, pid });
+                assert.equal(meta.status, "killed", `${reason} must stop current-session delegated work`);
+                assert.equal(meta.stoppedReason, "shutdown", "the stop is attributed to the shutdown");
+                assert.equal(typeof meta.stoppedAt, "number");
+                assert.equal(meta.supervisionInterruptedAt, undefined, "a confirmed stop leaves no interruption marker");
+                assert.equal(typeof meta.completionCallbackSuppressedAt, "number", "a run stopped by shutdown owes no completion");
+                assert.match(meta.completionCallbackSuppressedReason, new RegExp(reason));
+                const gone = await waitFor(() => !realProcessProbe.pidExists(pid));
+                assert.ok(gone, `${reason} must not leave the detached child running`);
+                const notices = h.notes.filter((n) => /stopped by/.test(n.msg));
+                assert.equal(notices.length, 1, "the human is told the run was stopped");
+                assert.ok(notices[0].msg.includes(id), "the notice names the run");
+                assert.ok(/reload|session shutdown/.test(notices[0].msg));
+                assert.deepEqual(h.sent.filter((entry) => entry.options?.triggerTurn === true), [],
+                    "stopping at shutdown never triggers a turn");
             } finally {
                 if (pid) killProcessTree(pid, "SIGKILL");
                 if (id) rmSync(runDir(id), { recursive: true, force: true });
@@ -597,6 +613,82 @@ describe("session_shutdown child ownership (#625)", () => {
             }
         });
     }
+
+    const asRemote = (meta) => ({
+        ...meta,
+        remote: {
+            target: "t", host: "remote.invalid", remoteDir: "~/r", sshArgv: ["ssh", "remote.invalid"], login: false,
+            abortDonePath: join(runDir(meta.id), "abort-done"), abortWaitMs: 10, termGraceSeconds: 1, stopScript: "true",
+        },
+    });
+
+    it("stops a remote run at shutdown through the asynchronous remote stop and records the reason", async () => {
+        const h = makeHarness({ cwd: tmpdir(), sessionId: "remote-stop" });
+        let id;
+        const stopped = [];
+        setShutdownStopForTests({
+            signalBridge: () => {},
+            remoteStopAsync: async (remote) => { stopped.push(remote.host); return { verified: true }; },
+        });
+        try {
+            ({ id } = await spawnRun(h));
+            writeMeta(asRemote(readMeta(id)));
+            await h.shutdown({ reason: "quit" });
+            assert.deepEqual(stopped, ["remote.invalid"], "the remote session is stopped through ssh");
+            const meta = readMeta(id);
+            assert.equal(meta.status, "killed");
+            assert.equal(meta.stoppedReason, "shutdown");
+            assert.equal(meta.supervisionInterruptedAt, undefined);
+            assert.equal(typeof meta.completionCallbackSuppressedAt, "number");
+        } finally {
+            setShutdownStopForTests(undefined);
+            await h.shutdown({ reason: "quit" });
+        }
+    });
+
+    it("bounds the shutdown wait on an unresponsive remote stop and leaves the run discoverable", async () => {
+        const h = makeHarness({ cwd: tmpdir(), sessionId: "remote-hang" });
+        let id;
+        let pid;
+        setShutdownStopForTests({ signalBridge: () => {}, remoteStopAsync: () => new Promise(() => {}) }, 100);
+        try {
+            ({ id, pid } = await spawnRun(h));
+            writeMeta(asRemote(readMeta(id)));
+            const started = Date.now();
+            await h.shutdown({ reason: "quit" });
+            assert.ok(Date.now() - started < 3_000, "shutdown does not wait for a hung ssh");
+            const meta = readMeta(id);
+            assert.equal(meta.status, "running", "an unconfirmed stop leaves the run running");
+            assert.equal(meta.supervisionInterruptedReason, "quit", "and records why, so it stays discoverable");
+            assert.ok(h.notes.some((n) => n.level === "warning" && /could not be confirmed stopped/.test(n.msg) && n.msg.includes(id)));
+        } finally {
+            setShutdownStopForTests(undefined);
+            // The unconfirmed child is still alive: end it here so it cannot finalize into a later test.
+            if (id && pid) await reapRun({ id, pid });
+            await h.shutdown({ reason: "quit" });
+        }
+    });
+
+    it("an unverified remote stop is reported, not hidden", async () => {
+        const h = makeHarness({ cwd: tmpdir(), sessionId: "remote-unverified" });
+        let id;
+        let pid;
+        setShutdownStopForTests({ signalBridge: () => {}, remoteStopAsync: async () => ({ verified: false, reason: "ssh unreachable" }) });
+        try {
+            ({ id, pid } = await spawnRun(h));
+            writeMeta(asRemote(readMeta(id)));
+            await h.shutdown({ reason: "reload" });
+            const meta = readMeta(id);
+            assert.equal(meta.status, "running");
+            assert.equal(meta.supervisionInterruptedReason, "reload");
+            assert.ok(h.notes.some((n) => n.level === "warning" && /could not be confirmed stopped/.test(n.msg)));
+        } finally {
+            setShutdownStopForTests(undefined);
+            // The unconfirmed child is still alive: end it here so it cannot finalize into a later test.
+            if (id && pid) await reapRun({ id, pid });
+            await h.shutdown({ reason: "quit" });
+        }
+    });
 
     it("does not touch same-parent runs from a different foreground session", async () => {
         const cwd = tmpdir();
@@ -646,6 +738,347 @@ describe("session_shutdown child ownership (#625)", () => {
             rmSync(runDir(id), { recursive: true, force: true });
             await h.shutdown({ reason: "quit" });
         }
+    });
+});
+
+/**
+ * The shutdown stop may wait (bounded) on ssh. Nothing may be able to start a
+ * model turn for the ending session during that wait or afterwards, and the
+ * bookkeeping of one run must not decide what is recorded for another.
+ */
+describe("session_shutdown delivery gates and unconfirmed-stop bookkeeping", () => {
+    const asRemote = (meta) => ({
+        ...meta,
+        remote: {
+            target: "t", host: "remote.invalid", remoteDir: "~/r", sshArgv: ["ssh", "remote.invalid"], login: false,
+            abortDonePath: join(runDir(meta.id), "abort-done"), abortWaitMs: 10, termGraceSeconds: 1, stopScript: "true",
+        },
+    });
+    const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const triggering = (h) => h.sent.filter((entry) => entry.options?.triggerTurn === true);
+    /** A terminal record this process owns, with a completion still owed, for a session. */
+    const seedLostRun = (cwd, sessionId) => {
+        const id = nextRunId();
+        dirOnly.push(id);
+        mkdirSync(runDir(id), { recursive: true });
+        writeFileSync(join(runDir(id), "output.log"), "lost-run\n");
+        writeMeta({
+            id, status: "lost", pid: DEAD_PID, pgid: DEAD_PID, pidStartTime: "gone-token", spawnPid: process.pid, cwd,
+            promptPreview: "p", startedAt: Date.now() - 120_000, lostAt: Date.now() - 60_000, endedAt: Date.now() - 60_000,
+            logPath: join(runDir(id), "output.log"), sessionId: id, callbackOrigin: { cwd, sessionId }, callback: true,
+        });
+        return id;
+    };
+    /** A run whose record still says running although its child exited. */
+    const seedExitedRunningRun = (cwd, sessionId) => {
+        const id = nextRunId();
+        dirOnly.push(id);
+        mkdirSync(runDir(id), { recursive: true });
+        writeFileSync(join(runDir(id), "output.log"), "exited-run\n");
+        writeMeta({
+            id, status: "running", pid: DEAD_PID, pgid: DEAD_PID, pidStartTime: "gone-token", spawnPid: process.pid, cwd,
+            promptPreview: "p", startedAt: Date.now() - 5_000, logPath: join(runDir(id), "output.log"), sessionId: id,
+            callbackOrigin: { cwd, sessionId }, callback: true,
+        });
+        return id;
+    };
+
+    it("closes completion delivery and supervision before it waits on a slow remote stop", async () => {
+        const previousWindow = process.env.PI_BETTER_CALLBACK_BATCH_MS;
+        process.env.PI_BETTER_CALLBACK_BATCH_MS = "20";
+        await withFakeClock(async () => {
+            const cwd = tmpdir();
+            const h = makeHarness({ cwd, sessionId: "slow-stop" });
+            let release;
+            const gate = new Promise((resolve) => { release = resolve; });
+            setShutdownStopForTests({ signalBridge: () => {}, remoteStopAsync: async () => { await gate; return { verified: true }; } }, 5_000);
+            let shutdown;
+            let run;
+            try {
+                await h.handlers.get("session_start")({ reason: "startup" }, h.ctx); // binds the host's batcher, as Pi does
+                run = await spawnRun(h);
+                writeMeta(asRemote(readMeta(run.id)));
+                const lostId = seedLostRun(cwd, "slow-stop");
+                assert.equal(isHealthTickerActive(), true, "supervision is armed while the session runs");
+
+                shutdown = h.shutdown({ reason: "quit" });
+                await pause(50); // the handler is now parked on the remote stop
+                assert.equal(isHealthTickerActive(), false, "supervision is closed before the wait, not after it");
+
+                // A completion becomes pending during the wait, and the health ticker fires.
+                getCallbackBatcher(h.pi).enqueue({
+                    source: "subagent", id: "late-completion", label: "late", status: "completed",
+                    detailTool: "subagent_result", callback: true,
+                });
+                mock.timers.tick(HEALTH_TICK_MS * 2);
+                await pause(200);
+                assert.deepEqual(triggering(h), [], "nothing can start a turn while shutdown waits on the remote stop");
+                assert.equal(readMeta(lostId).lostCallbackSentAt, undefined, "the lost notice was not handed off during the wait");
+
+                release();
+                await shutdown;
+                await pause(100);
+                assert.deepEqual(triggering(h), [], "nor after it");
+                assert.equal(readMeta(run.id).status, "killed", "the confirmed stop still completes");
+                assert.equal(typeof readMeta(run.id).completionCallbackSuppressedAt, "number");
+            } finally {
+                release?.();
+                await shutdown;
+                setShutdownStopForTests(undefined);
+                if (run) await reapRun(run);
+                await h.shutdown({ reason: "quit" });
+            }
+        });
+        if (previousWindow === undefined) delete process.env.PI_BETTER_CALLBACK_BATCH_MS;
+        else process.env.PI_BETTER_CALLBACK_BATCH_MS = previousWindow;
+    });
+
+    it("marks only runs sent to a remote stop as unconfirmed at the bound, not local runs it did not stop", async () => {
+        const cwd = tmpdir();
+        const h = makeHarness({ cwd, sessionId: "scoped-unconfirmed" });
+        let remote;
+        setShutdownStopForTests({ signalBridge: () => {}, remoteStopAsync: () => new Promise(() => {}) }, 100);
+        const exitedId = seedExitedRunningRun(cwd, "scoped-unconfirmed");
+        try {
+            remote = await spawnRun(h);
+            writeMeta(asRemote(readMeta(remote.id)));
+            await h.shutdown({ reason: "quit" });
+            assert.equal(readMeta(remote.id).supervisionInterruptedReason, "quit", "the in-flight remote stop is unconfirmed");
+            const exited = readMeta(exitedId);
+            assert.equal(exited.supervisionInterruptedAt, undefined, "a local run whose child exited is not marked as possibly running");
+            const warning = h.notes.find((n) => n.level === "warning" && /could not be confirmed stopped/.test(n.msg));
+            assert.ok(warning?.msg.includes(remote.id));
+            assert.ok(!warning.msg.includes(exitedId), "and is not named in the warning");
+        } finally {
+            setShutdownStopForTests(undefined);
+            if (remote) await reapRun(remote);
+            await h.shutdown({ reason: "quit" });
+        }
+    });
+
+    it("one run's failing bookkeeping does not skip the other runs' markers or the warning", { skip: process.getuid?.() === 0 }, async () => {
+        const cwd = tmpdir();
+        const h = makeHarness({ cwd, sessionId: "settle-throws" });
+        let broken;
+        let hung;
+        // The broken run's stop fails and leaves its record unwritable; the other never answers.
+        setShutdownStopForTests({
+            signalBridge: () => {},
+            remoteStopAsync: (remoteInfo) => {
+                if (remoteInfo.remoteDir === "~/broken") {
+                    chmodSync(runDir(broken.id), 0o500);
+                    return Promise.reject(new Error("ssh unreachable"));
+                }
+                return new Promise(() => {});
+            },
+        }, 200);
+        try {
+            broken = await spawnRun(h);
+            hung = await spawnRun(h);
+            writeMeta({ ...asRemote(readMeta(broken.id)), remote: { ...asRemote(readMeta(broken.id)).remote, remoteDir: "~/broken" } });
+            writeMeta(asRemote(readMeta(hung.id)));
+            await h.shutdown({ reason: "quit" });
+            assert.equal(readMeta(hung.id).supervisionInterruptedReason, "quit", "the other run is still marked");
+            const warning = h.notes.find((n) => n.level === "warning" && /could not be confirmed stopped/.test(n.msg));
+            assert.ok(warning, "the warning is still shown");
+            assert.ok(warning.msg.includes(hung.id) && warning.msg.includes(broken.id), "and names both runs");
+        } finally {
+            setShutdownStopForTests(undefined);
+            if (broken) { try { chmodSync(runDir(broken.id), 0o700); } catch { /* gone */ } await reapRun(broken); }
+            if (hung) await reapRun(hung);
+            await h.shutdown({ reason: "quit" });
+        }
+    });
+
+    describe("runs that outlive the session that started them never start a turn", () => {
+        const finishLocally = async (run) => {
+            killProcessTree(run.pid, "SIGKILL");
+            return waitFor(() => {
+                const meta = readMeta(run.id);
+                return meta && meta.status !== "running" && meta.status !== "orphaned" ? meta : undefined;
+            }, { timeoutMs: 3000 });
+        };
+
+        it("delivers the late completion after a reload as a non-triggering notice", async () => {
+            const previousWindow = process.env.PI_BETTER_CALLBACK_BATCH_MS;
+            process.env.PI_BETTER_CALLBACK_BATCH_MS = "20";
+            const h = makeHarness({ cwd: tmpdir(), sessionId: "reload-late" });
+            let run;
+            setShutdownStopForTests({ signalBridge: () => {}, remoteStopAsync: async () => ({ verified: false, reason: "ssh unreachable" }) });
+            try {
+                run = await spawnRun(h);
+                writeMeta(asRemote(readMeta(run.id)));
+                await h.shutdown({ reason: "reload" });
+                assert.equal(readMeta(run.id).status, "running", "the stop was unconfirmed");
+                assert.equal(typeof readMeta(run.id).supervisionInterruptedAt, "number");
+
+                assert.ok(await finishLocally(run), "the unconfirmed run later finishes");
+                await pause(300);
+                await getCallbackBatcher(h.pi).flush();
+                const about = h.sent.filter((entry) => String(entry.message.content).includes(run.id));
+                assert.deepEqual(about.filter((entry) => entry.message.customType === "background-completion-batch"), [],
+                    "never through the turn-triggering batch");
+                assert.deepEqual(triggering(h), [], "nothing about it can start a turn");
+                assert.ok(about.every((entry) => entry.options?.triggerTurn === false));
+            } finally {
+                setShutdownStopForTests(undefined);
+                if (run) await reapRun(run);
+                await h.shutdown({ reason: "quit" });
+                if (previousWindow === undefined) delete process.env.PI_BETTER_CALLBACK_BATCH_MS;
+                else process.env.PI_BETTER_CALLBACK_BATCH_MS = previousWindow;
+            }
+        });
+
+        it("keeps the pending marker and sends nothing when a /new ended the session", async () => {
+            const h = makeHarness({ cwd: tmpdir(), sessionId: "new-late" });
+            let run;
+            setShutdownStopForTests({ signalBridge: () => {}, remoteStopAsync: async () => ({ verified: false, reason: "ssh unreachable" }) });
+            try {
+                run = await spawnRun(h);
+                writeMeta(asRemote(readMeta(run.id)));
+                await h.shutdown({ reason: "new" });
+                assert.ok(await finishLocally(run));
+                await pause(300);
+                await getCallbackBatcher(h.pi).flush();
+                assert.deepEqual(h.sent.filter((entry) => String(entry.message.content).includes(run.id)), [],
+                    "no session owns it now, so nothing is delivered");
+                const meta = readMeta(run.id);
+                assert.equal(meta.completionCallbackSentAt, undefined);
+                assert.equal(meta.completionCallbackSuppressedAt, undefined, "the owed completion stays on disk for its session");
+            } finally {
+                setShutdownStopForTests(undefined);
+                if (run) await reapRun(run);
+                await h.shutdown({ reason: "quit" });
+            }
+        });
+
+        it("a replacement instance of the same process recovers it as a notice, not a turn", async () => {
+            const cwd = tmpdir();
+            const id = nextRunId();
+            dirOnly.push(id);
+            mkdirSync(runDir(id), { recursive: true });
+            writeFileSync(join(runDir(id), "output.log"), "done\n");
+            // Terminal, completion owed, started by a session of THIS process that was shut down with the stop unconfirmed.
+            writeMeta({
+                id, status: "completed", pid: DEAD_PID, pgid: DEAD_PID, spawnPid: process.pid, cwd, promptPreview: "p",
+                startedAt: Date.now() - 5_000, endedAt: Date.now() - 1_000, exitCode: 0, lifecycleClassification: "complete",
+                logPath: join(runDir(id), "output.log"), sessionId: id, callback: true,
+                callbackOrigin: { cwd, sessionId: "same-process" }, completionCallbackPendingAt: Date.now() - 1_000,
+                supervisionInterruptedAt: Date.now() - 2_000, supervisionInterruptedReason: "reload",
+            });
+            const h = makeHarness({ cwd, sessionId: "same-process" });
+            try {
+                await h.handlers.get("session_start")({ reason: "reload" }, h.ctx);
+                await getCallbackBatcher(h.pi).flush();
+                const about = h.sent.filter((entry) => String(entry.message.content).includes(id));
+                assert.deepEqual(about.map((entry) => entry.message.customType), ["subagent-restart-notice"]);
+                assert.deepEqual(about[0].options, { triggerTurn: false });
+                assert.ok(readMeta(id).completionCallbackSentAt > 0);
+            } finally {
+                await h.shutdown({ reason: "quit" });
+            }
+        });
+
+        it("a shutdown that could not even write the interruption marker still leaves its run outlived: a same-id next session is not woken by it", async () => {
+            const previousWindow = process.env.PI_BETTER_CALLBACK_BATCH_MS;
+            process.env.PI_BETTER_CALLBACK_BATCH_MS = "20";
+            const h = makeHarness({ cwd: tmpdir(), sessionId: "marker-write-fails" });
+            let run;
+            setShutdownStopForTests({
+                signalBridge: () => {},
+                remoteStopAsync: async () => {
+                    // The stop cannot be confirmed AND the record can no longer be written.
+                    setMetaWriteBarrierForTests(() => { throw new Error("no space left on device"); });
+                    return { verified: false, reason: "ssh unreachable" };
+                },
+            });
+            try {
+                run = await spawnRun(h);
+                writeMeta(asRemote(readMeta(run.id)));
+                await h.shutdown({ reason: "reload" });
+                setMetaWriteBarrierForTests(undefined);
+                setShutdownStopForTests(undefined);
+                assert.equal(readMeta(run.id).status, "running", "the stop was unconfirmed");
+                assert.equal(readMeta(run.id).supervisionInterruptedAt, undefined, "and no durable marker could be written");
+                assert.ok(h.notes.some((n) => n.level === "warning" && /could not be confirmed stopped/.test(n.msg) && n.msg.includes(run.id)), "the human is still told");
+
+                // The next lifetime of this process has the same session id.
+                await h.handlers.get("session_start")({ reason: "reload" }, h.ctx);
+                assert.ok(await finishLocally(run), "the unconfirmed run later finishes");
+                await pause(300);
+                await getCallbackBatcher(h.pi).flush();
+                const about = h.sent.filter((entry) => String(entry.message.content).includes(run.id));
+                assert.deepEqual(about.filter((entry) => entry.message.customType === "background-completion-batch"), [],
+                    "never through the turn-triggering batch");
+                assert.deepEqual(triggering(h), [], "nothing about it can start a turn");
+                assert.ok(about.every((entry) => entry.options?.triggerTurn === false));
+            } finally {
+                setMetaWriteBarrierForTests(undefined);
+                setShutdownStopForTests(undefined);
+                if (run) await reapRun(run);
+                await h.shutdown({ reason: "quit" });
+                if (previousWindow === undefined) delete process.env.PI_BETTER_CALLBACK_BATCH_MS;
+                else process.env.PI_BETTER_CALLBACK_BATCH_MS = previousWindow;
+            }
+        });
+
+        it("a run still running when a session starts, left by a lifetime that never marked it, gets only non-triggering health notices", async () => {
+            await withFakeClock(async () => {
+                const cwd = tmpdir();
+                const seedRunning = (sessionId) => {
+                    const id = nextRunId();
+                    dirOnly.push(id);
+                    mkdirSync(runDir(id), { recursive: true });
+                    writeFileSync(join(runDir(id), "output.log"), "running-run\n");
+                    writeMeta({
+                        id, status: "running", pid: DEAD_PID, pgid: DEAD_PID, pidStartTime: "gone-token", spawnPid: process.pid, cwd,
+                        promptPreview: "p", startedAt: Date.now() - 120_000, logPath: join(runDir(id), "output.log"), sessionId: id,
+                        callbackOrigin: { cwd, sessionId }, callback: true,
+                    });
+                    return id;
+                };
+                const outlived = seedRunning("unmarked-leftover"); // present before the session starts, no marker
+                const h = makeHarness({ cwd, sessionId: "unmarked-leftover" });
+                try {
+                    await h.handlers.get("session_start")({ reason: "reload" }, h.ctx);
+                    // Control: a run this lifetime launched itself, then lost.
+                    const launchedHere = await spawnRun(h);
+                    const current = launchedHere.id;
+                    writeMeta({ ...readMeta(current), pid: DEAD_PID, pgid: DEAD_PID, pidStartTime: "gone-token", callback: true });
+                    mock.timers.tick(HEALTH_TICK_MS);
+                    await new Promise((resolve) => setImmediate(resolve));
+                    const healthFor = (id) => h.sent.filter((entry) => entry.message?.customType === "subagent-health" && entry.message.content.includes(id));
+                    assert.equal(healthFor(outlived).length, 1);
+                    assert.deepEqual(healthFor(outlived)[0].options, { triggerTurn: false }, "the leftover's lost notice only informs");
+                    assert.equal(healthFor(current).length, 1);
+                    assert.equal(healthFor(current)[0].options.triggerTurn, true, "a run of the live lifetime keeps its wake");
+                    await reapRun(launchedHere);
+                } finally {
+                    await h.shutdown({ reason: "quit" });
+                }
+            });
+        });
+
+        it("a health notice for such a run is non-triggering too", async () => {
+            await withFakeClock(async () => {
+                const cwd = tmpdir();
+                const id = seedLostRun(cwd, "health-quiet");
+                writeMeta({ ...readMeta(id), supervisionInterruptedAt: Date.now() - 2_000, supervisionInterruptedReason: "reload" });
+                const h = makeHarness({ cwd, sessionId: "health-quiet" });
+                try {
+                    await h.handlers.get("session_start")({}, h.ctx);
+                    mock.timers.tick(HEALTH_TICK_MS);
+                    await new Promise((resolve) => setImmediate(resolve));
+                    const health = h.sent.filter((entry) => entry.message?.customType === "subagent-health" && entry.message.content.includes(id));
+                    assert.equal(health.length, 1);
+                    assert.deepEqual(health[0].options, { triggerTurn: false });
+                    assert.ok(readMeta(id).lostCallbackSentAt > 0, "delivered once");
+                    assert.deepEqual(triggering(h).filter((entry) => String(entry.message.content).includes(id)), []);
+                } finally {
+                    await h.shutdown({ reason: "quit" });
+                }
+            });
+        });
     });
 });
 
@@ -743,9 +1176,16 @@ describe("interrupted supervision handoff (#625)", () => {
             assert.equal(meta.supervisionInterruptedReason, "quit", "the interruption record is kept as history");
 
             await getCallbackBatcher(h.pi).flush();
-            const completions = h.sent.filter((entry) => entry.message.customType === "background-completion-batch");
-            assert.equal(completions.length, 1, "the resumed conversation gets exactly one completion");
-            assert.match(completions[0].message.content, new RegExp(id));
+            // (Completions of this process's own runs left by earlier tests may use the batch; this run must not.)
+            assert.equal(h.sent.filter((entry) => entry.message.customType === "background-completion-batch"
+                && String(entry.message.content).includes(id)).length, 0,
+                "a previous process's completion never goes through the turn-triggering batch");
+            const notices = h.sent.filter((entry) => entry.message.customType === "subagent-restart-notice");
+            assert.equal(notices.length, 1, "the resumed conversation gets exactly one notice");
+            assert.match(notices[0].message.content, new RegExp(id));
+            assert.deepEqual(notices[0].options, { triggerTurn: false }, "the notice appends to the conversation without starting a turn");
+            assert.deepEqual(h.sent.filter((entry) => entry.options?.triggerTurn === true && String(entry.message.content).includes(id)), [],
+                "nothing from a previous process triggers a turn");
             assert.ok(readMeta(id).completionCallbackSentAt > 0);
         } finally {
             await h.shutdown({ reason: "quit" });
@@ -793,8 +1233,9 @@ describe("interrupted supervision handoff (#625)", () => {
                 await a.handlers.get("session_start")({ reason: "startup" }, a.ctx);
                 await getCallbackBatcher(a.pi).flush();
                 const delivered = () => a.sent.filter((entry) =>
-                    entry.message.customType === "background-completion-batch" && String(entry.message.content).includes(id));
+                    entry.message.customType === "subagent-restart-notice" && String(entry.message.content).includes(id));
                 assert.equal(delivered().length, 1, "resumed origin A must recover its owed completion after B opened first");
+                assert.equal(delivered()[0].options.triggerTurn, false, "recovered without triggering a turn");
                 assert.ok(readMeta(id).completionCallbackSentAt > 0);
                 assert.equal(readMeta(id).completionCallbackSuppressedAt, undefined);
 
@@ -849,7 +1290,7 @@ describe("interrupted supervision handoff (#625)", () => {
         const id = seedRestartRun({ originSession: "origin-A" });
         let failOnce = true;
         const first = makeHarness({ cwd: tmpdir(), sessionId: "origin-A", sendMessage(message, options, sent) {
-            if (message.customType === "background-completion-batch" && failOnce) {
+            if (message.customType === "subagent-restart-notice" && failOnce) {
                 failOnce = false;
                 throw new Error("simulated handoff failure");
             }
@@ -857,22 +1298,22 @@ describe("interrupted supervision handoff (#625)", () => {
         } });
         try {
             await first.handlers.get("session_start")({ reason: "startup" }, first.ctx);
-            assert.equal(await getCallbackBatcher(first.pi).flush(), false, "the failed handoff is not marked delivered");
             const owed = readMeta(id);
             assert.equal(owed.completionCallbackSentAt, undefined);
             assert.equal(owed.completionCallbackSuppressedAt, undefined, "failure keeps the obligation recoverable");
         } finally {
             await first.shutdown({ reason: "quit" });
         }
-        assert.equal(first.sent.filter((entry) => entry.message.customType === "background-completion-batch").length, 0);
+        assert.equal(first.sent.filter((entry) => entry.message.customType === "subagent-restart-notice").length, 0);
 
         const second = makeHarness({ cwd: tmpdir(), sessionId: "origin-A" });
         try {
             await second.handlers.get("session_start")({ reason: "startup" }, second.ctx);
             await getCallbackBatcher(second.pi).flush();
             const delivered = second.sent.filter((entry) =>
-                entry.message.customType === "background-completion-batch" && String(entry.message.content).includes(id));
+                entry.message.customType === "subagent-restart-notice" && String(entry.message.content).includes(id));
             assert.equal(delivered.length, 1, "the restarted conversation recovers the retried completion");
+            assert.equal(delivered[0].options.triggerTurn, false);
             assert.ok(readMeta(id).completionCallbackSentAt > 0);
         } finally {
             await second.shutdown({ reason: "quit" });
@@ -911,6 +1352,10 @@ describe("interrupted supervision handoff (#625)", () => {
                 assert.equal(recovered.status, "completed", `supervision recovered ${recovered.status}`);
                 assert.equal(recovered.lifecycleClassification, "complete");
                 assert.equal(recovered.exitCode, null, "no exit code is invented for a child nobody observed");
+                // The run belongs to a previous process lifetime: its completion is a notice, never a turn.
+                const about = h.sent.filter((entry) => String(entry.message.content).includes(run.id));
+                assert.deepEqual(about.map((entry) => entry.message.customType), ["subagent-restart-notice"]);
+                assert.deepEqual(about[0].options, { triggerTurn: false });
             } finally {
                 if (run) await reapRun(run);
                 await h.shutdown({ reason: "quit" });
@@ -1083,15 +1528,15 @@ describe("completion callback batching", () => {
     // @covers subagent.completion-callback
     // @level integration
     // @fails-without-fix subagent.completion-callback
-    it("recovers durable pending callbacks after reload and retries a failed aggregate without early markers", async () => {
+    it("recovers durable pending callbacks after reload as non-triggering notices and retries a failed handoff without early markers", async () => {
         let failNext = true;
         const h = makeHarness({
             cwd: tmpdir(),
             sessionId: "session-b",
             sendMessage(message, options, sent) {
-                if (message.customType === "background-completion-batch" && failNext) {
+                if (message.customType === "subagent-restart-notice" && failNext) {
                     failNext = false;
-                    throw new Error("simulated aggregate handoff failure");
+                    throw new Error("simulated notice handoff failure");
                 }
                 sent.push({ message, options });
             },
@@ -1119,31 +1564,34 @@ describe("completion callback batching", () => {
             writeMeta({ ...base, id: ids[2], name: "foreign", logPath: join(runDir(ids[2]), "output.log"), callbackOrigin: { cwd: h.ctx.cwd, sessionId: "session-a" } });
 
             await h.handlers.get("session_start")({}, h.ctx);
-            const batcher = getCallbackBatcher(h.pi);
-            assert.equal(batcher.pendingCount(), 3, "reload recovers every unhandled pending record before ownership filtering");
-
-            assert.equal(await batcher.flush(), false);
-            assert.equal(readMeta(ids[0]).completionCallbackSentAt, undefined);
-            assert.equal(readMeta(ids[1]).completionCallbackSentAt, undefined);
-            assert.equal(readMeta(ids[2]).completionCallbackSentAt, undefined);
+            assert.equal(getCallbackBatcher(h.pi).pendingCount(), 0, "completions pending at session_start never enter the triggering batcher");
+            const notices = () => h.sent.filter((entry) => entry.message.customType === "subagent-restart-notice");
+            assert.deepEqual(h.sent.filter((entry) => entry.options?.triggerTurn === true), [], "recovery starts no turn");
+            // One handoff failed: only that run stays pending; the other one is receipted after the host took it.
+            const delivered = ids.slice(0, 2).filter((id) => readMeta(id).completionCallbackSentAt !== undefined);
+            assert.equal(delivered.length, 1, "exactly the accepted handoff is receipted");
+            assert.equal(notices().length, 1);
             assert.ok(readMeta(ids[2]).completionCallbackSuppressedAt > 0, "foreign record is durably suppressed");
+            assert.equal(readMeta(ids[2]).completionCallbackSentAt, undefined);
 
-            assert.equal(await batcher.flush(), true);
-            const messages = h.sent.filter((entry) => entry.message.customType === "background-completion-batch");
-            assert.equal(messages.length, 1);
-            assert.match(messages[0].message.content, new RegExp(ids[0]));
-            assert.match(messages[0].message.content, new RegExp(ids[1]));
-            assert.doesNotMatch(messages[0].message.content, new RegExp(ids[2]));
+            await h.handlers.get("session_start")({}, h.ctx);
+            assert.equal(notices().length, 2, "the failed handoff is retried by the next recovery");
+            const text = notices().map((entry) => entry.message.content).join("\n");
+            assert.match(text, new RegExp(ids[0]));
+            assert.match(text, new RegExp(ids[1]));
+            assert.doesNotMatch(text, new RegExp(ids[2]));
             assert.ok(readMeta(ids[0]).completionCallbackSentAt > 0);
             assert.ok(readMeta(ids[1]).completionCallbackSentAt > 0);
+            assert.ok(notices().every((entry) => entry.options.triggerTurn === false));
+            assert.equal(h.sent.filter((entry) => entry.message.customType === "background-completion-batch").length, 0);
         } finally {
             h.shutdown();
         }
     });
-    it("marks terminal incidents only after the completion batch succeeds", async () => {
+    it("marks terminal incidents only after the recovered completion notice is accepted", async () => {
         let failOnce = true;
         const h = makeHarness({ sendMessage(message, options, sent) {
-            if (message.customType === "background-completion-batch" && failOnce) {
+            if (message.customType === "subagent-restart-notice" && failOnce) {
                 failOnce = false;
                 throw new Error("simulated failure");
             }
@@ -1160,17 +1608,18 @@ describe("completion callback batching", () => {
             writeFileSync(join(runDir(id), "output.log"), JSON.stringify({ type: "agent_end", messages: [] }) + "\n");
             observeFailures(failurePath(id), [{ id: "tool:failed", operation: "npm-test", kind: "failure", summary: "tests failed" }]);
             await h.handlers.get("session_start")({}, h.ctx);
-            const batcher = getCallbackBatcher(h.pi);
-            assert.equal(await batcher.flush(), false);
-            assert.equal(readMeta(id).completionCallbackSentAt, undefined);
+            assert.equal(readMeta(id).completionCallbackSentAt, undefined, "a refused handoff leaves the completion pending");
             assert.deepEqual(pendingFailureAttention(readRunFailures(id), Date.now(), { terminal: true })?.incidents, ["tool:failed"]);
-            assert.equal(await batcher.flush(), true);
+            await h.handlers.get("session_start")({}, h.ctx);
             assert.ok(readMeta(id).completionCallbackSentAt > 0);
             assert.equal(pendingFailureAttention(readRunFailures(id), Date.now(), { terminal: true }), undefined);
             await h.handlers.get("session_start")({}, h.ctx);
-            assert.equal(batcher.pendingCount(), 0);
-            assert.equal(h.sent.filter((x) => x.message.customType === "background-completion-batch").length, 1);
-            assert.match(h.sent.find((x) => x.message.customType === "background-completion-batch").message.content, /status=completed; action required/);
+            assert.equal(getCallbackBatcher(h.pi).pendingCount(), 0);
+            assert.equal(h.sent.filter((x) => x.message.customType === "background-completion-batch").length, 0);
+            const notices = h.sent.filter((x) => x.message.customType === "subagent-restart-notice");
+            assert.equal(notices.length, 1, "delivered once");
+            assert.equal(notices[0].options.triggerTurn, false);
+            assert.match(notices[0].message.content, /status=completed; action required/);
             assert.equal(h.sent.filter((x) => x.message.customType === "subagent-failure").length, 0);
         } finally { h.shutdown(); }
     });
@@ -1627,7 +2076,7 @@ describe("#65 — orphaned/lost health callbacks via health ticker", () => {
         });
     });
 
-    it("lost transition sends one explicit followUp when callback:true", async () => {
+    it("lost transition of a run already running at session_start sends one non-triggering notice when callback:true", async () => {
         await withFakeClock(async () => {
             const h = makeHarness();
             try {
@@ -1655,8 +2104,9 @@ describe("#65 — orphaned/lost health callbacks via health ticker", () => {
                 assert.equal(readMeta(id).status, "lost");
                 const msgs = healthMsgsFor(h.sent, id);
                 assert.equal(msgs.length, 1, `exactly one lost health callback for ${id}; got ${msgs.length}`);
-                assert.equal(msgs[0].options.deliverAs, "followUp");
-                assert.equal(msgs[0].options.triggerTurn, true);
+                // The record was already running when this session started: it belongs to a previous
+                // lifetime of the process, so its notice informs and never starts a turn.
+                assert.deepEqual(msgs[0].options, { triggerTurn: false });
                 assert.match(msgs[0].message.content, /ATTENTION/i);
                 assert.match(msgs[0].message.content, /no related process remains/i);
                 assert.match(msgs[0].message.content, /no coherent terminal/i);
@@ -1755,7 +2205,7 @@ describe("#65 — orphaned/lost health callbacks via health ticker", () => {
         });
     });
 
-    it("persisted unmarked orphaned recovers one callback after reload without a fresh transition", async () => {
+    it("persisted unmarked orphaned recovers one non-triggering notice after reload without a fresh transition", async () => {
         writeFakePi(TRAP_FAIL_SCRIPT);
         await withFakeClock(async () => {
             const h = makeHarness();
@@ -1782,8 +2232,8 @@ describe("#65 — orphaned/lost health callbacks via health ticker", () => {
                 assert.equal(readMeta(id).status, "orphaned", "live group evidence keeps orphaned");
                 const msgs = healthMsgsFor(h.sent, id);
                 assert.equal(msgs.length, 1, `exactly one recovered orphaned callback; got ${msgs.length}`);
-                assert.equal(msgs[0].options.deliverAs, "followUp");
-                assert.equal(msgs[0].options.triggerTurn, true);
+                // Persisted from a prior session: the recovered notice informs and never starts a turn.
+                assert.deepEqual(msgs[0].options, { triggerTurn: false });
                 assert.match(msgs[0].message.content, /ATTENTION/i);
                 assert.match(msgs[0].message.content, /may still be alive/i);
                 assert.ok(readMeta(id).orphanedCallbackSentAt > 0, "marker written after successful handoff");
@@ -1803,7 +2253,7 @@ describe("#65 — orphaned/lost health callbacks via health ticker", () => {
         });
     });
 
-    it("persisted unmarked lost recovers one callback after reload", async () => {
+    it("persisted unmarked lost recovers one non-triggering notice after reload", async () => {
         await withFakeClock(async () => {
             const h = makeHarness();
             try {
@@ -1839,8 +2289,8 @@ describe("#65 — orphaned/lost health callbacks via health ticker", () => {
                 assert.equal(readMeta(id).status, "lost");
                 const msgs = healthMsgsFor(h.sent, id);
                 assert.equal(msgs.length, 1, `exactly one recovered lost callback; got ${msgs.length}`);
-                assert.equal(msgs[0].options.deliverAs, "followUp");
-                assert.equal(msgs[0].options.triggerTurn, true);
+                // Lost before this lifetime began: the recovered notice informs and never starts a turn.
+                assert.deepEqual(msgs[0].options, { triggerTurn: false });
                 assert.match(msgs[0].message.content, /ATTENTION/i);
                 assert.match(msgs[0].message.content, /no related process remains/i);
                 assert.ok(readMeta(id).lostCallbackSentAt > 0, "marker written after successful handoff");
@@ -1856,7 +2306,7 @@ describe("#65 — orphaned/lost health callbacks via health ticker", () => {
         });
     });
 
-    it("failed callback handoff is not permanently suppressed; reload delivers one later success", async () => {
+    it("failed callback handoff is not permanently suppressed; reload delivers one later non-triggering success", async () => {
         await withFakeClock(async () => {
             let failNext = true;
             const tools = new Map();
@@ -1920,8 +2370,7 @@ describe("#65 — orphaned/lost health callbacks via health ticker", () => {
 
                 const msgs = healthMsgsFor(sent, id);
                 assert.equal(msgs.length, 1, `exactly one successful recovery callback; got ${msgs.length}`);
-                assert.equal(msgs[0].options.deliverAs, "followUp");
-                assert.equal(msgs[0].options.triggerTurn, true);
+                assert.deepEqual(msgs[0].options, { triggerTurn: false }, "a lost run of an earlier lifetime never starts a turn");
                 assert.match(msgs[0].message.content, /ATTENTION/i);
                 assert.ok(readMeta(id).lostCallbackSentAt > 0, "marker written only after successful handoff");
 
