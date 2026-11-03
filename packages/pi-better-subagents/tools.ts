@@ -565,12 +565,13 @@ export function subagentWaitTool(Type: TypeModule, baseSession: SubagentToolSess
         label: "Wait for Subagents",
         description:
             "Block until the listed subagent runs finish, then return each run's result. Only in a one-shot session " +
-            "(`pi -p`, e.g. you are a subagent): your session ends with your turn and stops every run you started, so " +
-            "completion callbacks never reach you. Bounded: timeout_minutes defaults to 30, max 120. Returns early when " +
+            "(`pi -p`, e.g. you are a subagent): when your turn ends your session shuts down and stops (SIGTERM, bounded) every " +
+            "run you started that is still going, recording it killed with no completion, so completion callbacks never reach you " +
+            "and unfinished runs lose their final result. Bounded: timeout_minutes defaults to 30, max 120. Returns early when " +
             "your parent sends an amendment or a listed run needs attention.",
         promptSnippet: "Wait for subagents you started (one-shot sessions only)",
         promptGuidelines: [
-            "You are in a one-shot session: when you end your turn, runs you started are stopped and their results are lost. For you, 'reported on the next turn' never happens. Before your final answer, call subagent_wait with the ids whose results you need.",
+            "You are in a one-shot session: when you end your turn, your session shuts down and stops every run you started that is still going (recorded killed, no completion); only their partial output remains. For you, 'reported on the next turn' never happens. Before your final answer, call subagent_wait with the ids whose results you need.",
             "Work on other things first if you can, then wait. If subagent_wait returns early (amendment, attention notice, timeout), act on what it reports, then wait again only for runs you still need.",
             "Runs returned by subagent_wait are not announced again; use subagent_result with the returned cursor for further pages.",
         ],

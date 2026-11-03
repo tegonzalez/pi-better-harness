@@ -132,10 +132,86 @@ thresholds continue to take precedence for subagent health.
 | `subagent_wait` | **yes** | Headless sessions only (see [Nested agents](#nested-agents-waiting-in-a-headless-session)). Blocks until the listed runs finish and returns each run's first `subagent_result` page. Params: `ids` (one or more run ids), `timeout_minutes` (optional). |
 | `subagent_steer` | never | Amend a running child's instructions. Params: `id`, `message`. See [Steering a running subagent](#steering-a-running-subagent). |
 
+## What happens to started runs when a session ends
+
+Children are detached process groups, so nothing would stop them when the
+session that started them goes away, and they would keep spending with nobody to
+supervise, bound or stop them. The session therefore stops them. Every end of a
+session runs the extension's `session_shutdown` handler, with the same effect
+whether Pi is interactive or one-shot (`pi -p`, which disposes its session
+when the turn ends):
+
+- **Quit, `/reload`, `/new`, `/resume` and fork** stop every `running` or
+  `orphaned` run that session started, through the same stop path as
+  `subagent_stop`: a local run's process group is sent SIGTERM; a remote run is
+  aborted over RPC and its remote session terminated and verified over ssh (see
+  [remote subagents](remote-subagents.md)). The wait for stops is bounded (8
+  seconds); remote stops run concurrently. Completion delivery and
+  supervision are closed first, so nothing can start a turn while the stops are
+  awaited.
+- **A stopped run is recorded `killed`** with `stoppedReason: "shutdown"` and
+  `stoppedAt`. It owes no completion message: nothing is delivered now, after a
+  reload, or after a restart, and no turn is started. Its saved output stays
+  readable with `subagent_result` / `subagent_output` and, if its conversation
+  was recorded, can be continued by an explicit `subagent_spawn` with
+  `session_id`.
+- **A stop that cannot be confirmed in time** (ssh down, remote process
+  survives, bound reached) leaves that run `running`, records the interruption
+  (`supervisionInterruptedAt`, reason `quit`/`reload`/`new`/…), and warns the
+  human by name (only runs sent to a remote stop are marked at the bound; a
+  local run that had already exited is not). If its child has since finished,
+  a later session (the same Pi process, or a restart in the same conversation)
+  finalizes it from the child's own log; otherwise end it with `subagent_stop`.
+  Its later completion and its deadline, stuck, lost and failure notices are
+  appended to the conversation as non-triggering notices and never start a
+  turn. This holds even when the interruption marker could not be written (or
+  the run list could not be read) at shutdown: the guard is not the marker but
+  an allowlist (see "Only the session that launched a run can be woken by it"
+  below).
+- **A launch in flight when the session ends does not survive it.** A torn-down
+  session refuses new launches (they start nothing) until the next session
+  starts. A remote launch that was still waiting on ssh when the session ended
+  is stopped as soon as it resolves (same bound; an unconfirmed stop is
+  recorded and named) and the launch call reports the refusal. That run is
+  never on the allowlist (its launch began in a lifetime that had ended) and is
+  also marked durably before the stop begins, so the exit of its bridge can at
+  most produce one non-triggering notice, never a turn, and the stop merges into
+  the record the exit wrote rather than overwriting it. If the run's record is
+  purged while a remote stop is in flight, the stop reports `purged` and does not
+  write its earlier snapshot back.
+- **Only the session that launched a run can be woken by it.** Each extension
+  instance keeps an in-memory allowlist of the runs launched by its current
+  session lifetime (added when the launch succeeds, cleared at `session_start`
+  and at shutdown). Only those runs may start a model turn: their completion
+  and their deadline, stuck, lost, failure and orphaned notices. Everything else
+  (runs of an ended lifetime, of a previous Pi process, or of a previous
+  extension instance; Pi loads a fresh extension instance on `/reload`,
+  `/new`, `/resume` and fork, which starts with an empty allowlist) is
+  delivered once as a non-triggering notice (`triggerTurn: false`) and never
+  dropped, including a run that was already `lost` or finished with no notice
+  sent. Missing or removed durable markers never make such a run wake the model.
+- **Only that session's runs.** Runs another session or another Pi process
+  started are not touched. If the run registry cannot be listed during
+  shutdown, the human is warned that runs may still be running.
+- **No shutdown handler runs when Pi is killed** (SIGKILL, crash, power loss).
+  Local children then keep running until they finish. The next Pi process
+  adopts a record whose parent is provably gone (`reconcileAbandonedRuns`, at
+  session start and on supervision ticks) as status-only: `orphaned` while its
+  process group is still alive, `lost` otherwise. Adoption sends no notice and
+  delivers no callback. Their completions are never delivered as a turn (see
+  above).
+
+Nothing about this changes `subagent_spawn` continuation: `session_id` /
+`session_name` still resume a saved conversation, only when a tool call asks for
+it.
+
 ## Nested agents: waiting in a headless session
 
-A subagent runs as `pi -p`: it answers one prompt and exits, stopping every
-child it started. It has no next turn, so the completion callback an
+A subagent runs as `pi -p`: it answers one prompt and exits, and the end of that
+one-shot session stops every run it started that is still going (see
+[above](#what-happens-to-started-runs-when-a-session-ends): the session's
+shutdown stops them and records them `killed`, `stoppedReason: "shutdown"`, with
+no completion). It has no next turn, so the completion callback an
 interactive session relies on never reaches it. A child launched with
 `allow_nested:true` therefore also gets `subagent_wait`: the agent calls it to
 block on the runs it needs before it writes its final answer. Waiting is the
@@ -169,9 +245,12 @@ make a child keep going (pi-dev `docs/constraints.md`).
 - **Its own parent.** Time inside the call counts toward neither progress nor
   the child's stuck window. A parent deadline ends the wait through its
   wrap-up amendment; the ceiling stops the child as usual.
+- **If it does not wait.** A run still going when the child's turn ends is
+  stopped by that shutdown, bounded, and its partial output is all that is left.
+  Waiting is the only way to get such a run's final result.
 - **Known gap.** If a waiting child is killed with SIGKILL (not SIGTERM), its
-  children, which run in their own process groups, are left running; the
-  parent's navigator lists them as orphaned.
+  shutdown handler never runs, so its children, which run in their own process
+  groups, are left running; the parent's navigator lists them as orphaned.
 
 ## Steering a running subagent
 
@@ -451,11 +530,24 @@ given.
 - **One completion per run.** A run's ordinary notification is identified by
   its run id, so a terminal run is reported once even if its status wording
   changes (failure notes, observation gaps) between queueing and delivery.
-  Stopped runs are terminal too: `subagent_stop`, a navigator Close, the reload
-  drain, or cleanup that finalizes an orphaned run from its log records the same
-  pending completion, so the caller receives one `killed`/`completed`/`failed`
-  row instead of discovering the outcome by polling `subagent_list()`. A run
-  stopped while the session is shutting down is recovered by the next session.
+  Stopped runs are terminal too: `subagent_stop`, a navigator Close, or cleanup
+  that finalizes an orphaned run from its log records the same pending
+  completion, so the caller receives one `killed`/`completed`/`failed` row
+  instead of discovering the outcome by polling `subagent_list()`. The one
+  exception is a run stopped because its session ended; see
+  [What happens to started runs when a session ends](#what-happens-to-started-runs-when-a-session-ends).
+- **A completion from before this session started never starts a turn.** A
+  run launched by a Pi process that has since exited and left an interruption
+  record (a shutdown stop that could not be confirmed), and any completion
+  still pending when a session starts (for example one still in the batch
+  window, held or retrying when you ran `/reload`), is not delivered through
+  the turn-triggering batch above. If its conversation is resumed and the run
+  finished, its completion is appended as a `subagent-restart-notice` message
+  with `triggerTurn: false`: it informs the conversation and starts no turn.
+  Only completions of runs this session lifetime launched use the batch; a run
+  launched by an earlier lifetime or extension instance is always a notice, even
+  when its record carries no interruption marker. Read the result with
+  `subagent_result`.
 - **Optional busy steering.** In `/harness-settings`, set **Completions while
   busy** to **Steer active run** to receive ordinary completions during
   foreground work. Changes autosave to the current session branch and apply
