@@ -1,13 +1,12 @@
 /**
- * Regression: the foreground can resolve an `ollama-cloud` model because its
- * provider package is installed and loaded. An isolated child launches with
- * `--no-extensions`, so unless that same package is named for the child, the
- * provider is never registered and the child fails with "model not found".
+ * Security/spend regression: a child launched on an `ollama-cloud` model must
+ * NOT automatically load `pi-ollama-cloud`. That package registers web tools
+ * that post to ollama.com and overrides the role's `--tools`, so loading it is
+ * an explicit user choice made with a `providerExtensions` entry.
  *
- * The provider mapping is therefore built in, not something every user must
- * copy into `config.json`. A user mapping (including an empty one that opts
- * out) still wins, and a mapped-but-missing package must keep surfacing the
- * existing explicit missing error instead of launching without provider auth.
+ * An explicit entry still works (string, list, replacement), an empty list is
+ * a no-op, and a mapped-but-missing package keeps surfacing the explicit
+ * missing error instead of launching without provider auth.
  *
  * // @covers extensions.provider-auth
  * // @level integration
@@ -18,6 +17,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import * as extensionsModule from "../extensions.mjs";
 import { extensionArgs, resolveExtensions } from "../extensions.mjs";
 import { loadConfig, resolveExtensionPath, setConfigPathForTests } from "../config.ts";
 
@@ -49,17 +49,36 @@ function openEnvironment(t, { settings, installed = true } = {}) {
     return { agentDir };
 }
 
-function resolveFromShippedConfig() {
-    return resolveExtensions({ tools: "read,bash", model: MODEL, config: loadConfig() });
+function resolveFromShippedConfig(tools = "read,bash") {
+    return resolveExtensions({ tools, model: MODEL, config: loadConfig() });
 }
 
-describe("built-in provider extensions", () => {
-    it("loads the ollama-cloud provider package without a manual mapping", (t) => {
-        const { agentDir } = openEnvironment(t);
+describe("provider extensions are explicit only", () => {
+    it("does not load the ollama-cloud provider package on the model name alone", (t) => {
+        openEnvironment(t);
+        const resolution = resolveFromShippedConfig();
+        assert.deepEqual(resolution.specs, []);
+        assert.deepEqual(resolution.reasons, {});
+        const child = extensionArgs(resolution, resolveExtensionPath);
+        assert.deepEqual(child.missing, []);
+        assert.deepEqual(child.args, ["--no-extensions"]);
+    });
+
+    it("ships no built-in provider map and no provider default in the shipped config", () => {
+        assert.equal("BUILTIN_PROVIDER_EXTENSIONS" in extensionsModule, false);
+        const shipped = loadConfig();
+        assert.deepEqual(shipped.providerExtensions ?? {}, {});
+        for (const model of [MODEL, "ollama-cloud/x", "xai/grok-4.5"]) {
+            assert.deepEqual(resolveExtensions({ tools: "read", model, config: shipped }).specs, []);
+        }
+        assert.deepEqual(resolveExtensions({ tools: "read", model: MODEL, config: {} }).specs, []);
+    });
+
+    it("loads the provider package when the user maps it explicitly", (t) => {
+        const { agentDir } = openEnvironment(t, { settings: { providerExtensions: { "ollama-cloud": OLLAMA } } });
         const resolution = resolveFromShippedConfig();
         assert.deepEqual(resolution.specs, [OLLAMA]);
         assert.deepEqual(resolution.reasons[OLLAMA], ["provider:ollama-cloud"]);
-
         const child = extensionArgs(resolution, resolveExtensionPath);
         assert.deepEqual(child.missing, []);
         assert.deepEqual(child.args, [
@@ -69,24 +88,19 @@ describe("built-in provider extensions", () => {
         ]);
     });
 
-    it("keeps a missing provider package an explicit missing error", (t) => {
-        openEnvironment(t, { installed: false });
+    it("keeps an explicitly mapped but missing provider package an explicit missing error", (t) => {
+        openEnvironment(t, { installed: false, settings: { providerExtensions: { "ollama-cloud": OLLAMA } } });
         const child = extensionArgs(resolveFromShippedConfig(), resolveExtensionPath);
         assert.deepEqual(child.missing, [OLLAMA]);
         assert.deepEqual(child.args, ["--no-extensions"]);
     });
 
-    it("lets a user mapping override the built-in package", (t) => {
+    it("loads exactly the package the user maps, and an empty entry loads nothing", (t) => {
         openEnvironment(t, {
             settings: { providerExtensions: { "ollama-cloud": "npm:pi-ollama-alternative" } },
         });
-        const resolution = resolveFromShippedConfig();
-        assert.deepEqual(resolution.specs, ["npm:pi-ollama-alternative"]);
-        assert.deepEqual(resolution.reasons["npm:pi-ollama-alternative"], ["provider:ollama-cloud"]);
-    });
-
-    it("lets a user entry disable the built-in package", (t) => {
-        openEnvironment(t, { settings: { providerExtensions: { "ollama-cloud": [] } } });
-        assert.deepEqual(resolveFromShippedConfig().specs, []);
+        assert.deepEqual(resolveFromShippedConfig().specs, ["npm:pi-ollama-alternative"]);
+        const empty = resolveExtensions({ tools: "read", model: MODEL, config: { providerExtensions: { "ollama-cloud": [] } } });
+        assert.deepEqual(empty.specs, []);
     });
 });

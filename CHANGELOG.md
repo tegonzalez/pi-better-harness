@@ -8,6 +8,7 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Removed
 
+- Stop loading `pi-ollama-cloud` into isolated subagent children automatically for `ollama-cloud` models: it registers web tools posting to ollama.com and overrides the role's `--tools`. Add an explicit `providerExtensions` entry to opt in.
 - Remove Model Router and its bundled Ollama Cloud provider from the `pi-better-harness` umbrella bundle: loading it registered `ollama_web_search`/`ollama_web_fetch` tools that post to ollama.com without the user's choice. Install `pi-better-model-router` explicitly to use it.
 
 ## [pi-better-harness@0.39.0] - 2026-11-02

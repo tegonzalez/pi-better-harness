@@ -754,16 +754,19 @@ so a package that backs no requested tool never loads. With the default
 allowlist (`read, bash, edit, write, web_search, web_fetch`) exactly one package
 loads — the web-tools one — and `web_fetch` works normally.
 
-Two maps in `config.json` drive it, with a built-in default for provider auth:
+Two maps in `config.json` drive it; both are empty of provider defaults:
 
 - `toolExtensions` — tool name → package(s) providing it. Built-ins (`read`,
   `bash`, `edit`, `write`) need no entry.
 - `providerExtensions` — provider → auth package. Model auth is not tool-shaped:
   `xai/grok-4.5` needs `pi-xai-oauth` loaded whatever tools it was granted.
 
-The built-in map loads `pi-ollama-cloud` for `ollama-cloud` models, so a role
-resolved against that provider works without a manual entry. An entry for the
-same provider replaces the built-in one, and an empty list disables it. A mapped
+No provider package loads automatically. A role resolved against a provider
+that needs one (for example `ollama-cloud`, via `pi-ollama-cloud`) fails in its
+isolated child with "model not found" until you add an explicit
+`providerExtensions` entry such as `{"ollama-cloud": "npm:pi-ollama-cloud"}`.
+This is deliberate: `pi-ollama-cloud` registers web tools that post to
+ollama.com and replace the role's `--tools`, so the choice is yours. A mapped
 package that is not installed still fails the launch with the explicit
 missing-extension error rather than starting without provider auth.
 

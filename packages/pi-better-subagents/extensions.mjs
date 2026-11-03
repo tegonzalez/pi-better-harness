@@ -40,15 +40,13 @@ export const BUILTIN_TOOLS = ["read", "bash", "edit", "write", "codemode"];
 export const SELF_SPEC = "self";
 
 /**
- * Provider packages Pi does not ship itself. A provider's models exist in a
- * child only when the package registering them is loaded; without this map, a
- * role that resolves e.g. `ollama-cloud/...` in the foreground fails in its
- * isolated child with "model not found". User `providerExtensions` entries
- * replace these per provider (an empty list disables the built-in entry).
+ * No provider package is loaded into a child automatically. A provider whose
+ * models only exist while its package is loaded (e.g. `ollama-cloud/...`) needs
+ * an explicit `providerExtensions` entry; the child otherwise fails with "model
+ * not found". Loading one on the model name alone would run third-party
+ * provider code, and for `pi-ollama-cloud` register web tools that post to
+ * ollama.com and replace the role's `--tools`, without anyone having asked.
  */
-export const BUILTIN_PROVIDER_EXTENSIONS = {
-    "ollama-cloud": "npm:pi-ollama-cloud",
-};
 
 /** Split "xai/grok-4.5" -> "xai". Returns undefined when there is no provider. */
 export function providerOf(model) {
@@ -128,10 +126,10 @@ export function resolveExtensions(a = {}) {
     }
 
     // Model auth is not tool-shaped: xai/grok needs pi-xai-oauth loaded or the
-    // child cannot authenticate at all, whatever tools it was granted. A user
-    // entry for a provider wins over the built-in one, including an empty list
-    // that opts out of loading the provider's package.
-    const providerMap = { ...BUILTIN_PROVIDER_EXTENSIONS, ...(cfg.providerExtensions ?? {}) };
+    // child cannot authenticate at all, whatever tools it was granted. Only an
+    // explicit user `providerExtensions` entry loads a provider package; there
+    // is no built-in default.
+    const providerMap = cfg.providerExtensions ?? {};
     const provider = providerOf(a.model);
     if (provider) {
         for (const spec of toSpecList(providerMap[provider])) {
