@@ -18,9 +18,8 @@ export function installedHarnessFixture() {
     mkdirSync(join(root, "scripts"));
     cpSync(join(repo, "scripts/stage-harness-dependencies.mjs"), join(root, "scripts/stage-harness-dependencies.mjs"));
     const env = { ...process.env, npm_config_ignore_scripts: "true" };
-    // Staging now includes the router's third-party Ollama dependency. Make
-    // installed external dependencies available before assembling the bundle;
-    // bundled first-party packages still become real extracted files below.
+    // Make installed external dependencies available before assembling the
+    // bundle; bundled first-party packages still become real extracted files below.
     symlinkSync(join(repo, "node_modules"), join(root, "node_modules"), "dir");
     execFileSync(process.execPath, [join(root, "scripts/stage-harness-dependencies.mjs")], {
       cwd: root, env, stdio: "pipe",

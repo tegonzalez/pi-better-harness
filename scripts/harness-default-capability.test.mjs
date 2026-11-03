@@ -26,6 +26,11 @@ const rootManifest = readJson("package.json");
 const harnessManifest = readJson("packages/pi-better-harness/package.json");
 const sandboxManifest = readJson("packages/pi-better-sandbox/package.json");
 
+// The router (and the Ollama Cloud provider it bundles, whose web tools post to
+// ollama.com) is an explicit opt-in: the installer may add it as its own
+// standalone package, but the umbrella bundle must never carry or load it.
+const STANDALONE_ONLY = ["pi-better-model-router"];
+
 
 // @covers harness.default-capability
 // @level integration
@@ -53,10 +58,24 @@ test("the installer and bundle declare the same managed components", () => {
   );
 
   assert.deepEqual(
-    [...componentPackages].sort(),
+    componentPackages.filter((name) => !STANDALONE_ONLY.includes(name)).sort(),
     [...harnessManifest.bundledDependencies].sort(),
     "the installer's components and bundled dependencies must be the same set",
   );
+});
+
+// @covers harness.default-capability
+// @level integration
+test("the umbrella bundle neither declares, depends on nor loads the model router or Ollama Cloud", () => {
+  const forbidden = /model-router|ollama/i;
+  assert.ok(!harnessManifest.pi.extensions.some((entry) => forbidden.test(entry)), JSON.stringify(harnessManifest.pi.extensions));
+  assert.ok(!rootManifest.pi.extensions.some((entry) => forbidden.test(entry)), JSON.stringify(rootManifest.pi.extensions));
+  assert.ok(!Object.keys(harnessManifest.dependencies).some((name) => forbidden.test(name)), "no router/provider dependency");
+  assert.ok(!harnessManifest.bundledDependencies.some((name) => forbidden.test(name)), "no router/provider bundled");
+  assert.ok(!stagedPackageNames.some((name) => forbidden.test(name)), "no router/provider staged");
+  assert.ok(!existsSync(join(harnessDir, "extensions/model-router")), "the router shim must stay deleted");
+  const lock = JSON.parse(readFileSync(join(harnessDir, "package-lock.json"), "utf8"));
+  assert.deepEqual(Object.keys(lock.packages).filter((key) => forbidden.test(key)), [], "no router/provider in the lockfile");
 });
 
 // @covers harness.default-capability
@@ -77,7 +96,7 @@ test("Outcome & Todo belongs to Harness and Plan is retired", () => {
 // @level integration
 test("every component is a bundled dependency pinned at its workspace version", () => {
 
-  for (const packageName of componentPackages) {
+  for (const packageName of componentPackages.filter((name) => !STANDALONE_ONLY.includes(name))) {
     const workspaceVersion = readJson(`packages/${packageName}/package.json`).version;
     // Either the exact workspace release, or the sibling directory itself (file:../<id>, installed with
     // --install-links): the umbrella then ships this checkout's code, which is the workspace version.
@@ -156,6 +175,7 @@ test("the bundled tarball carries the sandbox extension and its synchronized sha
     );
 
     const packed = pack.files.map((file) => file.path);
+    assert.deepEqual(packed.filter((path) => /model-router|ollama/i.test(path)), [], "the tarball must not carry the router or Ollama Cloud provider");
     const carries = (path) => {
       assert.ok(packed.includes(path), `bundled tarball is missing ${path}:\n${packed.join("\n")}`);
       assert.ok(existsSync(join(unpackedDir, path)), `${path} is listed but absent from the unpacked tarball`);

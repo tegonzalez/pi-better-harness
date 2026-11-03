@@ -13,7 +13,6 @@ const BUNDLED_EXTENSIONS = [
   "extensions/background-tasks/index.ts",
   "extensions/ssh/index.ts",
   "extensions/goal/index.ts",
-  "extensions/model-router/index.ts",
   ...harnessExtensionFilters,
 ];
 

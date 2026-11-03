@@ -13,14 +13,11 @@ core extensions:
 | `pi-better-background-tasks` | Run durable shell tasks and command watchers without blocking the current turn. |
 | `pi-better-ssh` | Run short synchronous remote commands over reusable SSH connections. |
 | `pi-better-goal` | Track the current objective and keep Pi aware of active background work. |
-| `pi-better-model-router` | Route between DeepSeek and Ollama Cloud by estimated price. |
 | Harness Outcome & Todo | Display saved session context and checklist progress by default; hooks are opt-in in `/harness-settings`. |
 
-The bundle includes `pi-better-model-router` 0.1.0 and its Ollama Cloud provider.
-Select `router/deepseek-flash-auto` in `/model` to use it; DeepSeek is the default
-tie preference. Installation does not change the default selected model. The router
-requires Pi's `registerVirtualModel` API and is tested with Pi 1.4.0. On older
-hosts without that API, the bundle skips the router and shows an upgrade notice.
+The umbrella bundle does not include `pi-better-model-router` or its Ollama Cloud provider: that provider registers `ollama_web_search`/`ollama_web_fetch` tools that post to ollama.com. `npx pi-better-harness install` does install `pi-better-model-router` (and with it the Ollama Cloud provider) as a separate component; to avoid it, install the packages you want individually with `pi install npm:<package>`.
+Once installed, select `router/deepseek-flash-auto` in `/model`; DeepSeek is the
+default tie preference and the default selected model is unchanged.
 
 `pi-better-read-aloud` lives in this repo but is intentionally not part of the
 meta package.

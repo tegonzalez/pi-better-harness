@@ -2,7 +2,7 @@
 
 <img src="docs/images/brand/logo.png" alt="Pi Better Harness logo" width="128" height="128" />
 
-`pi-better-harness` combines an opt-in foreground write sandbox, delegated subagents, durable background shell tasks, synchronous SSH commands, Goal continuation, model routing, and optional Outcome & Todo.
+`pi-better-harness` combines an opt-in foreground write sandbox, delegated subagents, durable background shell tasks, synchronous SSH commands, Goal continuation, and optional Outcome & Todo.
 
 ## Quick Answer
 
@@ -88,7 +88,7 @@ Do not use the bundle when you only need one extension; install that package dir
 - [`pi-better-model-router`](packages/pi-better-model-router/README.md): price-based routing between DeepSeek and Ollama Cloud.
 - Harness Outcome & Todo: session context and checklist progress, off until enabled in `/harness-settings`.
 
-The bundle includes `pi-better-model-router` 0.1.0 and its Ollama Cloud provider; the `npx` installer installs the router as a sixth standalone component. Select `router/deepseek-flash-auto` in `/model` to use it. The router prefers DeepSeek when prices tie and does not change the default selected model. It requires Pi's `registerVirtualModel` API and is tested with Pi 1.4.0. On older hosts without that API, the bundle skips the router and shows an upgrade notice.
+The umbrella package (`pi install npm:pi-better-harness`) does not include `pi-better-model-router` or its Ollama Cloud provider: that provider registers `ollama_web_search`/`ollama_web_fetch` tools that post to ollama.com. `npx pi-better-harness install` does install `pi-better-model-router` (and with it the Ollama Cloud provider), as a separate component alongside the other packages; to avoid it, install the packages you want individually with `pi install npm:<package>`. Select `router/deepseek-flash-auto` in `/model` to use the router.
 
 `pi-better-read-aloud` lives in this repo but is not published or included in the meta package yet.
 
