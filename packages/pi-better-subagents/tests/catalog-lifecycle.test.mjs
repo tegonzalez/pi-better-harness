@@ -1146,6 +1146,58 @@ fi
             assert.deepEqual(newRuns(before), []);
         });
 
+        it("rejects a blank session_id or session_name instead of silently starting a fresh run", async (t) => {
+            setConfigForTests({ defaultModel: null, maxConcurrent: 64, tierPolicy: null });
+            t.after(() => setConfigForTests(undefined));
+            const before = runsNow();
+            const base = { prompt: "x", tools: "read,bash", sandbox: false };
+            for (const blank of ["", "   "]) {
+                await assert.rejects(
+                    tools.subagent_spawn.execute("tc", { ...base, session_id: blank }, null, null, ctx()),
+                    /session_id must be a non-empty native session id\./,
+                    `spawn session_id ${JSON.stringify(blank)}`,
+                );
+                await assert.rejects(
+                    tools.subagent_spawn.execute("tc", { ...base, session_name: blank }, null, null, ctx()),
+                    /session_name must be a non-empty name\./,
+                    `spawn session_name ${JSON.stringify(blank)}`,
+                );
+                await assert.rejects(
+                    tools.subagent_spawn_batch.execute("tc", {
+                        jobs: [{ prompt: "ok" }, { prompt: "x", session_id: blank }],
+                        shared: { tools: "read,bash", sandbox: false },
+                    }, null, null, ctx()),
+                    /session_id must be a non-empty native session id\./,
+                    `batch job session_id ${JSON.stringify(blank)}`,
+                );
+                await assert.rejects(
+                    tools.subagent_spawn_batch.execute("tc", {
+                        jobs: [{ prompt: "ok" }, { prompt: "x", session_name: blank }],
+                        shared: { tools: "read,bash", sandbox: false },
+                    }, null, null, ctx()),
+                    /session_name must be a non-empty name\./,
+                    `batch job session_name ${JSON.stringify(blank)}`,
+                );
+                await assert.rejects(
+                    tools.subagent_spawn_batch.execute("tc", {
+                        jobs: [{ prompt: "ok" }],
+                        shared: { tools: "read,bash", sandbox: false, session_id: blank },
+                    }, null, null, ctx()),
+                    /session_id is per job/,
+                    `batch shared session_id ${JSON.stringify(blank)}`,
+                );
+                await assert.rejects(
+                    tools.subagent_spawn_batch.execute("tc", {
+                        jobs: [{ prompt: "ok" }],
+                        shared: { tools: "read,bash", sandbox: false, session_name: blank },
+                    }, null, null, ctx()),
+                    /session_name is per job/,
+                    `batch shared session_name ${JSON.stringify(blank)}`,
+                );
+            }
+            assert.deepEqual(newRuns(before), [], "a rejected blank selector launches nothing, not even the other jobs");
+        });
+
         it("treats empty optional strings as omitted (models that fill every schema field)", async (t) => {
             setConfigForTests({ defaultModel: null, maxConcurrent: 64, tierPolicy: null });
             t.after(() => setConfigForTests(undefined));

@@ -1888,12 +1888,19 @@ function latestConversationAttempt(sessionId: string, metas: readonly RunMeta[])
  * latest attempt, missing history or workspace, unsupported recipe), so a
  * missing session is the only error added here. Nothing is ever recreated.
  */
+/**
+ * Fields whose blank value is never normalized to "omitted": `prompt` is validated as required,
+ * and a blank session selector is a request to continue a saved conversation that cannot be
+ * honoured, so it is rejected rather than silently starting a fresh run.
+ */
+const SPAWN_KEPT_BLANK_FIELDS = ["prompt", "session_id", "session_name"] as const;
+
 function requestedSessionId(job: { session_id?: string; session_name?: string }, cwd: string): string | undefined {
     if (job.session_id !== undefined && job.session_name !== undefined) {
         throw new Error("Pass either session_id or session_name, not both.");
     }
     if (job.session_name !== undefined) {
-        if (typeof job.session_name !== "string") throw new Error("session_name must be a non-empty name.");
+        if (typeof job.session_name !== "string" || job.session_name.trim() === "") throw new Error("session_name must be a non-empty name.");
         return selectSessionByName(listMetas(), job.session_name, (workspace) => isWithinWorkspace(workspace, cwd));
     }
     return job.session_id;
@@ -2773,8 +2780,10 @@ export default function (pi: ExtensionAPI) {
             content: { type: "text"; text: string }[];
             details: Record<string, unknown>;
         }> {
-            // Empty optional strings (agent: "", model: "", ...) mean omitted.
-            const p = omitBlankOptionalStrings(params as SpawnParams, ["prompt"]);
+            // Empty optional strings (agent: "", model: "", ...) mean omitted, except the
+            // conversation selectors: a blank session_id/session_name is a caller trying to
+            // continue a saved conversation, which must be rejected, never turned into a fresh run.
+            const p = omitBlankOptionalStrings(params as SpawnParams, SPAWN_KEPT_BLANK_FIELDS);
             p.session_id = requestedSessionId(p, ctx.cwd);
             if (p.prompt.trim() === "") throw new Error("prompt is empty.");
             if (p.session_id !== undefined && (typeof p.session_id !== "string" || p.session_id.trim() === "")) {
@@ -2974,11 +2983,12 @@ export default function (pi: ExtensionAPI) {
                 jobs: Array<Partial<SpawnParams> & { prompt: string }>;
                 onCapacity?: "reject" | "launch-available";
             };
-            // Empty optional strings in shared or any job mean omitted.
+            // Empty optional strings in shared or any job mean omitted, except the conversation
+            // selectors (see subagent_spawn): a blank one is rejected by validation below.
             const p = {
                 ...omitBlankOptionalStrings(raw),
-                shared: omitBlankOptionalStrings(raw.shared),
-                jobs: raw.jobs.map((job) => omitBlankOptionalStrings(job, ["prompt"])),
+                shared: omitBlankOptionalStrings(raw.shared, ["session_id", "session_name"]),
+                jobs: raw.jobs.map((job) => omitBlankOptionalStrings(job, SPAWN_KEPT_BLANK_FIELDS)),
             };
 
             const cfg = loadLaunchConfig();
